@@ -181,7 +181,54 @@ internal class Win32Bindings private constructor(
                 ValueLayout.JAVA_INT,                                       // BOOL
                 listOf(ValueLayout.ADDRESS),                                // HICON
             ),
+
+            // ── user32: popup menu (Task #112) ─────────────────────────────
+            Triple("CreatePopupMenu",
+                ValueLayout.ADDRESS,                                        // HMENU
+                emptyList(),
+            ),
+            Triple("DestroyMenu",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(ValueLayout.ADDRESS),                                // HMENU
+            ),
+            Triple("AppendMenuW",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(
+                    ValueLayout.ADDRESS,    // HMENU
+                    ValueLayout.JAVA_INT,   // UINT uFlags
+                    ValueLayout.JAVA_LONG,  // UINT_PTR uIDNewItem (or HMENU when MF_POPUP)
+                    ValueLayout.ADDRESS,    // LPCWSTR lpNewItem
+                ),
+            ),
+            Triple("TrackPopupMenu",
+                ValueLayout.JAVA_INT,                                       // BOOL or int (with TPM_RETURNCMD)
+                listOf(
+                    ValueLayout.ADDRESS,    // HMENU
+                    ValueLayout.JAVA_INT,   // UINT uFlags
+                    ValueLayout.JAVA_INT,   // int x
+                    ValueLayout.JAVA_INT,   // int y
+                    ValueLayout.JAVA_INT,   // int nReserved (0)
+                    ValueLayout.ADDRESS,    // HWND
+                    ValueLayout.ADDRESS,    // const RECT* (NULL)
+                ),
+            ),
+            Triple("SetForegroundWindow",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(ValueLayout.ADDRESS),                                // HWND
+            ),
         )
+
+        // ── AppendMenuW / TrackPopupMenu flags from winuser.h ──────────────
+
+        const val MF_STRING:    Int = 0x00000000
+        const val MF_POPUP:     Int = 0x00000010
+        const val MF_SEPARATOR: Int = 0x00000800
+        const val MF_GRAYED:    Int = 0x00000001
+        const val MF_DISABLED:  Int = 0x00000002
+
+        const val TPM_RIGHTBUTTON: Int = 0x0002
+        const val TPM_RETURNCMD:   Int = 0x0100
+        const val TPM_NONOTIFY:    Int = 0x0080
 
         // ── Shell_NotifyIcon constants from shellapi.h ─────────────────────
 

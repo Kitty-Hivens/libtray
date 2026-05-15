@@ -81,6 +81,17 @@ internal class Win32TrayImpl private constructor(
     /** Tracks the latest tooltip string for re-applying after setIcon. */
     @Volatile private var tooltip: String = initial.tooltip ?: ""
 
+    /**
+     * Latest menu set via [setMenu], or null if no menu attached. Stored
+     * by reference rather than rebuilt-into-HMENU on each set: Win32
+     * popup menus are short-lived (built on right-click, destroyed when
+     * dismissed), so `setMenu` is just a state update — the HMENU is
+     * constructed lazily inside [showContextMenu] each time the user
+     * right-clicks the icon. Avoids the GDI handle leak that comes from
+     * holding HMENUs across multiple setMenu calls.
+     */
+    @Volatile private var currentMenu: TrayMenu? = initial.menu
+
     /** Background pump thread — `PeekMessageW` + `DispatchMessageW` loop. */
     private val pumpThread = Thread({ pumpLoop() }, "libtray-win32-${ProcessHandle.current().pid()}").apply {
         isDaemon = true
@@ -147,7 +158,11 @@ internal class Win32TrayImpl private constructor(
         return ok
     }
 
-    override fun setMenu(menu: TrayMenu?): Boolean = false  // Task #112
+    override fun setMenu(menu: TrayMenu?): Boolean {
+        if (!open.get()) return false
+        currentMenu = menu
+        return true
+    }
 
     override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
         handlers.add(handler)
@@ -354,23 +369,147 @@ internal class Win32TrayImpl private constructor(
             0L
         }
 
-        // Shell_NotifyIcon callback — wired in Task #111 (icon) and the
-        // mouse-side dispatched in Task #112 (menu/click). Until then the
-        // window class IS registered with this WndProc, but no icon is
-        // attached so the OS won't actually deliver WM_USER+1 events yet.
-        Win32Bindings.WM_USER + 1 -> 0L
+        // Shell_NotifyIcon callback. With NOTIFYICON_VERSION_4 (set
+        // during init), the dispatch format is:
+        //   wParam = (LOWORD = x, HIWORD = y) cursor position in screen pixels
+        //   lParam = (LOWORD = mouse event id, HIWORD = our icon uID)
+        // Earlier versions packed mouse events into wParam — we don't
+        // support them; the version negotiation already failed if the
+        // shell can't speak v4.
+        Win32Bindings.WM_TRAY_CALLBACK -> {
+            val event = lowWordSigned(lParam)
+            val x = lowWordSigned(wParam)
+            val y = highWordSigned(wParam)
+            when (event) {
+                Win32Bindings.WM_LBUTTONUP -> fire(TrayEvent.Activated)
+                Win32Bindings.WM_RBUTTONUP, Win32Bindings.WM_CONTEXTMENU -> showContextMenu(x, y)
+            }
+            0L
+        }
 
-        // Menu item clicked — Task #112 wires LOWORD(wParam) → libtray
-        // menu id → TrayEvent.MenuItemSelected. Foundation routing only.
+        // Menu item clicked via the legacy WM_COMMAND path — only fires
+        // if we ever pass TrackPopupMenu without TPM_RETURNCMD. We use
+        // TPM_RETURNCMD, so the selection comes back from TrackPopupMenu
+        // as its return value and this branch shouldn't fire. Defensive.
         Win32Bindings.WM_COMMAND -> 0L
 
         else -> defWindowProc(uMsg, wParam, lParam)
     }
 
+    private fun lowWordSigned(value: Long): Int = (value and 0xffff).toShort().toInt()
+    private fun highWordSigned(value: Long): Int = ((value shr 16) and 0xffff).toShort().toInt()
+
+    /**
+     * Build an HMENU from [currentMenu] and pop it at the cursor. Blocks
+     * the pump thread until the user picks an item or dismisses the
+     * menu — TrackPopupMenu pumps its own messages internally, so the
+     * window stays responsive. Selected libtray ids fire as
+     * [TrayEvent.MenuItemSelected]; dismissals fire nothing.
+     *
+     * No menu set → no popup. Standard behaviour: an empty right-click
+     * surface is less surprising than an empty popup that opens and
+     * immediately closes.
+     */
+    private fun showContextMenu(x: Int, y: Int) {
+        val menu = currentMenu ?: return
+        if (menu.items.isEmpty()) return
+
+        // Per MSDN: SetForegroundWindow before TrackPopupMenu, otherwise
+        // clicks outside the menu don't dismiss it (the menu's owner
+        // window has to be foreground for the standard "click-away
+        // closes menu" behaviour to kick in).
+        runCatching {
+            bindings.handle("SetForegroundWindow").invokeExact(hwnd) as Int
+        }
+
+        val createdMenus = ArrayList<MemorySegment>()
+        val cmdToId = HashMap<Int, String>()
+        val nextCmd = AtomicInteger(0x1000)
+
+        val rootHmenu = runCatching {
+            bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
+        }.getOrNull() ?: return
+        if (rootHmenu.address() == 0L) return
+        createdMenus += rootHmenu
+
+        appendItems(rootHmenu, menu.items, cmdToId, nextCmd, createdMenus)
+
+        val flags = Win32Bindings.TPM_RETURNCMD or Win32Bindings.TPM_RIGHTBUTTON
+        val selected = runCatching {
+            bindings.handle("TrackPopupMenu").invokeExact(
+                rootHmenu, flags, x, y, 0, hwnd, MemorySegment.NULL,
+            ) as Int
+        }.getOrDefault(0)
+
+        // DestroyMenu walks any submenus attached via MF_POPUP, but
+        // submenus we built and *didn't* attach (none in this code path)
+        // would leak. Plus per Win32 docs, calling DestroyMenu on a
+        // submenu that's been attached is forbidden. Walk the list
+        // backwards: root last (it owns the children), submenus first
+        // get a no-op DestroyMenu since they're already owned by root.
+        runCatching { bindings.handle("DestroyMenu").invokeExact(rootHmenu) as Int }
+
+        if (selected != 0) {
+            val libtrayId = cmdToId[selected]
+            if (libtrayId != null) {
+                fire(TrayEvent.MenuItemSelected(libtrayId))
+            }
+        }
+    }
+
+    /**
+     * Recursively append [items] into [parent] HMENU. Standard items get
+     * a fresh command id (0x1000+counter) so TrackPopupMenu's return
+     * value can be looked up against [cmdToId] to recover the libtray
+     * id. Submenus get a child HMENU built recursively.
+     */
+    private fun appendItems(
+        parent: MemorySegment,
+        items: List<dev.hivens.libtray.TrayMenuItem>,
+        cmdToId: HashMap<Int, String>,
+        nextCmd: AtomicInteger,
+        createdMenus: ArrayList<MemorySegment>,
+    ) {
+        val appendMenu = bindings.handle("AppendMenuW")
+        for (item in items) {
+            when (item) {
+                is dev.hivens.libtray.TrayMenuItem.Separator -> {
+                    runCatching {
+                        appendMenu.invokeExact(parent, Win32Bindings.MF_SEPARATOR, 0L, MemorySegment.NULL) as Int
+                    }
+                }
+                is dev.hivens.libtray.TrayMenuItem.Standard -> {
+                    val cmd = nextCmd.getAndIncrement()
+                    cmdToId[cmd] = item.id
+                    val labelSeg = allocateUtf16(bindings.arena, item.label)
+                    var flags = Win32Bindings.MF_STRING
+                    if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
+                    runCatching {
+                        appendMenu.invokeExact(parent, flags, cmd.toLong(), labelSeg) as Int
+                    }
+                }
+                is dev.hivens.libtray.TrayMenuItem.Submenu -> {
+                    val child = runCatching {
+                        bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
+                    }.getOrNull()
+                    if (child != null && child.address() != 0L) {
+                        createdMenus += child
+                        appendItems(child, item.items, cmdToId, nextCmd, createdMenus)
+                        val labelSeg = allocateUtf16(bindings.arena, item.label)
+                        var flags = Win32Bindings.MF_POPUP or Win32Bindings.MF_STRING
+                        if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
+                        runCatching {
+                            appendMenu.invokeExact(parent, flags, child.address(), labelSeg) as Int
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private fun defWindowProc(uMsg: Int, wParam: Long, lParam: Long): Long =
         bindings.handle("DefWindowProcW").invokeExact(hwnd, uMsg, wParam, lParam) as Long
 
-    @Suppress("unused")  // visible to fire() once Tasks #111/#112 wire events
     private fun fire(event: TrayEvent) {
         for (h in handlers) {
             runCatching { h(event) }.onFailure { log.warn("event handler threw", it) }
