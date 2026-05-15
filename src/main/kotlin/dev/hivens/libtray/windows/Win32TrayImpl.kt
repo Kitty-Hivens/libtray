@@ -310,14 +310,22 @@ internal class Win32TrayImpl private constructor(
         val maskScanline = ((w + 31) / 32) * 4
         val andBytes = ByteArray(maskScanline * h)
 
-        val xorSeg = bindings.arena.allocate(xorBytes.size.toLong())
-        xorSeg.asByteBuffer().put(xorBytes)
-        val andSeg = bindings.arena.allocate(andBytes.size.toLong())
-        andSeg.asByteBuffer().put(andBytes)
-
-        val hicon = bindings.handle("CreateIcon").invokeExact(
-            hInstance, w, h, 1.toByte(), 32.toByte(), andSeg, xorSeg,
-        ) as MemorySegment
+        // Confined arena for the bitmap bytes — CreateIcon copies them
+        // into the icon resource synchronously, so we can free as soon
+        // as the call returns. Without this they'd accumulate in
+        // bindings.arena (shared, JVM-lifetime) on every setIcon call —
+        // ~4KB per 32x32 update, which adds up on apps that animate the
+        // tray glyph.
+        val createIcon = bindings.handle("CreateIcon")
+        val hicon = Arena.ofConfined().use { tmp ->
+            val xorSeg = tmp.allocate(xorBytes.size.toLong())
+            xorSeg.asByteBuffer().put(xorBytes)
+            val andSeg = tmp.allocate(andBytes.size.toLong())
+            andSeg.asByteBuffer().put(andBytes)
+            createIcon.invokeExact(
+                hInstance, w, h, 1.toByte(), 32.toByte(), andSeg, xorSeg,
+            ) as MemorySegment
+        }
         if (hicon.address() == 0L) {
             log.warn("CreateIcon returned NULL (GetLastError={})", lastError())
             return null
@@ -495,37 +503,40 @@ internal class Win32TrayImpl private constructor(
             bindings.handle("SetForegroundWindow").invokeExact(hwnd) as Int
         }
 
-        val createdMenus = ArrayList<MemorySegment>()
-        val cmdToId = HashMap<Int, String>()
-        val nextCmd = AtomicInteger(0x1000)
+        // Confined arena for menu label strings. AppendMenuW (with
+        // MF_STRING) copies the LPCWSTR contents into the menu's own
+        // storage, so the labels only need to outlive the call —
+        // releasing them after the loop avoids growing bindings.arena
+        // by ~50 bytes per item on every right-click.
+        Arena.ofConfined().use { tmpArena ->
+            val cmdToId = HashMap<Int, String>()
+            val nextCmd = AtomicInteger(0x1000)
 
-        val rootHmenu = runCatching {
-            bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
-        }.getOrNull() ?: return
-        if (rootHmenu.address() == 0L) return
-        createdMenus += rootHmenu
+            val rootHmenu = runCatching {
+                bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
+            }.getOrNull() ?: return
+            if (rootHmenu.address() == 0L) return
 
-        appendItems(rootHmenu, menu.items, cmdToId, nextCmd, createdMenus)
+            appendItems(rootHmenu, menu.items, cmdToId, nextCmd, tmpArena)
 
-        val flags = Win32Bindings.TPM_RETURNCMD or Win32Bindings.TPM_RIGHTBUTTON
-        val selected = runCatching {
-            bindings.handle("TrackPopupMenu").invokeExact(
-                rootHmenu, flags, x, y, 0, hwnd, MemorySegment.NULL,
-            ) as Int
-        }.getOrDefault(0)
+            val flags = Win32Bindings.TPM_RETURNCMD or Win32Bindings.TPM_RIGHTBUTTON
+            val selected = runCatching {
+                bindings.handle("TrackPopupMenu").invokeExact(
+                    rootHmenu, flags, x, y, 0, hwnd, MemorySegment.NULL,
+                ) as Int
+            }.getOrDefault(0)
 
-        // DestroyMenu walks any submenus attached via MF_POPUP, but
-        // submenus we built and *didn't* attach (none in this code path)
-        // would leak. Plus per Win32 docs, calling DestroyMenu on a
-        // submenu that's been attached is forbidden. Walk the list
-        // backwards: root last (it owns the children), submenus first
-        // get a no-op DestroyMenu since they're already owned by root.
-        runCatching { bindings.handle("DestroyMenu").invokeExact(rootHmenu) as Int }
+            // DestroyMenu on the root walks any submenus attached via
+            // MF_POPUP — that frees the whole HMENU tree in one call.
+            // Per Win32 docs, calling DestroyMenu on an already-attached
+            // submenu is forbidden, so we never track them separately.
+            runCatching { bindings.handle("DestroyMenu").invokeExact(rootHmenu) as Int }
 
-        if (selected != 0) {
-            val libtrayId = cmdToId[selected]
-            if (libtrayId != null) {
-                fire(TrayEvent.MenuItemSelected(libtrayId))
+            if (selected != 0) {
+                val libtrayId = cmdToId[selected]
+                if (libtrayId != null) {
+                    fire(TrayEvent.MenuItemSelected(libtrayId))
+                }
             }
         }
     }
@@ -535,13 +546,18 @@ internal class Win32TrayImpl private constructor(
      * a fresh command id (0x1000+counter) so TrackPopupMenu's return
      * value can be looked up against [cmdToId] to recover the libtray
      * id. Submenus get a child HMENU built recursively.
+     *
+     * Label segments are allocated from [tmpArena] — the caller owns
+     * the arena and closes it after TrackPopupMenu returns; AppendMenuW
+     * has already copied each label into the menu's internal storage by
+     * then.
      */
     private fun appendItems(
         parent: MemorySegment,
         items: List<dev.hivens.libtray.TrayMenuItem>,
         cmdToId: HashMap<Int, String>,
         nextCmd: AtomicInteger,
-        createdMenus: ArrayList<MemorySegment>,
+        tmpArena: Arena,
     ) {
         val appendMenu = bindings.handle("AppendMenuW")
         for (item in items) {
@@ -554,7 +570,7 @@ internal class Win32TrayImpl private constructor(
                 is dev.hivens.libtray.TrayMenuItem.Standard -> {
                     val cmd = nextCmd.getAndIncrement()
                     cmdToId[cmd] = item.id
-                    val labelSeg = allocateUtf16(bindings.arena, item.label)
+                    val labelSeg = allocateUtf16(tmpArena, item.label)
                     var flags = Win32Bindings.MF_STRING
                     if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
                     runCatching {
@@ -566,9 +582,8 @@ internal class Win32TrayImpl private constructor(
                         bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
                     }.getOrNull()
                     if (child != null && child.address() != 0L) {
-                        createdMenus += child
-                        appendItems(child, item.items, cmdToId, nextCmd, createdMenus)
-                        val labelSeg = allocateUtf16(bindings.arena, item.label)
+                        appendItems(child, item.items, cmdToId, nextCmd, tmpArena)
+                        val labelSeg = allocateUtf16(tmpArena, item.label)
                         var flags = Win32Bindings.MF_POPUP or Win32Bindings.MF_STRING
                         if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
                         runCatching {
