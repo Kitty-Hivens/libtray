@@ -64,7 +64,9 @@ internal class SniTrayImpl private constructor(
     @Volatile private var iconBytes: ByteArray = initial.iconBytes
     @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
     @Volatile private var tooltip: String = initial.tooltip ?: ""
-    @Volatile private var menu: TrayMenu? = initial.menu  // currently informational only
+    @Volatile private var menu: TrayMenu? = initial.menu
+    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let(::DBusMenuLayout)
+    private val layoutRevision = AtomicInteger(0)
     @Volatile private var status: String = "Active"
     @Volatile private var open = AtomicBoolean(true)
 
@@ -100,8 +102,9 @@ internal class SniTrayImpl private constructor(
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
         this.menu = menu
-        // No NewMenu signal until DBusMenu protocol lands — current
-        // contract is "client shows its own popup on MenuRequested".
+        this.menuLayout = menu?.let(::DBusMenuLayout)
+        layoutRevision.incrementAndGet()
+        emitLayoutUpdated()
         return true
     }
 
@@ -172,8 +175,18 @@ internal class SniTrayImpl private constructor(
                 else                 -> log.debug("Unhandled SNI.{}", member)
             }
             "org.freedesktop.DBus.Introspectable" -> when (member) {
-                "Introspect" -> handleIntrospect(msg)
+                "Introspect" -> handleIntrospect(msg, path)
                 else         -> log.debug("Unhandled Introspectable.{}", member)
+            }
+            "com.canonical.dbusmenu" -> when (member) {
+                "GetLayout"           -> handleMenuGetLayout(msg)
+                "GetGroupProperties"  -> handleMenuGetGroupProperties(msg)
+                "GetProperty"         -> handleMenuGetProperty(msg)
+                "Event"               -> handleMenuEvent(msg)
+                "EventGroup"          -> handleMenuEventGroup(msg)
+                "AboutToShow"         -> handleMenuAboutToShow(msg)
+                "AboutToShowGroup"    -> handleMenuAboutToShowGroup(msg)
+                else                  -> log.debug("Unhandled dbusmenu.{}", member)
             }
             "org.freedesktop.DBus" -> {
                 // Bus signals (NameOwnerChanged etc) — informational, ignore.
@@ -257,7 +270,12 @@ internal class SniTrayImpl private constructor(
             "OverlayIconName"   -> appendVariantString(call, parent, "")
             "AttentionIconName" -> appendVariantString(call, parent, "")
             "ToolTip"       -> appendVariantToolTip(call, parent, tooltip)
-            "Menu"          -> appendVariantObjectPath(call, parent, "/")
+            // Always advertise /MenuBar so the host knows where to fetch
+            // the dbusmenu, even when there's currently no menu set —
+            // GetLayout responds with an empty root in that case. Toggling
+            // Menu between "/" and "/MenuBar" mid-life confuses some hosts
+            // (KDE plasmashell drops the icon on the toggle).
+            "Menu"          -> appendVariantObjectPath(call, parent, "/MenuBar")
             "ItemIsMenu"    -> appendVariantBoolean(call, parent, false)
             else -> appendVariantString(call, parent, "")
         }
@@ -376,13 +394,278 @@ internal class SniTrayImpl private constructor(
 
     // ── Introspection (for hosts that probe before subscribing) ──────────
 
-    private fun handleIntrospect(msg: MemorySegment) {
+    private fun handleIntrospect(msg: MemorySegment, path: String) {
         Arena.ofConfined().use { call ->
             val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit)
-            appendBasicString(call, iter, DBusBindings.DBUS_TYPE_STRING, INTROSPECTION_XML)
+            val xml = when (path) {
+                "/MenuBar" -> INTROSPECTION_XML_MENU
+                else       -> INTROSPECTION_XML_ITEM
+            }
+            appendBasicString(call, iter, DBusBindings.DBUS_TYPE_STRING, xml)
             sendAndUnref(reply)
+        }
+    }
+
+    // ── DBusMenu protocol (com.canonical.dbusmenu) ───────────────────────
+
+    /**
+     * GetLayout(parentId, recursionDepth, propertyNames)
+     *   → (revision, root) where root is (id, properties, children).
+     *
+     * Hosts call this to fetch the menu structure on first show + on
+     * every LayoutUpdated signal we emit. recursionDepth = -1 means
+     * "give me everything"; finite values let the host page the tree.
+     */
+    private fun handleMenuGetLayout(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val parentId = readInt(call, iter) ?: 0
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
+            val depth = readInt(call, iter) ?: -1
+            // We ignore propertyNames and just send everything we know —
+            // the protocol allows unrequested properties in the response,
+            // and our property set is small enough that filtering would
+            // cost more code than it saves.
+
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
+
+            // Revision (uint32)
+            val intBuf = call.allocate(ValueLayout.JAVA_INT)
+            intBuf.set(ValueLayout.JAVA_INT, 0, layoutRevision.get())
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(replyIter, DBusBindings.DBUS_TYPE_UINT32.toInt(), intBuf) as Int
+
+            // Root struct (ia{sv}av) — recursive subtree from parentId.
+            marshallNode(call, replyIter, parentId, depth)
+            sendAndUnref(reply)
+        }
+    }
+
+    private fun marshallNode(call: Arena, parent: MemorySegment, nodeId: Int, depthRemaining: Int) {
+        val struct = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+
+        // int32 id
+        val intBuf = call.allocate(ValueLayout.JAVA_INT)
+        intBuf.set(ValueLayout.JAVA_INT, 0, nodeId)
+        bindings.handle("dbus_message_iter_append_basic")
+            .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+
+        // a{sv} properties dict
+        val dictSig = call.allocateUtf8("{sv}")
+        val dictArr = call.allocate(bindings.messageIterLayout)
+        openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dictArr)
+        val props = menuLayout?.propertiesOf(nodeId).orEmpty()
+        for ((name, value) in props) {
+            appendMenuPropertyEntry(call, dictArr, name, value)
+        }
+        closeContainer(struct, dictArr)
+
+        // av children — array of variants of (ia{sv}av)
+        val childSig = call.allocateUtf8("v")
+        val childArr = call.allocate(bindings.messageIterLayout)
+        openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, childSig, childArr)
+        if (depthRemaining != 0) {
+            val nextDepth = if (depthRemaining < 0) -1 else depthRemaining - 1
+            for (childId in menuLayout?.childrenOf(nodeId).orEmpty()) {
+                val variant = call.allocate(bindings.messageIterLayout)
+                val variantSig = call.allocateUtf8("(ia{sv}av)")
+                openContainer(childArr, DBusBindings.DBUS_TYPE_VARIANT, variantSig, variant)
+                marshallNode(call, variant, childId, nextDepth)
+                closeContainer(childArr, variant)
+            }
+        }
+        closeContainer(struct, childArr)
+
+        closeContainer(parent, struct)
+    }
+
+    private fun appendMenuPropertyEntry(call: Arena, parent: MemorySegment, name: String, value: DBusMenuLayout.PropertyValue) {
+        val entry = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_DICT_ENTRY, MemorySegment.NULL, entry)
+        appendBasicString(call, entry, DBusBindings.DBUS_TYPE_STRING, name)
+        when (value) {
+            is DBusMenuLayout.PropertyValue.Str  -> appendVariantString(call, entry, value.value)
+            is DBusMenuLayout.PropertyValue.Bool -> appendVariantBoolean(call, entry, value.value)
+        }
+        closeContainer(parent, entry)
+    }
+
+    /**
+     * GetGroupProperties(ids, propertyNames) → a(ia{sv})
+     *   array of (id, properties_dict).
+     */
+    private fun handleMenuGetGroupProperties(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val ids = readIntArray(call, iter)
+            // We ignore propertyNames; same reasoning as GetLayout.
+
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
+
+            val arrSig = call.allocateUtf8("(ia{sv})")
+            val arr = call.allocate(bindings.messageIterLayout)
+            openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
+            for (id in ids) {
+                val struct = call.allocate(bindings.messageIterLayout)
+                openContainer(arr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+                val intBuf = call.allocate(ValueLayout.JAVA_INT)
+                intBuf.set(ValueLayout.JAVA_INT, 0, id)
+                bindings.handle("dbus_message_iter_append_basic")
+                    .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+                val dictSig = call.allocateUtf8("{sv}")
+                val dict = call.allocate(bindings.messageIterLayout)
+                openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dict)
+                for ((name, value) in menuLayout?.propertiesOf(id).orEmpty()) {
+                    appendMenuPropertyEntry(call, dict, name, value)
+                }
+                closeContainer(struct, dict)
+                closeContainer(arr, struct)
+            }
+            closeContainer(replyIter, arr)
+            sendAndUnref(reply)
+        }
+    }
+
+    /** GetProperty(id, name) → variant. Niche; hosts mostly use GetGroupProperties. */
+    private fun handleMenuGetProperty(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
+            val propName = readBasicString(call, iter) ?: return replyEmpty(msg)
+
+            val value = menuLayout?.propertiesOf(id)?.get(propName)
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
+            when (value) {
+                is DBusMenuLayout.PropertyValue.Str  -> appendVariantString(call, replyIter, value.value)
+                is DBusMenuLayout.PropertyValue.Bool -> appendVariantBoolean(call, replyIter, value.value)
+                null                                  -> appendVariantString(call, replyIter, "")
+            }
+            sendAndUnref(reply)
+        }
+    }
+
+    /**
+     * Event(id, eventId, data, timestamp) — host tells us about user
+     * interaction. We care about "clicked"; everything else is acked
+     * with an empty reply.
+     */
+    private fun handleMenuEvent(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
+            val eventId = readBasicString(call, iter) ?: return replyEmpty(msg)
+            // data + timestamp ignored — we don't expose them as event fields.
+            if (eventId == "clicked") {
+                val originalId = menuLayout?.nodeOf(id)?.originalId
+                if (originalId != null && originalId != "<root>") {
+                    fire(TrayEvent.MenuItemSelected(originalId))
+                }
+            }
+            replyEmpty(msg)
+        }
+    }
+
+    /** EventGroup(events: a(isvu)) — batched Event. Reply: a(i) of unhandled ids. */
+    private fun handleMenuEventGroup(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val arrIter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_recurse").invokeExact(iter, arrIter) as Unit
+            // Walk each (i s v u) tuple — pull id + event_id, ignore data + ts.
+            while (true) {
+                val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(arrIter) as Int
+                if (argType.toByte() == DBusBindings.DBUS_TYPE_INVALID) break
+                val structIter = call.allocate(bindings.messageIterLayout)
+                bindings.handle("dbus_message_iter_recurse").invokeExact(arrIter, structIter) as Unit
+                val id = readInt(call, structIter) ?: 0
+                bindings.handle("dbus_message_iter_next").invokeExact(structIter) as Int
+                val eventId = readBasicString(call, structIter) ?: ""
+                if (eventId == "clicked") {
+                    val originalId = menuLayout?.nodeOf(id)?.originalId
+                    if (originalId != null && originalId != "<root>") {
+                        fire(TrayEvent.MenuItemSelected(originalId))
+                    }
+                }
+                bindings.handle("dbus_message_iter_next").invokeExact(arrIter) as Int
+            }
+
+            // Reply: empty array of int (no unhandled events).
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
+            val arrSig = call.allocateUtf8("i")
+            val replyArr = call.allocate(bindings.messageIterLayout)
+            openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, replyArr)
+            closeContainer(replyIter, replyArr)
+            sendAndUnref(reply)
+        }
+    }
+
+    /** AboutToShow(id) → bool needsUpdate. We never need a layout refresh on demand. */
+    private fun handleMenuAboutToShow(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit
+            val boolBuf = call.allocate(ValueLayout.JAVA_INT)
+            boolBuf.set(ValueLayout.JAVA_INT, 0, 0)  // no update needed
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(iter, DBusBindings.DBUS_TYPE_BOOLEAN.toInt(), boolBuf) as Int
+            sendAndUnref(reply)
+        }
+    }
+
+    /** AboutToShowGroup(ids) → (a(i) updatesNeeded, a(i) idErrors). Both empty. */
+    private fun handleMenuAboutToShowGroup(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit
+            val arrSig = call.allocateUtf8("i")
+            for (i in 0 until 2) {
+                val arr = call.allocate(bindings.messageIterLayout)
+                openContainer(iter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
+                closeContainer(iter, arr)
+            }
+            sendAndUnref(reply)
+        }
+    }
+
+    /** Tell hosts the menu layout changed. They re-call GetLayout. */
+    private fun emitLayoutUpdated() {
+        Arena.ofConfined().use { call ->
+            val path = call.allocateUtf8("/MenuBar")
+            val iface = call.allocateUtf8("com.canonical.dbusmenu")
+            val member = call.allocateUtf8("LayoutUpdated")
+            val sig = bindings.handle("dbus_message_new_signal")
+                .invokeExact(path, iface, member) as MemorySegment
+            if (sig.address() == 0L) return
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(sig, iter) as Unit
+            val intBuf = call.allocate(ValueLayout.JAVA_INT)
+            intBuf.set(ValueLayout.JAVA_INT, 0, layoutRevision.get())
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(iter, DBusBindings.DBUS_TYPE_UINT32.toInt(), intBuf) as Int
+            intBuf.set(ValueLayout.JAVA_INT, 0, 0)  // root id 0 — entire layout updated
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(iter, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+            sendAndUnref(sig)
         }
     }
 
@@ -417,6 +700,34 @@ internal class SniTrayImpl private constructor(
         bindings.handle("dbus_message_iter_get_basic").invokeExact(iter, out) as Unit
         val ptr = out.get(ValueLayout.ADDRESS, 0)
         return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getUtf8String(0)
+    }
+
+    private fun readInt(call: Arena, iter: MemorySegment): Int? {
+        val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
+        // Accept INT32 / UINT32 / BOOLEAN — they're all 32-bit on the wire.
+        if (argType.toByte() != DBusBindings.DBUS_TYPE_INT32 &&
+            argType.toByte() != DBusBindings.DBUS_TYPE_UINT32 &&
+            argType.toByte() != DBusBindings.DBUS_TYPE_BOOLEAN) return null
+        val out = call.allocate(ValueLayout.JAVA_INT)
+        bindings.handle("dbus_message_iter_get_basic").invokeExact(iter, out) as Unit
+        return out.get(ValueLayout.JAVA_INT, 0)
+    }
+
+    /** Walk an `ai` array iterator and collect ints. Iterator must be at the array start. */
+    private fun readIntArray(call: Arena, iter: MemorySegment): List<Int> {
+        val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
+        if (argType.toByte() != DBusBindings.DBUS_TYPE_ARRAY) return emptyList()
+        val sub = call.allocate(bindings.messageIterLayout)
+        bindings.handle("dbus_message_iter_recurse").invokeExact(iter, sub) as Unit
+        val result = mutableListOf<Int>()
+        while (true) {
+            val elementType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(sub) as Int
+            if (elementType.toByte() == DBusBindings.DBUS_TYPE_INVALID) break
+            val v = readInt(call, sub) ?: break
+            result += v
+            bindings.handle("dbus_message_iter_next").invokeExact(sub) as Int
+        }
+        return result
     }
 
     private fun appendBasicString(call: Arena, iter: MemorySegment, type: Byte, value: String) {
@@ -497,8 +808,10 @@ internal class SniTrayImpl private constructor(
 
         // Minimal introspection — hosts that probe before subscribing
         // need it; without it some implementations refuse to render the
-        // icon. Lists the methods + signals we actually implement.
-        private val INTROSPECTION_XML = """
+        // icon. Lists the methods + signals we actually implement on
+        // each path — /StatusNotifierItem and /MenuBar are dispatched
+        // separately by [handleIntrospect].
+        private val INTROSPECTION_XML_ITEM = """
             <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
               "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
             <node>
@@ -514,6 +827,51 @@ internal class SniTrayImpl private constructor(
               <interface name="org.freedesktop.DBus.Properties">
                 <method name="Get"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
                 <method name="GetAll"><arg type="s" direction="in"/><arg type="a{sv}" direction="out"/></method>
+              </interface>
+              <interface name="org.freedesktop.DBus.Introspectable">
+                <method name="Introspect"><arg type="s" direction="out"/></method>
+              </interface>
+            </node>
+        """.trimIndent()
+
+        private val INTROSPECTION_XML_MENU = """
+            <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+              "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+            <node>
+              <interface name="com.canonical.dbusmenu">
+                <method name="GetLayout">
+                  <arg type="i" direction="in"/><arg type="i" direction="in"/><arg type="as" direction="in"/>
+                  <arg type="u" direction="out"/><arg type="(ia{sv}av)" direction="out"/>
+                </method>
+                <method name="GetGroupProperties">
+                  <arg type="ai" direction="in"/><arg type="as" direction="in"/>
+                  <arg type="a(ia{sv})" direction="out"/>
+                </method>
+                <method name="GetProperty">
+                  <arg type="i" direction="in"/><arg type="s" direction="in"/>
+                  <arg type="v" direction="out"/>
+                </method>
+                <method name="Event">
+                  <arg type="i" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="in"/><arg type="u" direction="in"/>
+                </method>
+                <method name="EventGroup">
+                  <arg type="a(isvu)" direction="in"/>
+                  <arg type="ai" direction="out"/>
+                </method>
+                <method name="AboutToShow">
+                  <arg type="i" direction="in"/>
+                  <arg type="b" direction="out"/>
+                </method>
+                <method name="AboutToShowGroup">
+                  <arg type="ai" direction="in"/>
+                  <arg type="ai" direction="out"/><arg type="ai" direction="out"/>
+                </method>
+                <signal name="LayoutUpdated">
+                  <arg type="u"/><arg type="i"/>
+                </signal>
+                <signal name="ItemsPropertiesUpdated">
+                  <arg type="a(ia{sv})"/><arg type="a(ias)"/>
+                </signal>
               </interface>
               <interface name="org.freedesktop.DBus.Introspectable">
                 <method name="Introspect"><arg type="s" direction="out"/></method>
