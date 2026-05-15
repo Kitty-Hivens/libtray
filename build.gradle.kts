@@ -4,6 +4,18 @@ plugins {
     `maven-publish`
 }
 
+tasks.register<JavaExec>("runSmoke") {
+    group = "verification"
+    description = "Open a tray icon and print click events. Ctrl-C to exit."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("io.github.kittyhivens.libtray.SmokeMainKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    standardInput = System.`in`
+    // Don't fail the build if a developer aborts the smoke with Ctrl-C —
+    // SIGINT exits the JVM with code 130, JavaExec treats that as failure.
+    isIgnoreExitValue = true
+}
+
 group = "io.github.kitty-hivens"
 // Version comes from the git tag at CI time via `-PappVersion=<tag>`;
 // falls back to `git describe` for local development. Mirrors Aura's
