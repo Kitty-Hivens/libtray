@@ -17,6 +17,8 @@ import java.lang.invoke.MethodType
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -51,16 +53,41 @@ import javax.imageio.ImageIO
  */
 internal class Win32TrayImpl private constructor(
     private val bindings: Win32Bindings,
-    private val hwnd: MemorySegment,
     private val classNameSeg: MemorySegment,
     private val hInstance: MemorySegment,
-    initial: TrayBuilder,
+    private val initial: TrayBuilder,
 ) : Tray {
 
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
     @Volatile private var open = AtomicBoolean(true)
     private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+
+    /**
+     * The HWND for the message-only window. Set by the pump thread once
+     * `CreateWindowExW` returns. Read by the main thread after the
+     * [readyLatch] fires; written and read on the pump thread thereafter.
+     *
+     * Must be created on the pump thread because Win32 messages
+     * (including the WM_USER+1 callbacks Shell_NotifyIcon dispatches for
+     * mouse events) are posted to the *creating thread's* message queue.
+     * If we created the window on the main thread but pumped on a
+     * separate daemon, mouse callbacks would queue up on main forever
+     * and the pump would see nothing — exactly the "icon visible, no
+     * events" symptom seen on the first Windows test.
+     */
+    @Volatile private var hwnd: MemorySegment = MemorySegment.NULL
+
+    /**
+     * Signals "pump thread has either succeeded in creating the window
+     * + registering the icon, or failed and is exiting". `await`'d in
+     * [Companion.create] so the public `Tray.create` doesn't return a
+     * Tray that's still mid-init.
+     */
+    private val readyLatch = CountDownLatch(1)
+
+    /** Set true by the pump thread after a successful NIM_ADD. */
+    @Volatile private var creationSucceeded: Boolean = false
 
     /**
      * Reusable NOTIFYICONDATAW struct. Allocated once on the bindings
@@ -98,29 +125,11 @@ internal class Win32TrayImpl private constructor(
     }
 
     init {
-        HWND_INSTANCES[hwnd.address()] = this
+        // Window creation, instance registration, Shell_NotifyIcon
+        // NIM_ADD, and the pump loop ALL run on pumpThread — see the
+        // comment on [hwnd] for why. Main thread blocks on [readyLatch]
+        // inside Companion.create until the pump signals success/failure.
         pumpThread.start()
-
-        // Build HICON from the initial PNG; null is a soft failure —
-        // we still register the icon entry (Shell_NotifyIcon allows
-        // NIF_MESSAGE without NIF_ICON), the user just sees a blank
-        // square in the tray. Logging at warn so the issue is visible.
-        val initialIcon = pngToHicon(initial.iconBytes)
-        if (initialIcon == null) {
-            log.warn("PNG → HICON conversion returned null; tray entry will register without an icon")
-        } else {
-            iconHandle.set(initialIcon)
-        }
-
-        initNotifyIconData(initialIcon)
-        if (!shellNotifyIcon(Win32Bindings.NIM_ADD)) {
-            log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
-        }
-        // Opt into NOTIFYICON_VERSION_4 — modern mouse-message format
-        // (Task #112 needs this to read button events from lParam).
-        if (!shellNotifyIcon(Win32Bindings.NIM_SETVERSION)) {
-            log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
-        }
     }
 
     override val isOpen: Boolean get() = open.get()
@@ -319,20 +328,60 @@ internal class Win32TrayImpl private constructor(
     // ── Background dispatch loop ─────────────────────────────────────────
 
     private fun pumpLoop() {
-        // Allocate a single MSG struct off the bindings arena; reused
-        // every iteration. Lifetime tied to the Tray (closed alongside).
+        // ── Phase 1: bring up window + tray icon (this thread!) ───────────
+        // Done here rather than in the constructor because Win32 messages
+        // (the WM_USER+1 callbacks Shell_NotifyIcon dispatches for mouse
+        // events) queue up to the *creating* thread. We pump on this
+        // thread, so we MUST create the window on this thread too.
+        val createdHwnd = createMessageWindow()
+        if (createdHwnd == null || createdHwnd.address() == 0L) {
+            log.warn("CreateWindowExW failed on pump thread (GetLastError={})", lastError())
+            readyLatch.countDown()
+            return
+        }
+        hwnd = createdHwnd
+        HWND_INSTANCES[createdHwnd.address()] = this
+        log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
+
+        val initialIcon = pngToHicon(initial.iconBytes)
+        if (initialIcon == null) {
+            log.warn("PNG → HICON conversion returned null; tray entry will register without an icon")
+        } else {
+            iconHandle.set(initialIcon)
+        }
+
+        initNotifyIconData(initialIcon)
+        val nimAddOk = shellNotifyIcon(Win32Bindings.NIM_ADD)
+        if (!nimAddOk) {
+            log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
+            // Don't bail — even a failed NIM_ADD shouldn't tear down the
+            // pump; the caller will see creationSucceeded=false from
+            // Companion.create and decide how to degrade.
+        } else {
+            log.info("Shell_NotifyIcon NIM_ADD succeeded (uID={})", Win32Bindings.TRAY_ICON_UID)
+        }
+        // NIM_SETVERSION must come AFTER NIM_ADD per MSDN; it switches
+        // the icon entry to NOTIFYICON_VERSION_4 mouse-message format.
+        if (!shellNotifyIcon(Win32Bindings.NIM_SETVERSION)) {
+            log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
+        }
+
+        creationSucceeded = nimAddOk
+        readyLatch.countDown()
+
+        // ── Phase 2: drain message queue until close() ────────────────────
         val msg = bindings.arena.allocate(bindings.msgLayout)
         val peekMessage = bindings.handle("PeekMessageW")
         val translateMessage = bindings.handle("TranslateMessage")
         val dispatchMessage = bindings.handle("DispatchMessageW")
         val msgOffset = bindings.msgLayout.byteOffset(
-            java.lang.foreign.MemoryLayout.PathElement.groupElement("message"),
+            MemoryLayout.PathElement.groupElement("message"),
         )
         while (open.get()) {
             try {
                 val gotMessage = peekMessage.invokeExact(
                     msg,
-                    MemorySegment.NULL,                      // any window
+                    MemorySegment.NULL,                      // any of this thread's windows
                     0,                                        // wMsgFilterMin
                     0,                                        // wMsgFilterMax
                     Win32Bindings.PM_REMOVE,
@@ -352,6 +401,30 @@ internal class Win32TrayImpl private constructor(
                 log.warn("Win32 pump iteration threw: {}", t.message)
             }
         }
+    }
+
+    /**
+     * Create the message-only HWND. Runs on the pump thread (see
+     * thread-affinity comment on [hwnd]). All other window-init work
+     * (class registration, hInstance lookup) happened on the main
+     * thread inside [Companion.createInternal] — that work is per-process
+     * and thread-safe.
+     */
+    private fun createMessageWindow(): MemorySegment? {
+        return runCatching {
+            val windowName = allocateUtf16(bindings.arena, initial.title)
+            bindings.handle("CreateWindowExW").invokeExact(
+                0,                                      // dwExStyle
+                classNameSeg,                           // lpClassName
+                windowName,                             // lpWindowName
+                0,                                      // dwStyle
+                0, 0, 0, 0,                            // x, y, w, h (irrelevant for message-only)
+                Win32Bindings.HWND_MESSAGE,             // hWndParent — message-only
+                MemorySegment.NULL,                     // hMenu
+                hInstance,                              // hInstance
+                MemorySegment.NULL,                     // lpParam
+            ) as MemorySegment
+        }.onFailure { log.warn("CreateWindowExW threw: {}", it.message) }.getOrNull()
     }
 
     // ── WndProc dispatch (called from the upcall stub) ───────────────────
@@ -602,6 +675,7 @@ internal class Win32TrayImpl private constructor(
 
             // hInstance — HMODULE of the calling EXE. Passing NULL to
             // GetModuleHandleW returns the EXE that owns the JVM process.
+            // Process-wide handle, safe to acquire on any thread.
             val hInstance = bindings.handle("GetModuleHandleW")
                 .invokeExact(MemorySegment.NULL) as MemorySegment
             if (hInstance.address() == 0L) {
@@ -615,26 +689,29 @@ internal class Win32TrayImpl private constructor(
                 return null
             }
 
-            // Window class name — wide-string. Suffixed with PID + counter
-            // so multiple Tray instances + multiple processes don't collide.
+            // Window class registration is per-process and thread-safe;
+            // doing it on the main thread (here) keeps the pump thread's
+            // entry path lean. CreateWindowExW itself has to wait until
+            // the pump thread runs — that's done inside Win32TrayImpl's
+            // pumpLoop, see the thread-affinity comment on [hwnd].
             val className = "LibtrayWin32-${ProcessHandle.current().pid()}-${classCounter.incrementAndGet()}"
             val classNameSeg = allocateUtf16(arena, className)
 
-            // WNDCLASSEXW — populate, register. cbSize is mandatory.
             val wc = arena.allocate(bindings.wndClassExWLayout)
             val layout = bindings.wndClassExWLayout
-            wc.set(ValueLayout.JAVA_INT, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("cbSize")), layout.byteSize().toInt())
-            wc.set(ValueLayout.JAVA_INT, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("style")), 0)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("lpfnWndProc")), stub)
-            wc.set(ValueLayout.JAVA_INT, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("cbClsExtra")), 0)
-            wc.set(ValueLayout.JAVA_INT, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("cbWndExtra")), 0)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("hInstance")), hInstance)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("hIcon")), MemorySegment.NULL)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("hCursor")), MemorySegment.NULL)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("hbrBackground")), MemorySegment.NULL)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("lpszMenuName")), MemorySegment.NULL)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("lpszClassName")), classNameSeg)
-            wc.set(ValueLayout.ADDRESS, layout.byteOffset(java.lang.foreign.MemoryLayout.PathElement.groupElement("hIconSm")), MemorySegment.NULL)
+            fun off(name: String): Long = layout.byteOffset(MemoryLayout.PathElement.groupElement(name))
+            wc.set(ValueLayout.JAVA_INT, off("cbSize"), layout.byteSize().toInt())
+            wc.set(ValueLayout.JAVA_INT, off("style"), 0)
+            wc.set(ValueLayout.ADDRESS, off("lpfnWndProc"), stub)
+            wc.set(ValueLayout.JAVA_INT, off("cbClsExtra"), 0)
+            wc.set(ValueLayout.JAVA_INT, off("cbWndExtra"), 0)
+            wc.set(ValueLayout.ADDRESS, off("hInstance"), hInstance)
+            wc.set(ValueLayout.ADDRESS, off("hIcon"), MemorySegment.NULL)
+            wc.set(ValueLayout.ADDRESS, off("hCursor"), MemorySegment.NULL)
+            wc.set(ValueLayout.ADDRESS, off("hbrBackground"), MemorySegment.NULL)
+            wc.set(ValueLayout.ADDRESS, off("lpszMenuName"), MemorySegment.NULL)
+            wc.set(ValueLayout.ADDRESS, off("lpszClassName"), classNameSeg)
+            wc.set(ValueLayout.ADDRESS, off("hIconSm"), MemorySegment.NULL)
 
             val atom = bindings.handle("RegisterClassExW").invokeExact(wc) as Short
             if (atom.toInt() == 0) {
@@ -642,33 +719,25 @@ internal class Win32TrayImpl private constructor(
                 log.warn("RegisterClassExW failed (GetLastError={})", err)
                 return null
             }
+            log.info("Win32 window class registered: {}", className)
 
-            // Create the message-only window. HWND_MESSAGE as parent puts
-            // it in the message-only manager — invisible, doesn't appear
-            // in alt-tab, but receives WM_USER messages just fine.
-            val windowName = allocateUtf16(arena, builder.title)
-            val hwnd = bindings.handle("CreateWindowExW").invokeExact(
-                0,                                      // dwExStyle
-                classNameSeg,                           // lpClassName
-                windowName,                             // lpWindowName
-                0,                                      // dwStyle
-                0, 0, 0, 0,                            // x, y, w, h (irrelevant for message-only)
-                Win32Bindings.HWND_MESSAGE,             // hWndParent — message-only
-                MemorySegment.NULL,                     // hMenu
-                hInstance,                              // hInstance
-                MemorySegment.NULL,                     // lpParam
-            ) as MemorySegment
-            if (hwnd.address() == 0L) {
-                val err = bindings.handle("GetLastError").invokeExact() as Int
-                log.warn("CreateWindowExW failed (GetLastError={})", err)
-                bindings.handle("UnregisterClassW").invokeExact(classNameSeg, hInstance) as Int
+            val instance = Win32TrayImpl(bindings, classNameSeg, hInstance, builder)
+            // Wait for the pump thread to finish window creation +
+            // NIM_ADD before handing the Tray back to the caller. 5s
+            // is generous — these calls return synchronously from the
+            // shell and complete in the millisecond range when they
+            // succeed at all.
+            if (!instance.readyLatch.await(5, TimeUnit.SECONDS)) {
+                log.warn("Win32 tray pump thread did not signal ready within 5s; tearing down")
+                instance.close()
                 return null
             }
-
-            log.info("Win32 tray foundation up: hwnd=0x{} class={}",
-                hwnd.address().toString(16), className)
-
-            return Win32TrayImpl(bindings, hwnd, classNameSeg, hInstance, builder)
+            if (!instance.creationSucceeded) {
+                log.warn("Win32 tray creation reported failure on pump thread")
+                instance.close()
+                return null
+            }
+            return instance
         }
 
         /**

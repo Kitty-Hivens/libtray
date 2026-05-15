@@ -4,12 +4,32 @@ plugins {
     `maven-publish`
 }
 
+// Dedicated configuration so the smoke harness can pull in an SLF4J
+// binding (slf4j-simple) without polluting the published library
+// artifact. The library API exposes slf4j-api only; consumers bring
+// their own binding (logback, log4j2, etc).
+val smokeRuntime: Configuration by configurations.creating {
+    extendsFrom(configurations.runtimeClasspath.get())
+}
+
+dependencies {
+    "smokeRuntime"(libs.slf4j.simple)
+}
+
 tasks.register<JavaExec>("runSmoke") {
     group = "verification"
     description = "Open a tray icon and print click events. Ctrl-C to exit."
-    classpath = sourceSets.main.get().runtimeClasspath
+    classpath = sourceSets.main.get().runtimeClasspath + smokeRuntime
     mainClass.set("dev.hivens.libtray.SmokeMainKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // Show INFO-level logs so the smoke harness surfaces backend
+    // diagnostics ("window class registered", "NIM_ADD succeeded",
+    // GetLastError on failure paths). Default slf4j-simple level is INFO
+    // already, but the system property makes the intent explicit and
+    // future-proofs against the default flipping in a newer release.
+    systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "info")
+    systemProperty("org.slf4j.simpleLogger.showDateTime", "true")
+    systemProperty("org.slf4j.simpleLogger.dateTimeFormat", "HH:mm:ss.SSS")
     standardInput = System.`in`
     // Don't fail the build if a developer aborts the smoke with Ctrl-C —
     // SIGINT exits the JVM with code 130, JavaExec treats that as failure.
