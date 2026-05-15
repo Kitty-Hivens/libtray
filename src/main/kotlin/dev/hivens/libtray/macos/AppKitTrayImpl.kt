@@ -1,15 +1,15 @@
-package io.github.kittyhivens.libtray.macos
+package dev.hivens.libtray.macos
 
-import io.github.kittyhivens.libtray.Tray
-import io.github.kittyhivens.libtray.TrayBuilder
-import io.github.kittyhivens.libtray.TrayEvent
-import io.github.kittyhivens.libtray.TrayMenu
+import dev.hivens.libtray.Tray
+import dev.hivens.libtray.TrayBuilder
+import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayMenu
 
 /**
  * macOS tray backend stub. Real implementation will wrap `NSStatusBar`
  * + `NSStatusItem` from AppKit via `objc_msgSend` Panama bindings. Lands
  * in a follow-up PR; this file exists so the factory in
- * [io.github.kittyhivens.libtray.Tray.create] can dispatch without
+ * [dev.hivens.libtray.Tray.create] can dispatch without
  * conditional reflection.
  *
  * Implementation note for future-self / contributors: AppKit must be

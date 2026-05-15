@@ -57,7 +57,7 @@ JitPack or build from source.
 
 ```kotlin
 dependencies {
-    implementation("io.github.kitty-hivens:libtray:0.1.0")
+    implementation("dev.hivens:libtray:0.1.0")
 }
 ```
 
@@ -70,7 +70,7 @@ specifically) to permit the native calls.
   <summary>Use</summary>
 
 ```kotlin
-import io.github.kittyhivens.libtray.*
+import dev.hivens.libtray.*
 
 val tray = Tray.create(
     TrayBuilder(

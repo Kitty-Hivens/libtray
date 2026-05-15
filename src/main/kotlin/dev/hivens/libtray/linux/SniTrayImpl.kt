@@ -1,9 +1,9 @@
-package io.github.kittyhivens.libtray.linux
+package dev.hivens.libtray.linux
 
-import io.github.kittyhivens.libtray.Tray
-import io.github.kittyhivens.libtray.TrayBuilder
-import io.github.kittyhivens.libtray.TrayEvent
-import io.github.kittyhivens.libtray.TrayMenu
+import dev.hivens.libtray.Tray
+import dev.hivens.libtray.TrayBuilder
+import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayMenu
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena

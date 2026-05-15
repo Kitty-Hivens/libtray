@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 /**
  * Static description of the right-click menu attached to a tray icon.

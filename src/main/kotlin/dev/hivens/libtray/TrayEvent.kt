@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 /**
  * Events the tray icon can fire. Subscribed to via [Tray.onEvent].

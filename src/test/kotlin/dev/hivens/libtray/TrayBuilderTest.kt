@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.shouldBe

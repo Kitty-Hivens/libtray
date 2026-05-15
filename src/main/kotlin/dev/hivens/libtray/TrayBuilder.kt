@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 /**
  * Immutable construction parameters for [Tray.create]. Held by the backend

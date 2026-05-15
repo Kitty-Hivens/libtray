@@ -1,15 +1,15 @@
-package io.github.kittyhivens.libtray.windows
+package dev.hivens.libtray.windows
 
-import io.github.kittyhivens.libtray.Tray
-import io.github.kittyhivens.libtray.TrayBuilder
-import io.github.kittyhivens.libtray.TrayEvent
-import io.github.kittyhivens.libtray.TrayMenu
+import dev.hivens.libtray.Tray
+import dev.hivens.libtray.TrayBuilder
+import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayMenu
 
 /**
  * Windows tray backend stub. Real implementation will wrap
  * `Shell_NotifyIcon` from `shell32.dll` and pump notifications via a
  * Win32 message loop. Lands in a follow-up PR; this file exists so the
- * factory in [io.github.kittyhivens.libtray.Tray.create] can dispatch
+ * factory in [dev.hivens.libtray.Tray.create] can dispatch
  * without conditional reflection.
  */
 internal class Win32TrayImpl private constructor() : Tray {

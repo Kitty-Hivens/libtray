@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 import org.slf4j.LoggerFactory
 
@@ -81,11 +81,11 @@ public interface Tray : AutoCloseable {
             val backend: Tray? = runCatching {
                 when {
                     osName.contains("linux") || osName.contains("bsd") ->
-                        io.github.kittyhivens.libtray.linux.SniTrayImpl.create(builder)
+                        dev.hivens.libtray.linux.SniTrayImpl.create(builder)
                     osName.contains("windows") ->
-                        io.github.kittyhivens.libtray.windows.Win32TrayImpl.create(builder)
+                        dev.hivens.libtray.windows.Win32TrayImpl.create(builder)
                     osName.contains("mac") || osName.contains("darwin") ->
-                        io.github.kittyhivens.libtray.macos.AppKitTrayImpl.create(builder)
+                        dev.hivens.libtray.macos.AppKitTrayImpl.create(builder)
                     else -> null
                 }
             }.onFailure {

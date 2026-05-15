@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray.linux
+package dev.hivens.libtray.linux
 
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor

@@ -1,7 +1,7 @@
-package io.github.kittyhivens.libtray.linux
+package dev.hivens.libtray.linux
 
-import io.github.kittyhivens.libtray.TrayMenu
-import io.github.kittyhivens.libtray.TrayMenuItem
+import dev.hivens.libtray.TrayMenu
+import dev.hivens.libtray.TrayMenuItem
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * subtree, properties, and children. When the host fires `Event(id,
  * "clicked", ...)` we look the int back up to recover the original
  * caller-supplied string id and surface that via
- * [io.github.kittyhivens.libtray.TrayEvent.MenuItemSelected].
+ * [dev.hivens.libtray.TrayEvent.MenuItemSelected].
  *
  * One [DBusMenuLayout] per [TrayMenu] snapshot — calling
  * [SniTrayImpl.setMenu] swaps in a fresh layout and emits the

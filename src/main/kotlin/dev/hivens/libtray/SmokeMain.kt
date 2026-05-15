@@ -1,4 +1,4 @@
-package io.github.kittyhivens.libtray
+package dev.hivens.libtray
 
 import java.awt.Color
 import java.awt.image.BufferedImage

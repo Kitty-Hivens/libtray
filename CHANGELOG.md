@@ -9,7 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Repository scaffold: Apache 2.0 license, Gradle/Kotlin build,
   Java 22 toolchain (Project Panama floor — `java.lang.foreign`
   finalized as JEP 454), gradle wrapper.
-- Public API surface in `io.github.kittyhivens.libtray`:
+- Public API surface in `dev.hivens.libtray`:
   `Tray` interface (open/close lifecycle, icon + tooltip + menu
   setters, event subscription), `TrayBuilder` (immutable construction
   parameters), `TrayEvent` sealed hierarchy
