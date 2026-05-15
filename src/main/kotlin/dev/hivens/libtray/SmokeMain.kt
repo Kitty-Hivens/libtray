@@ -9,9 +9,28 @@ import javax.imageio.ImageIO
  * Manual smoke for the tray backend. Run via `./gradlew runSmoke` —
  * shows a 32x32 tray icon, prints click events to stdout. Ctrl-C to exit.
  *
- * Used by the maintainer to eyeball the Linux backend on Hyprland / KDE
- * before we have CI infrastructure that can probe the desktop's tray
- * host. Not a unit test — it's interactive.
+ * Used by the maintainer to eyeball each platform's backend before we
+ * have CI infrastructure that can probe the OS's tray host. Not a unit
+ * test — it's interactive.
+ *
+ * **Validation checklist** (use this as a script when you bring up a
+ * fresh platform or sanity-check after a backend change):
+ *
+ *   1. Run `./gradlew runSmoke` (or `gradlew.bat runSmoke` on Windows).
+ *      Stdout should print "tray live" within a couple of seconds.
+ *   2. Look at your system tray / notification area. A purple circle
+ *      icon should appear with a black "i"-shaped glyph.
+ *   3. Hover the icon. Tooltip should read "libtray smoke test".
+ *   4. Left-click the icon. Stdout should print
+ *      `[smoke] event: Activated (left click)`.
+ *   5. Right-click the icon. A two-item menu should appear:
+ *      "Click me (noop)" + "Exit", separated by a horizontal line.
+ *   6. Click "Click me (noop)". Stdout should print
+ *      `[smoke] event: MenuItemSelected id=noop`.
+ *   7. Right-click again, click "Exit". Stdout should print
+ *      `id=exit` and the program should terminate cleanly.
+ *
+ * Per-OS prerequisites covered in the failure message below.
  */
 fun main() {
     println("libtray smoke — building 32x32 PNG icon in memory...")
@@ -44,11 +63,22 @@ fun main() {
             )),
         ),
     ) ?: run {
-        System.err.println("Tray.create returned null. " +
-            "On Linux this means libdbus + session bus + StatusNotifierWatcher must all be reachable. " +
-            "Check that you are running inside a desktop session (DISPLAY / WAYLAND_DISPLAY set, " +
-            "DBUS_SESSION_BUS_ADDRESS set), and that some component provides the SNI watcher " +
-            "(KDE plasmashell, GNOME's StatusNotifierItem extension, waybar's tray module on Hyprland).")
+        val os = System.getProperty("os.name", "").lowercase()
+        val hint = when {
+            os.contains("linux") || os.contains("bsd") ->
+                "Linux: libdbus + session bus + StatusNotifierWatcher must all be reachable. " +
+                "Check DISPLAY / WAYLAND_DISPLAY and DBUS_SESSION_BUS_ADDRESS are set, and that " +
+                "some component provides the SNI watcher (KDE plasmashell, GNOME's SNI extension, " +
+                "waybar's tray module on Hyprland)."
+            os.contains("windows") ->
+                "Windows: kernel32/user32/shell32/gdi32 must load (they always do on Windows; null " +
+                "here means a Panama upcall stub or RegisterClassExW failed — check the JVM has " +
+                "--enable-native-access=ALL-UNNAMED and is JDK 22+)."
+            os.contains("mac") || os.contains("darwin") ->
+                "macOS: NSStatusItem backend not yet implemented (Phase 4)."
+            else -> "Unrecognised OS: $os. libtray supports Linux, Windows, macOS."
+        }
+        System.err.println("Tray.create returned null. $hint")
         kotlin.system.exitProcess(1)
     }
 

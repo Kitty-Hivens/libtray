@@ -104,14 +104,15 @@ tray.close()
 <details>
   <summary>Status</summary>
 
-**Pre-release.** API may shift before 1.0. The Linux SNI backend is the
-first to land; Windows + macOS impls follow.
+**Pre-release.** API may shift before 1.0. Linux SNI + Windows
+Shell_NotifyIcon backends shipped; macOS is next.
 
 Built and validated against:
 
 - Aura Launcher (`Kitty-Hivens/Aura-Launcher`) — primary downstream
 - Linux: Hyprland, KDE Plasma — verified
-- Windows: pending
+- Windows: code complete (Shell_NotifyIcon + popup menu via Project Panama),
+  awaiting community validation across Win10 / Win11 / Server SKUs
 - macOS: pending (no Mac in maintainer's hands; community contributors with
   Apple Silicon are the current path to validation)
 </details>
