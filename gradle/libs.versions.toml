@@ -1,0 +1,28 @@
+[versions]
+# Pinned to match the Aura launcher's Kotlin so cross-project Panama
+# bindings stay binary-compatible. Bump in lockstep until libtray has
+# more downstream consumers than just Aura.
+kotlin = "2.3.20-RC3"
+slf4j  = "2.0.16"
+
+# Java 22 is the floor: that's where `java.lang.foreign` (Project Panama)
+# was finalized as JEP 454. Earlier LTSes (17, 21) still have FFM in
+# preview requiring `--enable-preview`, which a library shouldn't impose
+# on its consumers. 22 is also when `MemorySegment.allocate(layout, count)`
+# replaced the older `allocateArray` API the library uses.
+javaTarget = "22"
+
+# Test stack — light. JUnit 5 + Kotest assertions for readable test code.
+junit  = "5.11.4"
+kotest = "5.9.1"
+
+[libraries]
+slf4j-api    = { group = "org.slf4j", name = "slf4j-api",    version.ref = "slf4j" }
+slf4j-simple = { group = "org.slf4j", name = "slf4j-simple", version.ref = "slf4j" }
+
+junit-jupiter           = { group = "org.junit.jupiter", name = "junit-jupiter",           version.ref = "junit" }
+junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform-launcher" }
+kotest-assertions       = { group = "io.kotest", name = "kotest-assertions-core",          version.ref = "kotest" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
