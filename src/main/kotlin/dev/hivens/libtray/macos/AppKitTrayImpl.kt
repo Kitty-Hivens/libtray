@@ -6,7 +6,6 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import org.slf4j.LoggerFactory
-import java.awt.EventQueue
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -80,11 +79,9 @@ internal class AppKitTrayImpl private constructor(
 
     init {
         INSTANCE_REGISTRY[instanceId] = this
-        onAppKitThread {
-            if (initial.iconBytes.isNotEmpty()) applyIcon(initial.iconBytes)
-            initial.tooltip?.takeIf { it.isNotEmpty() }?.let { applyTooltip(it) }
-            initial.menu?.let { applyMenu(it) }
-        }
+        if (initial.iconBytes.isNotEmpty()) applyIcon(initial.iconBytes)
+        initial.tooltip?.takeIf { it.isNotEmpty() }?.let { applyTooltip(it) }
+        initial.menu?.let { applyMenu(it) }
     }
 
     override val isOpen: Boolean get() = open.get()
@@ -92,14 +89,14 @@ internal class AppKitTrayImpl private constructor(
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        return runCatching { onAppKitThread { applyIcon(iconBytes) }; true }.getOrElse { t ->
+        return runCatching { applyIcon(iconBytes); true }.getOrElse { t ->
             log.warn("setIcon threw: {}", t.message); false
         }
     }
 
     override fun setTooltip(text: String): Boolean {
         if (!open.get()) return false
-        return runCatching { onAppKitThread { applyTooltip(text) }; true }.getOrElse { t ->
+        return runCatching { applyTooltip(text); true }.getOrElse { t ->
             log.warn("setTooltip threw: {}", t.message); false
         }
     }
@@ -107,7 +104,7 @@ internal class AppKitTrayImpl private constructor(
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
         return runCatching {
-            onAppKitThread { if (menu == null) clearMenu() else applyMenu(menu) }
+            if (menu == null) clearMenu() else applyMenu(menu)
             true
         }.getOrElse { t ->
             log.warn("setMenu threw: {}", t.message); false
@@ -121,23 +118,19 @@ internal class AppKitTrayImpl private constructor(
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        runCatching { clearMenu() }
+        // [[NSStatusBar systemStatusBar] removeStatusItem:item]
         runCatching {
-            onAppKitThread {
-                runCatching { clearMenu() }
-                // [[NSStatusBar systemStatusBar] removeStatusItem:item]
-                runCatching {
-                    val nsStatusBarCls = bindings.cls("NSStatusBar")
-                    val systemStatusBar = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        systemStatusBar, bindings.sel("removeStatusItem:"), statusItem,
-                    ) as Unit
-                }
-                // Release our retained reference to the status item itself
-                runCatching {
-                    bindings.handle("objc_release").invokeExact(statusItem) as Unit
-                }
-            }
+            val nsStatusBarCls = bindings.cls("NSStatusBar")
+            val systemStatusBar = bindings.handle("objc_msgSend_id")
+                .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                systemStatusBar, bindings.sel("removeStatusItem:"), statusItem,
+            ) as Unit
+        }
+        // Release our retained reference to the status item itself
+        runCatching {
+            bindings.handle("objc_release").invokeExact(statusItem) as Unit
         }
         INSTANCE_REGISTRY.remove(instanceId)
     }
@@ -329,39 +322,6 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
-    /**
-     * Run an AppKit-touching block on the Cocoa main thread. macOS pins
-     * NSStatusItem creation, NSWindow ops, and most AppKit state
-     * mutations to the main thread; calling from a JVM background
-     * thread (like our pump or smoke main) crashes with
-     * `NSInternalInconsistencyException: NSWindow should only be
-     * instantiated on the main thread!`.
-     *
-     * AWT's EventQueue is bound to the AppKit main thread via JBR's
-     * Cocoa toolkit (and stock OpenJDK's CToolkit on macOS) once AWT
-     * is initialised — which BufferedImage / ImageIO operations
-     * trigger transparently on first touch. Routing through
-     * `EventQueue.invokeAndWait` puts our work on the right thread
-     * without needing to bind libdispatch.
-     *
-     * If the caller is already on the EDT, we run directly to avoid
-     * the deadlock that `invokeAndWait` would cause.
-     */
-    private fun onAppKitThread(block: () -> Unit) {
-        if (EventQueue.isDispatchThread()) {
-            block()
-            return
-        }
-        val error = arrayOfNulls<Throwable>(1)
-        EventQueue.invokeAndWait {
-            try {
-                block()
-            } catch (t: Throwable) {
-                error[0] = t
-            }
-        }
-        error[0]?.let { throw it }
-    }
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
@@ -418,78 +378,90 @@ internal class AppKitTrayImpl private constructor(
             }
             lastBindings = bindings
 
+            // Caller-thread check. NSStatusItem and every NSWindow
+            // constructor it delegates to are pinned to OS thread 0
+            // (Cocoa main thread). On a JVM that's the JVM main thread
+            // ONLY when launched with `-XstartOnFirstThread`. Without
+            // it, AppKit will throw `NSInternalInconsistencyException`
+            // mid-construction — surface a clean nullable return + a
+            // pointer at the fix instead, which downstream consumers
+            // can act on. (Also detects calls from worker threads of
+            // a properly-flagged process.)
+            if (!isCocoaMainThread(bindings)) {
+                log.warn(
+                    "AppKit tray must be created on the Cocoa main thread (OS thread 0). " +
+                        "Add `-XstartOnFirstThread` to the JVM launch args, and call Tray.create " +
+                        "from your application's main thread. Current thread: {}",
+                    Thread.currentThread().name,
+                )
+                return null
+            }
+
             return runCatching {
-                // Force AWT init BEFORE jumping onto the EDT — Toolkit
-                // boot has to happen from a non-EDT thread, and on
-                // macOS this is also what materialises the AppKit main
-                // thread that EventQueue then dispatches onto.
-                java.awt.Toolkit.getDefaultToolkit()
+                log.info("[create] step 1/5: ensure NSApplication is initialised")
+                ensureNSApplicationInitialised(bindings)
 
-                var result: Tray? = null
-                runOnAppKitThreadStatic {
-                    log.info("[create] step 1/5: ensure NSApplication is initialised")
-                    ensureNSApplicationInitialised(bindings)
+                log.info("[create] step 2/5: register LibtrayMenuTarget class")
+                ensureMenuTargetClass(bindings)
 
-                    log.info("[create] step 2/5: register LibtrayMenuTarget class")
-                    ensureMenuTargetClass(bindings)
-
-                    log.info("[create] step 3/5: get [NSStatusBar systemStatusBar]")
-                    val nsStatusBarCls = bindings.cls("NSStatusBar")
-                    val systemStatusBar = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
-                    if (systemStatusBar.address() == 0L) {
-                        log.warn("[NSStatusBar systemStatusBar] returned NULL")
-                        return@runOnAppKitThreadStatic
-                    }
-
-                    log.info("[create] step 4/5: statusItemWithLength:")
-                    val statusItem = bindings.handle("objc_msgSend_id_double")
-                        .invokeExact(
-                            systemStatusBar, bindings.sel("statusItemWithLength:"),
-                            ObjcBindings.NS_VARIABLE_STATUS_ITEM_LENGTH,
-                        ) as MemorySegment
-                    if (statusItem.address() == 0L) {
-                        log.warn("statusItemWithLength: returned NULL")
-                        return@runOnAppKitThreadStatic
-                    }
-                    val retainedItem = bindings.handle("objc_retain")
-                        .invokeExact(statusItem) as MemorySegment
-
-                    log.info("[create] step 5/5: get statusItem.button")
-                    val button = bindings.handle("objc_msgSend_id")
-                        .invokeExact(retainedItem, bindings.sel("button")) as MemorySegment
-                    if (button.address() == 0L) {
-                        log.warn("statusItem.button returned NULL — older macOS without NSStatusBarButton API?")
-                        bindings.handle("objc_release").invokeExact(retainedItem) as Unit
-                        return@runOnAppKitThreadStatic
-                    }
-
-                    log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
-                    result = AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder)
+                log.info("[create] step 3/5: get [NSStatusBar systemStatusBar]")
+                val nsStatusBarCls = bindings.cls("NSStatusBar")
+                val systemStatusBar = bindings.handle("objc_msgSend_id")
+                    .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
+                if (systemStatusBar.address() == 0L) {
+                    log.warn("[NSStatusBar systemStatusBar] returned NULL")
+                    return@runCatching null
                 }
-                result
+
+                log.info("[create] step 4/5: statusItemWithLength:")
+                val statusItem = bindings.handle("objc_msgSend_id_double")
+                    .invokeExact(
+                        systemStatusBar, bindings.sel("statusItemWithLength:"),
+                        ObjcBindings.NS_VARIABLE_STATUS_ITEM_LENGTH,
+                    ) as MemorySegment
+                if (statusItem.address() == 0L) {
+                    log.warn("statusItemWithLength: returned NULL")
+                    return@runCatching null
+                }
+                val retainedItem = bindings.handle("objc_retain")
+                    .invokeExact(statusItem) as MemorySegment
+
+                log.info("[create] step 5/5: get statusItem.button")
+                val button = bindings.handle("objc_msgSend_id")
+                    .invokeExact(retainedItem, bindings.sel("button")) as MemorySegment
+                if (button.address() == 0L) {
+                    log.warn("statusItem.button returned NULL — older macOS without NSStatusBarButton API?")
+                    bindings.handle("objc_release").invokeExact(retainedItem) as Unit
+                    return@runCatching null
+                }
+
+                log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
+                AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
             }.onFailure { log.warn("AppKit tray construction threw: {}", it.message) }.getOrNull()
         }
 
         /**
-         * Companion-scope variant of [AppKitTrayImpl.onAppKitThread]
-         * for use inside `create` where no instance exists yet.
-         * Same EDT-or-invokeAndWait dispatch.
+         * Ask Cocoa whether the caller is on the main thread.
+         * Equivalent to `[NSThread isMainThread]` — returns true only
+         * when the calling thread is OS thread 0, which is what every
+         * AppKit ops MUST run on. Used as a fail-fast guard before any
+         * NSStatusBar interaction, with a clear log pointing at the
+         * `-XstartOnFirstThread` JVM flag for the typical
+         * misconfiguration.
          */
-        private fun runOnAppKitThreadStatic(block: () -> Unit) {
-            if (EventQueue.isDispatchThread()) {
-                block()
-                return
+        private fun isCocoaMainThread(bindings: ObjcBindings): Boolean {
+            return runCatching {
+                val nsThreadCls = bindings.cls("NSThread")
+                // Class method — the receiver is the class itself.
+                // Returns BOOL (1 byte but msgSend treats as long here
+                // since we declared the variant that way).
+                val ret = bindings.handle("objc_msgSend_long")
+                    .invokeExact(nsThreadCls, bindings.sel("isMainThread")) as Long
+                ret != 0L
+            }.getOrElse {
+                log.warn("[NSThread isMainThread] threw: {} — assuming non-main", it.message)
+                false
             }
-            val error = arrayOfNulls<Throwable>(1)
-            EventQueue.invokeAndWait {
-                try {
-                    block()
-                } catch (t: Throwable) {
-                    error[0] = t
-                }
-            }
-            error[0]?.let { throw it }
         }
 
         /**

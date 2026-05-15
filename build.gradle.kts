@@ -22,6 +22,18 @@ tasks.register<JavaExec>("runSmoke") {
     classpath = sourceSets.main.get().runtimeClasspath + smokeRuntime
     mainClass.set("dev.hivens.libtray.SmokeMainKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // macOS pins NSStatusItem (and every NSWindow constructor it
+    // delegates to) to OS thread 0 — the actual process main thread.
+    // Without `-XstartOnFirstThread`, the JVM main thread runs on a
+    // worker thread that AppKit refuses with
+    //   *** NSInternalInconsistencyException: NSWindow should only
+    //       be instantiated on the main thread!
+    // AWT EDT also doesn't fit — it's a separate thread spawned by
+    // CocoaToolkit. The flag makes JVM main == OS thread 0 == AppKit
+    // main thread, so libtray's calls land where Cocoa wants them.
+    if (System.getProperty("os.name").lowercase().contains("mac")) {
+        jvmArgs("-XstartOnFirstThread")
+    }
     // Show INFO-level logs so the smoke harness surfaces backend
     // diagnostics ("window class registered", "NIM_ADD succeeded",
     // GetLastError on failure paths). Default slf4j-simple level is INFO
