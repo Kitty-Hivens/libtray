@@ -72,21 +72,19 @@ internal class SniTrayImpl private constructor(
      */
     private val appId: String = slugifyForSni(initial.title)
 
-    /** SNI `Title` property base — the human-readable application name. */
+    /**
+     * SNI `Title` property base — used when no [setTooltip] override has
+     * been pushed yet. After the first setTooltip call, the override
+     * wins. We never *compose* (e.g. "$appTitle — $tooltip"): hosts that
+     * also resolve a `.desktop` Name from [appId] would render that
+     * resolved name AND our composed Title, producing visible
+     * duplication ("App — App — status"). Single string, fully
+     * caller-controlled, no host can double-up.
+     */
     private val appTitle: String = initial.title
 
-    /**
-     * Compose the SNI Title rendered to hosts. Single source of truth so
-     * verbose tray-host renderers (waybar with multi-token templates,
-     * Plasma widgets that fall back to Title when ToolTip.title is empty)
-     * don't end up duplicating the application name once from Title and
-     * once from ToolTip. Caller of `setTooltip` thinks they're updating
-     * the tooltip; we propagate the change through Title via a NewTitle
-     * signal, and leave the ToolTip struct empty (see "ToolTip" property
-     * handler).
-     */
-    private fun composedTitle(): String =
-        if (tooltip.isBlank()) appTitle else "$appTitle — $tooltip"
+    /** Returns the Title currently shown to hosts: tooltip override if any, else appTitle. */
+    private fun currentTitle(): String = tooltip.ifBlank { appTitle }
 
     @Volatile private var iconBytes: ByteArray = initial.iconBytes
     @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
@@ -295,12 +293,14 @@ internal class SniTrayImpl private constructor(
         when (propName) {
             "Category"      -> appendVariantString(call, parent, "ApplicationStatus")
             "Id"            -> appendVariantString(call, parent, appId)
-            // Title carries the human-readable hover label. Dynamic — when
-            // a tooltip is set we suffix it onto appTitle so the host
-            // shows "App — status" on hover. ToolTip below is left empty
-            // so verbose hosts (e.g. waybar templates that render both
-            // Title AND ToolTip.title) don't duplicate the same string.
-            "Title"         -> appendVariantString(call, parent, composedTitle())
+            // Title is the single host-visible hover string. Caller-
+            // controlled via [setTooltip] — if you want "AppName —
+            // status" the caller passes that whole string in. libtray
+            // does NOT add a prefix because some hosts resolve the
+            // application name from the SNI Id and prepend it on their
+            // own; with libtray composing the same prefix the result
+            // would be "App — App — status".
+            "Title"         -> appendVariantString(call, parent, currentTitle())
             "Status"        -> appendVariantString(call, parent, status)
             "WindowId"      -> appendVariantInt(call, parent, 0)
             "IconName"      -> appendVariantString(call, parent, "")
