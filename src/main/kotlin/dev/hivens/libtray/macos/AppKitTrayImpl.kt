@@ -146,17 +146,37 @@ internal class AppKitTrayImpl private constructor(
     private fun applyIcon(pngBytes: ByteArray) {
         autoreleasepool {
             val nsData = bindings.nsData(pngBytes)
+            log.info("applyIcon: NSData allocated, addr=0x{} bytes={}",
+                nsData.address().toString(16), pngBytes.size)
             val nsImageCls = bindings.cls("NSImage")
             val allocated = bindings.handle("objc_msgSend_id")
                 .invokeExact(nsImageCls, bindings.sel("alloc")) as MemorySegment
             val image = bindings.handle("objc_msgSend_id_id")
                 .invokeExact(allocated, bindings.sel("initWithData:"), nsData) as MemorySegment
             if (image.address() == 0L) {
-                log.warn("[NSImage initWithData:] returned NULL — invalid PNG?")
+                log.warn("[NSImage initWithData:] returned NULL — invalid PNG? Falling back to text title.")
+                applyTitleFallback("●")
                 return@autoreleasepool
             }
+            log.info("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
             bindings.handle("objc_msgSend_void_id").invokeExact(
                 statusButton, bindings.sel("setImage:"), image,
+            ) as Unit
+            log.info("applyIcon: setImage: dispatched to status button")
+        }
+    }
+
+    /**
+     * Set a text title on the status button as a visible fallback —
+     * if image decoding fails silently and we have no icon, at least
+     * SOMETHING shows up in the menu bar instead of an invisible
+     * zero-width entry.
+     */
+    private fun applyTitleFallback(text: String) {
+        runCatching {
+            val nsString = bindings.nsString(text)
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                statusButton, bindings.sel("setTitle:"), nsString,
             ) as Unit
         }
     }
@@ -435,6 +455,13 @@ internal class AppKitTrayImpl private constructor(
                     return@runCatching null
                 }
 
+                // Force visibility — newer macOS sometimes treats status
+                // items as hidden by default until an explicit setVisible:.
+                runCatching {
+                    bindings.handle("objc_msgSend_void_long").invokeExact(
+                        retainedItem, bindings.sel("setVisible:"), 1L,
+                    ) as Unit
+                }
                 log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
                 AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
             }.onFailure { log.warn("AppKit tray construction threw: {}", it.message) }.getOrNull()
@@ -496,7 +523,21 @@ internal class AppKitTrayImpl private constructor(
                     bindings.handle("objc_msgSend_void_long").invokeExact(
                         app, bindings.sel("setActivationPolicy:"), 0L,
                     ) as Unit
-                    log.info("[create] NSApplication activation policy set to Regular (status bar items will paint)")
+                    // Required for status items to register with SystemUIServer
+                    // — without finishLaunching the app is "in flux" from
+                    // SystemUIServer's POV and refuses to paint our entry.
+                    runCatching {
+                        bindings.handle("objc_msgSend_id")
+                            .invokeExact(app, bindings.sel("finishLaunching")) as MemorySegment
+                    }
+                    // Activate so we're foreground enough for the menu bar
+                    // shell to wake up and re-poll status items.
+                    runCatching {
+                        bindings.handle("objc_msgSend_void_long").invokeExact(
+                            app, bindings.sel("activateIgnoringOtherApps:"), 1L,
+                        ) as Unit
+                    }
+                    log.info("[create] NSApplication activation policy = Regular, finishLaunching + activateIgnoringOtherApps fired")
                 }
             }.onFailure {
                 log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {} — proceeding anyway", it.message)
