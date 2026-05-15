@@ -1,4 +1,15 @@
-jdk:
-  - openjdk22
+# JitPack defaults to JDK 8 and only whitelists named keys up to openjdk21
+# in its `jdk:` directive. libtray needs JDK 22+ (Project Panama / FFM
+# finalized as JEP 454 in 22 — earlier JDKs require --enable-preview which
+# a library shouldn't impose). SDKMan, pre-installed on JitPack runners,
+# is the supported escape hatch.
+#
+# `sdk use` adjusts $PATH + $JAVA_HOME inside the same script execution,
+# so Gradle picks up Temurin 22 in the install step.
+before_install:
+  - source "$HOME/.sdkman/bin/sdkman-init.sh"
+  - sdk install java 22.0.2-tem
 install:
+  - source "$HOME/.sdkman/bin/sdkman-init.sh"
+  - sdk use java 22.0.2-tem
   - ./gradlew clean publishToMavenLocal -x test
