@@ -4,31 +4,627 @@ import io.github.kittyhivens.libtray.Tray
 import io.github.kittyhivens.libtray.TrayBuilder
 import io.github.kittyhivens.libtray.TrayEvent
 import io.github.kittyhivens.libtray.TrayMenu
+import org.slf4j.LoggerFactory
+import java.io.ByteArrayInputStream
+import java.lang.foreign.Arena
+import java.lang.foreign.MemorySegment
+import java.lang.foreign.ValueLayout
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import javax.imageio.ImageIO
 
 /**
- * Linux tray backend — StatusNotifierItem (`org.kde.StatusNotifierItem`)
- * over D-Bus, plus DBusMenu (`com.canonical.dbusmenu`) for the right-click
- * menu. The real `libdbus` Panama bindings + the SNI/DBusMenu protocol
- * implementation land in the next commit on this branch; this stub is in
- * place so the public [Tray.create] factory can dispatch through the
- * normal path.
+ * Linux tray backend — `org.kde.StatusNotifierItem` over D-Bus session
+ * bus, registered with `org.kde.StatusNotifierWatcher`. Pure libdbus via
+ * Project Panama (see [DBusBindings]); no GTK / GLib / libayatana
+ * transitive dependencies.
  *
- * Why SNI direct rather than libayatana-appindicator: the latter wraps
- * SNI via GLib/GObject and pulls GTK3 transitively, adding 20-50 MB to a
- * bundled AppImage and a runtime dependency that minimal distros don't
- * ship. libdbus is part of every desktop Linux's core.
+ * Wire-level dance, in order:
+ *   1. Connect to the session bus.
+ *   2. Request our own well-known name `org.kde.StatusNotifierItem-PID-N`
+ *      (PID + a per-process counter for the rare multi-tray case).
+ *   3. The desktop's tray host (KDE plasmashell, GNOME's SNI extension,
+ *      waybar on Hyprland, etc.) listens on
+ *      `org.kde.StatusNotifierWatcher.RegisterStatusNotifierItem` —
+ *      we call it with our well-known name.
+ *   4. The host then queries our `/StatusNotifierItem` object's
+ *      properties via `org.freedesktop.DBus.Properties.Get` and
+ *      `GetAll` and renders the icon. Property responses are the bulk
+ *      of [dispatchOne] below.
+ *   5. User clicks: host invokes `Activate` / `SecondaryActivate` /
+ *      `ContextMenu` / `Scroll` on us. We fire the matching
+ *      [TrayEvent] to subscribers.
+ *   6. State change: we emit `NewIcon` / `NewToolTip` / `NewStatus`
+ *      signals so the host re-fetches.
+ *
+ * Polling-loop dispatch (thread `libtray-sni-PID`): no Panama upcall
+ * stubs needed; libdbus messages are pulled with
+ * `dbus_connection_pop_message` and dispatched on our thread. Trade-
+ * off vs `dbus_connection_register_object_path` (would need
+ * `Linker.upcallStub` to give libdbus a callable C function pointer
+ * — significantly more complex).
+ *
+ * Menu: this commit ships click-only. The right-click `ContextMenu`
+ * method fires a [TrayEvent.MenuRequested] event so the host app can
+ * show its own popup (Compose / Swing / JavaFX). The full DBusMenu
+ * (`com.canonical.dbusmenu`) protocol implementation that lets the
+ * desktop's own menu UI render the [TrayMenu] is a follow-up commit.
+ * `Menu` property reports "/" (no DBusMenu) until then.
  */
-internal class SniTrayImpl private constructor() : Tray {
-    override val isOpen: Boolean = false
-    override fun setTooltip(text: String): Boolean = false
-    override fun setIcon(iconBytes: ByteArray): Boolean = false
-    override fun setMenu(menu: TrayMenu?): Boolean = false
-    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit = { }
-    override fun close() = Unit
+internal class SniTrayImpl private constructor(
+    private val bindings: DBusBindings,
+    private val connection: MemorySegment,
+    private val itemId: String,
+    initial: TrayBuilder,
+) : Tray {
+
+    private val log = LoggerFactory.getLogger("libtray.SniTray")
+
+    @Volatile private var iconBytes: ByteArray = initial.iconBytes
+    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
+    @Volatile private var tooltip: String = initial.tooltip ?: ""
+    @Volatile private var menu: TrayMenu? = initial.menu  // currently informational only
+    @Volatile private var status: String = "Active"
+    @Volatile private var open = AtomicBoolean(true)
+
+    private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+
+    /** Background dispatch thread — pulls messages, hands to [dispatchOne]. */
+    private val pumpThread = Thread({ pumpLoop() }, "libtray-sni-${ProcessHandle.current().pid()}").apply {
+        isDaemon = true
+    }
+
+    init {
+        pumpThread.start()
+    }
+
+    override val isOpen: Boolean get() = open.get()
+
+    override fun setTooltip(text: String): Boolean {
+        if (!open.get()) return false
+        tooltip = text
+        emitSignal("NewToolTip")
+        return true
+    }
+
+    override fun setIcon(iconBytes: ByteArray): Boolean {
+        if (!open.get()) return false
+        require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
+        this.iconBytes = iconBytes
+        this.iconPixmap = pngToPixmaps(iconBytes)
+        emitSignal("NewIcon")
+        return true
+    }
+
+    override fun setMenu(menu: TrayMenu?): Boolean {
+        if (!open.get()) return false
+        this.menu = menu
+        // No NewMenu signal until DBusMenu protocol lands — current
+        // contract is "client shows its own popup on MenuRequested".
+        return true
+    }
+
+    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
+        handlers.add(handler)
+        return { handlers.remove(handler) }
+    }
+
+    override fun close() {
+        if (!open.compareAndSet(true, false)) return
+        // pumpLoop checks open.get() each iteration and exits within
+        // the next read_write timeout (1s). Don't hard-interrupt — that
+        // could leave the connection in a weird half-closed state with
+        // the watcher still expecting our service.
+        pumpThread.join(2_000)
+        try {
+            bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
+        } catch (t: Throwable) {
+            log.warn("dbus_connection_unref threw on shutdown: {}", t.message)
+        }
+    }
+
+    // ── Background dispatch loop ─────────────────────────────────────────
+
+    private fun pumpLoop() {
+        val popMessage = bindings.handle("dbus_connection_pop_message")
+        val readWrite  = bindings.handle("dbus_connection_read_write")
+        val unref      = bindings.handle("dbus_message_unref")
+        while (open.get()) {
+            try {
+                readWrite.invokeExact(connection, 1_000) as Int  // 1s blocking poll
+                while (open.get()) {
+                    val msg = popMessage.invokeExact(connection) as MemorySegment
+                    if (msg.address() == 0L) break
+                    try {
+                        dispatchOne(msg)
+                    } catch (t: Throwable) {
+                        log.warn("Message dispatch threw, dropping message: {}", t.message)
+                    } finally {
+                        runCatching { unref.invokeExact(msg) as Unit }
+                    }
+                }
+            } catch (t: Throwable) {
+                log.warn("D-Bus pump iteration threw: {}", t.message)
+                // Sleep briefly so a permanently-broken bus doesn't
+                // burn CPU at 100% logging.
+                Thread.sleep(500)
+            }
+        }
+    }
+
+    private fun dispatchOne(msg: MemorySegment) {
+        val iface  = readMessageString(bindings.handle("dbus_message_get_interface"), msg) ?: return
+        val member = readMessageString(bindings.handle("dbus_message_get_member"),    msg) ?: return
+        val path   = readMessageString(bindings.handle("dbus_message_get_path"),      msg) ?: ""
+
+        when (iface) {
+            "org.freedesktop.DBus.Properties" -> when (member) {
+                "Get"     -> handlePropertiesGet(msg)
+                "GetAll"  -> handlePropertiesGetAll(msg)
+                else      -> log.debug("Unhandled Properties.{}", member)
+            }
+            "org.kde.StatusNotifierItem" -> when (member) {
+                "Activate"           -> { fire(TrayEvent.Activated);          replyEmpty(msg) }
+                "SecondaryActivate"  -> { fire(TrayEvent.MiddleActivated);    replyEmpty(msg) }
+                "ContextMenu"        -> { fire(TrayEvent.MenuRequested);      replyEmpty(msg) }
+                "Scroll"             -> replyEmpty(msg)  // no scroll events in TrayEvent for now
+                else                 -> log.debug("Unhandled SNI.{}", member)
+            }
+            "org.freedesktop.DBus.Introspectable" -> when (member) {
+                "Introspect" -> handleIntrospect(msg)
+                else         -> log.debug("Unhandled Introspectable.{}", member)
+            }
+            "org.freedesktop.DBus" -> {
+                // Bus signals (NameOwnerChanged etc) — informational, ignore.
+            }
+            else -> log.debug("Unhandled iface={} member={} path={}", iface, member, path)
+        }
+    }
+
+    private fun fire(event: TrayEvent) {
+        handlers.forEach { handler ->
+            runCatching { handler(event) }
+                .onFailure { log.warn("onEvent handler threw: {}", it.message) }
+        }
+    }
+
+    // ── Properties dispatch ──────────────────────────────────────────────
+
+    private fun handlePropertiesGet(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
+            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            (bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int)
+            val propName  = readBasicString(call, iter) ?: return replyEmpty(msg)
+
+            if (ifaceName != "org.kde.StatusNotifierItem") {
+                replyEmpty(msg)
+                return
+            }
+            val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit)
+            appendVariantForProperty(call, replyIter, propName)
+            sendAndUnref(reply)
+        }
+    }
+
+    private fun handlePropertiesGetAll(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
+            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            if (ifaceName != "org.kde.StatusNotifierItem") {
+                replyEmpty(msg)
+                return
+            }
+
+            val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
+            val replyIter = call.allocate(bindings.messageIterLayout)
+            (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit)
+
+            // a{sv} dict
+            val sigPtr = call.allocateUtf8("{sv}")
+            val arrIter = call.allocate(bindings.messageIterLayout)
+            openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, sigPtr, arrIter)
+            for (prop in PROPERTY_NAMES) {
+                appendDictEntry(call, arrIter, prop)
+            }
+            closeContainer(replyIter, arrIter)
+            sendAndUnref(reply)
+        }
+    }
+
+    private fun appendDictEntry(call: Arena, parent: MemorySegment, propName: String) {
+        val entry = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_DICT_ENTRY, MemorySegment.NULL, entry)
+        appendBasicString(call, entry, DBusBindings.DBUS_TYPE_STRING, propName)
+        appendVariantForProperty(call, entry, propName)
+        closeContainer(parent, entry)
+    }
+
+    private fun appendVariantForProperty(call: Arena, parent: MemorySegment, propName: String) {
+        when (propName) {
+            "Category"      -> appendVariantString(call, parent, "ApplicationStatus")
+            "Id"            -> appendVariantString(call, parent, itemId)
+            "Title"         -> appendVariantString(call, parent, itemId)
+            "Status"        -> appendVariantString(call, parent, status)
+            "WindowId"      -> appendVariantInt(call, parent, 0)
+            "IconName"      -> appendVariantString(call, parent, "")
+            "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
+            "OverlayIconName"   -> appendVariantString(call, parent, "")
+            "AttentionIconName" -> appendVariantString(call, parent, "")
+            "ToolTip"       -> appendVariantToolTip(call, parent, tooltip)
+            "Menu"          -> appendVariantObjectPath(call, parent, "/")
+            "ItemIsMenu"    -> appendVariantBoolean(call, parent, false)
+            else -> appendVariantString(call, parent, "")
+        }
+    }
+
+    // ── Property variant builders ────────────────────────────────────────
+
+    private fun appendVariantString(call: Arena, parent: MemorySegment, value: String) {
+        val sig = call.allocateUtf8("s")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        appendBasicString(call, variant, DBusBindings.DBUS_TYPE_STRING, value)
+        closeContainer(parent, variant)
+    }
+
+    private fun appendVariantObjectPath(call: Arena, parent: MemorySegment, value: String) {
+        val sig = call.allocateUtf8("o")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        appendBasicString(call, variant, DBusBindings.DBUS_TYPE_OBJECT_PATH, value)
+        closeContainer(parent, variant)
+    }
+
+    private fun appendVariantInt(call: Arena, parent: MemorySegment, value: Int) {
+        val sig = call.allocateUtf8("i")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        val intBuf = call.allocate(ValueLayout.JAVA_INT)
+        intBuf.set(ValueLayout.JAVA_INT, 0, value)
+        bindings.handle("dbus_message_iter_append_basic")
+            .invokeExact(variant, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+        closeContainer(parent, variant)
+    }
+
+    private fun appendVariantBoolean(call: Arena, parent: MemorySegment, value: Boolean) {
+        val sig = call.allocateUtf8("b")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        val boolBuf = call.allocate(ValueLayout.JAVA_INT)  // dbus_bool_t is 4 bytes
+        boolBuf.set(ValueLayout.JAVA_INT, 0, if (value) 1 else 0)
+        bindings.handle("dbus_message_iter_append_basic")
+            .invokeExact(variant, DBusBindings.DBUS_TYPE_BOOLEAN.toInt(), boolBuf) as Int
+        closeContainer(parent, variant)
+    }
+
+    private fun appendVariantToolTip(call: Arena, parent: MemorySegment, body: String) {
+        // ToolTip signature: (sa(iiay)ss) — (icon_name, icon_data,
+        // title, body). We populate icon_name="", icon_data=empty,
+        // title=itemId, body=tooltip.
+        val sig = call.allocateUtf8("(sa(iiay)ss)")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+
+        val struct = call.allocate(bindings.messageIterLayout)
+        openContainer(variant, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+        appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, "")           // icon_name
+        // empty a(iiay)
+        val emptyArrSig = call.allocateUtf8("(iiay)")
+        val emptyArr = call.allocate(bindings.messageIterLayout)
+        openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, emptyArrSig, emptyArr)
+        closeContainer(struct, emptyArr)
+        appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, itemId)       // title
+        appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, body)         // body
+        closeContainer(variant, struct)
+
+        closeContainer(parent, variant)
+    }
+
+    private fun appendVariantIconPixmap(call: Arena, parent: MemorySegment, pixmaps: List<Pixmap>) {
+        // IconPixmap signature: a(iiay) — array of (width, height, ARGB32-network-order bytes).
+        val sig = call.allocateUtf8("(iiay)")
+        val variant = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        val arr = call.allocate(bindings.messageIterLayout)
+        openContainer(variant, DBusBindings.DBUS_TYPE_ARRAY, sig, arr)
+
+        for (px in pixmaps) {
+            val struct = call.allocate(bindings.messageIterLayout)
+            openContainer(arr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+
+            val intBuf = call.allocate(ValueLayout.JAVA_INT)
+            intBuf.set(ValueLayout.JAVA_INT, 0, px.width)
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+            intBuf.set(ValueLayout.JAVA_INT, 0, px.height)
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+
+            // ay (byte array) — open, append each byte, close.
+            val byteSig = call.allocateUtf8("y")
+            val byteArr = call.allocate(bindings.messageIterLayout)
+            openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, byteSig, byteArr)
+            // Append the ARGB bytes one by one — libdbus has a fixed-array
+            // append helper but it's not in the LOAD_SET; per-byte is
+            // slower but safe. Tray icons are 16-256px so worst case ~256KB.
+            val byteBuf = call.allocate(ValueLayout.JAVA_BYTE)
+            for (b in px.argbNetworkOrder) {
+                byteBuf.set(ValueLayout.JAVA_BYTE, 0, b)
+                bindings.handle("dbus_message_iter_append_basic")
+                    .invokeExact(byteArr, DBusBindings.DBUS_TYPE_BYTE.toInt(), byteBuf) as Int
+            }
+            closeContainer(struct, byteArr)
+
+            closeContainer(arr, struct)
+        }
+
+        closeContainer(variant, arr)
+        closeContainer(parent, variant)
+    }
+
+    // ── Introspection (for hosts that probe before subscribing) ──────────
+
+    private fun handleIntrospect(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
+            val iter = call.allocate(bindings.messageIterLayout)
+            (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit)
+            appendBasicString(call, iter, DBusBindings.DBUS_TYPE_STRING, INTROSPECTION_XML)
+            sendAndUnref(reply)
+        }
+    }
+
+    // ── Signal emission ──────────────────────────────────────────────────
+
+    private fun emitSignal(name: String) {
+        Arena.ofConfined().use { call ->
+            val path = call.allocateUtf8("/StatusNotifierItem")
+            val iface = call.allocateUtf8("org.kde.StatusNotifierItem")
+            val member = call.allocateUtf8(name)
+            val sig = (bindings.handle("dbus_message_new_signal")
+                .invokeExact(path, iface, member) as MemorySegment)
+            if (sig.address() == 0L) {
+                log.warn("dbus_message_new_signal returned NULL for {}", name)
+                return
+            }
+            sendAndUnref(sig)
+        }
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────
+
+    private fun readMessageString(handle: java.lang.invoke.MethodHandle, msg: MemorySegment): String? {
+        val ptr = handle.invokeExact(msg) as MemorySegment
+        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getUtf8String(0)
+    }
+
+    private fun readBasicString(call: Arena, iter: MemorySegment): String? {
+        val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
+        if (argType.toByte() != DBusBindings.DBUS_TYPE_STRING) return null
+        val out = call.allocate(ValueLayout.ADDRESS)
+        bindings.handle("dbus_message_iter_get_basic").invokeExact(iter, out) as Unit
+        val ptr = out.get(ValueLayout.ADDRESS, 0)
+        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getUtf8String(0)
+    }
+
+    private fun appendBasicString(call: Arena, iter: MemorySegment, type: Byte, value: String) {
+        val strSeg = call.allocateUtf8(value)
+        val ptrBuf = call.allocate(ValueLayout.ADDRESS)
+        ptrBuf.set(ValueLayout.ADDRESS, 0, strSeg)
+        bindings.handle("dbus_message_iter_append_basic")
+            .invokeExact(iter, type.toInt(), ptrBuf) as Int
+    }
+
+    private fun openContainer(parent: MemorySegment, type: Byte, signature: MemorySegment, sub: MemorySegment) {
+        bindings.handle("dbus_message_iter_open_container")
+            .invokeExact(parent, type.toInt(), signature, sub) as Int
+    }
+
+    private fun closeContainer(parent: MemorySegment, sub: MemorySegment) {
+        bindings.handle("dbus_message_iter_close_container").invokeExact(parent, sub) as Int
+    }
+
+    private fun replyEmpty(msg: MemorySegment) {
+        val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
+        if (reply.address() == 0L) return
+        sendAndUnref(reply)
+    }
+
+    private fun sendAndUnref(reply: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val serial = call.allocate(ValueLayout.JAVA_INT)
+            bindings.handle("dbus_connection_send").invokeExact(connection, reply, serial) as Int
+            bindings.handle("dbus_connection_flush").invokeExact(connection) as Unit
+        }
+        bindings.handle("dbus_message_unref").invokeExact(reply) as Unit
+    }
+
+    private data class Pixmap(val width: Int, val height: Int, val argbNetworkOrder: ByteArray)
+
+    /**
+     * Decode a PNG (or any ImageIO-supported format) into the ARGB32
+     * network-byte-order layout that StatusNotifierItem's `IconPixmap`
+     * property expects. SNI accepts an array of multi-resolution
+     * pixmaps; we ship just one matching the input image's size.
+     */
+    private fun pngToPixmaps(bytes: ByteArray): List<Pixmap> {
+        return runCatching {
+            val img = ImageIO.read(ByteArrayInputStream(bytes)) ?: return emptyList()
+            val w = img.width
+            val h = img.height
+            val argb = IntArray(w * h)
+            img.getRGB(0, 0, w, h, argb, 0, w)
+            val out = ByteArray(w * h * 4)
+            for (i in argb.indices) {
+                val px = argb[i]
+                // Network byte order: A R G B.
+                out[i * 4]     = ((px ushr 24) and 0xFF).toByte()
+                out[i * 4 + 1] = ((px ushr 16) and 0xFF).toByte()
+                out[i * 4 + 2] = ((px ushr 8)  and 0xFF).toByte()
+                out[i * 4 + 3] = (px and 0xFF).toByte()
+            }
+            listOf(Pixmap(w, h, out))
+        }.getOrElse {
+            log.warn("Icon decode failed: {}", it.message)
+            emptyList()
+        }
+    }
 
     internal companion object {
-        /** Returns null until the SNI/D-Bus backend lands. */
-        @Suppress("UNUSED_PARAMETER")
-        fun create(builder: TrayBuilder): Tray? = null
+        private val log = LoggerFactory.getLogger("libtray.SniTray")
+        private val itemCounter = AtomicInteger(0)
+
+        // Properties exposed on the StatusNotifierItem object — used by
+        // GetAll to enumerate, and by Get to dispatch.
+        private val PROPERTY_NAMES = listOf(
+            "Category", "Id", "Title", "Status", "WindowId",
+            "IconName", "IconPixmap",
+            "OverlayIconName", "AttentionIconName",
+            "ToolTip", "Menu", "ItemIsMenu",
+        )
+
+        // Minimal introspection — hosts that probe before subscribing
+        // need it; without it some implementations refuse to render the
+        // icon. Lists the methods + signals we actually implement.
+        private val INTROSPECTION_XML = """
+            <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+              "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+            <node>
+              <interface name="org.kde.StatusNotifierItem">
+                <method name="Activate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+                <method name="SecondaryActivate"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+                <method name="ContextMenu"><arg name="x" type="i" direction="in"/><arg name="y" type="i" direction="in"/></method>
+                <method name="Scroll"><arg name="delta" type="i" direction="in"/><arg name="orientation" type="s" direction="in"/></method>
+                <signal name="NewIcon"/>
+                <signal name="NewToolTip"/>
+                <signal name="NewStatus"><arg type="s"/></signal>
+              </interface>
+              <interface name="org.freedesktop.DBus.Properties">
+                <method name="Get"><arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="v" direction="out"/></method>
+                <method name="GetAll"><arg type="s" direction="in"/><arg type="a{sv}" direction="out"/></method>
+              </interface>
+              <interface name="org.freedesktop.DBus.Introspectable">
+                <method name="Introspect"><arg type="s" direction="out"/></method>
+              </interface>
+            </node>
+        """.trimIndent()
+
+        fun create(builder: TrayBuilder): Tray? {
+            val bindings = DBusBindings.load() ?: run {
+                log.info("libdbus not loadable — SNI tray unavailable")
+                return null
+            }
+            return Arena.ofConfined().use { setup ->
+                val error = setup.allocate(bindings.errorLayout)
+                bindings.handle("dbus_error_init").invokeExact(error) as Unit
+
+                val conn = bindings.handle("dbus_bus_get").invokeExact(
+                    DBusBindings.DBUS_BUS_SESSION, error,
+                ) as MemorySegment
+                if (conn.address() == 0L) {
+                    log.info("dbus_bus_get returned NULL — no session bus, SNI unavailable")
+                    return@use null
+                }
+
+                val itemId = "org.kde.StatusNotifierItem-${ProcessHandle.current().pid()}-${itemCounter.incrementAndGet()}"
+                val nameSeg = setup.allocateUtf8(itemId)
+                val flags = DBusBindings.DBUS_NAME_FLAG_REPLACE_EXISTING or DBusBindings.DBUS_NAME_FLAG_DO_NOT_QUEUE
+                val nameResult = bindings.handle("dbus_bus_request_name").invokeExact(
+                    conn, nameSeg, flags, error,
+                ) as Int
+                if (nameResult != DBusBindings.DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
+                    log.warn("dbus_bus_request_name returned {} for {} — SNI registration failed",
+                        nameResult, itemId)
+                    bindings.handle("dbus_connection_unref").invokeExact(conn) as Unit
+                    return@use null
+                }
+
+                // Tell the desktop's tray host we're here. Failure isn't
+                // fatal — the host might come up later and discover us
+                // via well-known name listing — but log so a "no icon
+                // shows up" investigation has a starting point.
+                if (!registerWithWatcher(bindings, conn, itemId, setup)) {
+                    log.info("StatusNotifierWatcher registration failed for {}; icon may not appear " +
+                        "until a tray host comes online", itemId)
+                }
+
+                SniTrayImpl(bindings, conn, itemId, builder)
+            }
+        }
+
+        private fun registerWithWatcher(
+            bindings: DBusBindings,
+            conn: MemorySegment,
+            itemId: String,
+            setup: Arena,
+        ): Boolean {
+            return runCatching {
+                val destination = setup.allocateUtf8("org.kde.StatusNotifierWatcher")
+                val path        = setup.allocateUtf8("/StatusNotifierWatcher")
+                val iface       = setup.allocateUtf8("org.kde.StatusNotifierWatcher")
+                val member      = setup.allocateUtf8("RegisterStatusNotifierItem")
+                val msg = bindings.handle("dbus_message_new_method_call").invokeExact(
+                    destination, path, iface, member,
+                ) as MemorySegment
+                if (msg.address() == 0L) return@runCatching false
+
+                val iter = setup.allocate(bindings.messageIterLayout)
+                bindings.handle("dbus_message_iter_init_append").invokeExact(msg, iter) as Unit
+                val nameSeg = setup.allocateUtf8(itemId)
+                val ptrBuf = setup.allocate(ValueLayout.ADDRESS)
+                ptrBuf.set(ValueLayout.ADDRESS, 0, nameSeg)
+                bindings.handle("dbus_message_iter_append_basic")
+                    .invokeExact(iter, DBusBindings.DBUS_TYPE_STRING.toInt(), ptrBuf) as Int
+
+                val error = setup.allocate(bindings.errorLayout)
+                bindings.handle("dbus_error_init").invokeExact(error) as Unit
+                val reply = bindings.handle("dbus_connection_send_with_reply_and_block").invokeExact(
+                    conn, msg, 5_000, error,
+                ) as MemorySegment
+                bindings.handle("dbus_message_unref").invokeExact(msg) as Unit
+                if (reply.address() != 0L) {
+                    bindings.handle("dbus_message_unref").invokeExact(reply) as Unit
+                }
+                val errorSet = bindings.handle("dbus_error_is_set").invokeExact(error) as Int
+                if (errorSet != 0) {
+                    bindings.handle("dbus_error_free").invokeExact(error) as Unit
+                    false
+                } else true
+            }.getOrDefault(false)
+        }
     }
+}
+
+/**
+ * Allocate a UTF-8 null-terminated string in this arena. libdbus expects
+ * `const char *` style strings in every text field.
+ */
+private fun Arena.allocateUtf8(s: String): MemorySegment {
+    val bytes = s.toByteArray(Charsets.UTF_8)
+    val segment = allocate((bytes.size + 1).toLong())
+    if (bytes.isNotEmpty()) {
+        MemorySegment.copy(bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.size)
+    }
+    segment.set(ValueLayout.JAVA_BYTE, bytes.size.toLong(), 0)
+    return segment
+}
+
+/**
+ * Read a UTF-8 null-terminated string from a native pointer. Reinterprets
+ * with a generous max length so getUtf8String can scan to the terminator.
+ */
+private fun MemorySegment.getUtf8String(offset: Long): String {
+    // Find the null terminator within reasonable bounds.
+    val maxScan = minOf(byteSize() - offset, 1L shl 20)  // cap at 1MB
+    var len = 0L
+    while (len < maxScan && get(ValueLayout.JAVA_BYTE, offset + len) != 0.toByte()) len++
+    val bytes = ByteArray(len.toInt())
+    MemorySegment.copy(this, ValueLayout.JAVA_BYTE, offset, bytes, 0, len.toInt())
+    return String(bytes, Charsets.UTF_8)
 }
