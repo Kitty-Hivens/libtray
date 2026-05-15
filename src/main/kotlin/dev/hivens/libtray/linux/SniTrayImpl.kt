@@ -72,8 +72,21 @@ internal class SniTrayImpl private constructor(
      */
     private val appId: String = slugifyForSni(initial.title)
 
-    /** SNI `Title` property — the human-readable application name. */
+    /** SNI `Title` property base — the human-readable application name. */
     private val appTitle: String = initial.title
+
+    /**
+     * Compose the SNI Title rendered to hosts. Single source of truth so
+     * verbose tray-host renderers (waybar with multi-token templates,
+     * Plasma widgets that fall back to Title when ToolTip.title is empty)
+     * don't end up duplicating the application name once from Title and
+     * once from ToolTip. Caller of `setTooltip` thinks they're updating
+     * the tooltip; we propagate the change through Title via a NewTitle
+     * signal, and leave the ToolTip struct empty (see "ToolTip" property
+     * handler).
+     */
+    private fun composedTitle(): String =
+        if (tooltip.isBlank()) appTitle else "$appTitle — $tooltip"
 
     @Volatile private var iconBytes: ByteArray = initial.iconBytes
     @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
@@ -100,6 +113,12 @@ internal class SniTrayImpl private constructor(
     override fun setTooltip(text: String): Boolean {
         if (!open.get()) return false
         tooltip = text
+        // Both signals: Title is what most hosts read for the hover label
+        // (since ToolTip is left empty deliberately — see comment on the
+        // "ToolTip" property branch below for the why), so NewTitle has to
+        // fire when tooltip text changes. NewToolTip is kept for hosts
+        // that strictly key on the ToolTip-changed signal.
+        emitSignal("NewTitle")
         emitSignal("NewToolTip")
         return true
     }
@@ -276,14 +295,23 @@ internal class SniTrayImpl private constructor(
         when (propName) {
             "Category"      -> appendVariantString(call, parent, "ApplicationStatus")
             "Id"            -> appendVariantString(call, parent, appId)
-            "Title"         -> appendVariantString(call, parent, appTitle)
+            // Title carries the human-readable hover label. Dynamic — when
+            // a tooltip is set we suffix it onto appTitle so the host
+            // shows "App — status" on hover. ToolTip below is left empty
+            // so verbose hosts (e.g. waybar templates that render both
+            // Title AND ToolTip.title) don't duplicate the same string.
+            "Title"         -> appendVariantString(call, parent, composedTitle())
             "Status"        -> appendVariantString(call, parent, status)
             "WindowId"      -> appendVariantInt(call, parent, 0)
             "IconName"      -> appendVariantString(call, parent, "")
             "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
             "OverlayIconName"   -> appendVariantString(call, parent, "")
             "AttentionIconName" -> appendVariantString(call, parent, "")
-            "ToolTip"       -> appendVariantToolTip(call, parent, tooltip)
+            // ToolTip deliberately empty — see [composedTitle] for the
+            // single-source-of-truth rationale. Sending an empty struct
+            // (rather than dropping the property) keeps the variant well-
+            // typed for hosts that GET it before any LayoutUpdated.
+            "ToolTip"       -> appendVariantToolTip(call, parent, "")
             // Always advertise /MenuBar so the host knows where to fetch
             // the dbusmenu, even when there's currently no menu set —
             // GetLayout responds with an empty root in that case. Toggling
