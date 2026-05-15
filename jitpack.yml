@@ -1,0 +1,4 @@
+jdk:
+  - openjdk22
+install:
+  - ./gradlew clean publishToMavenLocal -x test
