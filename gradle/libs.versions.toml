@@ -2,7 +2,7 @@
 # Pinned to match the Aura launcher's Kotlin so cross-project Panama
 # bindings stay binary-compatible. Bump in lockstep until libtray has
 # more downstream consumers than just Aura.
-kotlin = "2.3.20-RC3"
+kotlin = "2.3.21"
 slf4j  = "2.0.16"
 
 # Java 22 is the floor: that's where `java.lang.foreign` (Project Panama)
