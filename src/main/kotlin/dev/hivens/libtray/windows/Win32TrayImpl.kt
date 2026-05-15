@@ -138,7 +138,7 @@ internal class Win32TrayImpl private constructor(
         if (!open.get()) return false
         tooltip = text
         writeWideStringField(notifyIconData, "szTip", 128, text)
-        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
         return shellNotifyIcon(Win32Bindings.NIM_MODIFY)
     }
 
@@ -159,7 +159,7 @@ internal class Win32TrayImpl private constructor(
             bindings.notifyIconDataLayout.byteOffset(MemoryLayout.PathElement.groupElement("hIcon")),
             newIcon,
         )
-        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
         val ok = shellNotifyIcon(Win32Bindings.NIM_MODIFY)
         if (prev != null && prev.address() != 0L) {
             runCatching { bindings.handle("DestroyIcon").invokeExact(prev) as Int }
@@ -238,7 +238,7 @@ internal class Win32TrayImpl private constructor(
         data.set(ValueLayout.ADDRESS, off("hIcon"), initialIcon ?: MemorySegment.NULL)
         data.set(ValueLayout.JAVA_INT, off("uTimeoutOrVersion"), Win32Bindings.NOTIFYICON_VERSION_4)
         writeWideStringField(data, "szTip", 128, tooltip)
-        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
     }
 
     /** Mutate just the uFlags field — every NIM_MODIFY needs the flags it wants applied. */

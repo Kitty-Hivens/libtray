@@ -243,6 +243,16 @@ internal class Win32Bindings private constructor(
         const val NIF_STATE:   Int = 0x00000008
 
         /**
+         * `NIF_SHOWTIP` (Vista+): show the standard tooltip even when the
+         * icon was registered with `NOTIFYICON_VERSION_4`. v4 mode
+         * silently suppresses the standard tooltip on the assumption that
+         * the app draws its own popup UI; without this flag, the szTip
+         * we set is stored but never rendered. Required combo for
+         * libtray's "v4 mouse events + standard hover tooltip" usage.
+         */
+        const val NIF_SHOWTIP: Int = 0x00000080
+
+        /**
          * `NOTIFYICON_VERSION_4` — opt into "modern" mouse-message
          * delivery. Without this, Shell_NotifyIcon packs button events
          * into the lParam of WM_USER+1 in the legacy way; with it, we
