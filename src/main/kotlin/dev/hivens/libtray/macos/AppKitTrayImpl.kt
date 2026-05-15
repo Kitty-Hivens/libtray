@@ -465,31 +465,41 @@ internal class AppKitTrayImpl private constructor(
         }
 
         /**
-         * Cocoa requires `NSApplication` to be initialised before
-         * `NSStatusBar`'s side of the AppKit machinery is touched.
-         * In a JVM context that's typically taken care of by AWT
-         * auto-init (BufferedImage / ImageIO touch the toolkit), but
-         * for headless or AWT-cold launches the call hangs without
-         * an `NSApplication` instance to pin AppKit's main runloop.
+         * Cocoa requires `NSApplication` to be initialised AND to have
+         * an activation policy that permits UI surfaces before
+         * `NSStatusBar` items become visible in the menu bar.
          *
-         * `[NSApplication sharedApplication]` is idempotent — first call
-         * creates the singleton + AppKit infrastructure, subsequent
-         * calls return the existing instance. Safe to invoke every
-         * time `Tray.create` runs.
+         *   1. `[NSApplication sharedApplication]` — materialises the
+         *      singleton + AppKit infrastructure. Idempotent.
+         *   2. `[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]`
+         *      — the JVM defaults to LSUIElement-ish accessory mode
+         *      (or worse, "prohibited" when launched without a Dock
+         *      entry), which silently suppresses NSStatusBar
+         *      registration: the call returns a non-NULL NSStatusItem
+         *      but the icon never paints. Switching to "regular"
+         *      makes the process a normal GUI participant, status
+         *      bar item shows up.
          *
-         * Won't kick the actual NSApplication run loop (we don't call
-         * `[app run]` — that would block the calling thread forever).
-         * NSStatusBar operations don't need a running event loop, just
-         * the singleton existing.
+         * We do NOT call `[NSApp run]` — that would block the calling
+         * thread forever. NSStatusBar operations work without an
+         * active run loop; only the singleton + activation policy
+         * matter for visibility.
          */
         @Synchronized
         private fun ensureNSApplicationInitialised(bindings: ObjcBindings) {
             runCatching {
                 val cls = bindings.cls("NSApplication")
-                bindings.handle("objc_msgSend_id")
+                val app = bindings.handle("objc_msgSend_id")
                     .invokeExact(cls, bindings.sel("sharedApplication")) as MemorySegment
+                if (app.address() != 0L) {
+                    // NSApplicationActivationPolicyRegular = 0
+                    bindings.handle("objc_msgSend_void_long").invokeExact(
+                        app, bindings.sel("setActivationPolicy:"), 0L,
+                    ) as Unit
+                    log.info("[create] NSApplication activation policy set to Regular (status bar items will paint)")
+                }
             }.onFailure {
-                log.warn("[NSApplication sharedApplication] threw: {} — proceeding anyway", it.message)
+                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {} — proceeding anyway", it.message)
             }
         }
 
