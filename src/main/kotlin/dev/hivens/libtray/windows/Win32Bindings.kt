@@ -157,7 +157,61 @@ internal class Win32Bindings private constructor(
                 null,                                                       // void
                 listOf(ValueLayout.JAVA_INT),                               // int nExitCode
             ),
+
+            // ── shell32: tray icon ─────────────────────────────────────────
+            Triple("Shell_NotifyIconW",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(ValueLayout.JAVA_INT, ValueLayout.ADDRESS),          // DWORD dwMessage, PNOTIFYICONDATAW
+            ),
+
+            // ── user32: icon construction / teardown ───────────────────────
+            Triple("CreateIcon",
+                ValueLayout.ADDRESS,                                        // HICON
+                listOf(
+                    ValueLayout.ADDRESS,    // HINSTANCE hInstance
+                    ValueLayout.JAVA_INT,   // int nWidth
+                    ValueLayout.JAVA_INT,   // int nHeight
+                    ValueLayout.JAVA_BYTE,  // BYTE cPlanes
+                    ValueLayout.JAVA_BYTE,  // BYTE cBitsPixel
+                    ValueLayout.ADDRESS,    // const BYTE* lpbANDbits
+                    ValueLayout.ADDRESS,    // const BYTE* lpbXORbits
+                ),
+            ),
+            Triple("DestroyIcon",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(ValueLayout.ADDRESS),                                // HICON
+            ),
         )
+
+        // ── Shell_NotifyIcon constants from shellapi.h ─────────────────────
+
+        const val NIM_ADD:    Int = 0x00000000
+        const val NIM_MODIFY: Int = 0x00000001
+        const val NIM_DELETE: Int = 0x00000002
+        const val NIM_SETVERSION: Int = 0x00000004
+
+        const val NIF_MESSAGE: Int = 0x00000001
+        const val NIF_ICON:    Int = 0x00000002
+        const val NIF_TIP:     Int = 0x00000004
+        const val NIF_STATE:   Int = 0x00000008
+
+        /**
+         * `NOTIFYICON_VERSION_4` — opt into "modern" mouse-message
+         * delivery. Without this, Shell_NotifyIcon packs button events
+         * into the lParam of WM_USER+1 in the legacy way; with it, we
+         * get message ids in lParam directly + cursor position in wParam.
+         * Cleaner dispatch in Task #112.
+         */
+        const val NOTIFYICON_VERSION_4: Int = 4
+
+        /**
+         * Icon id we use for the single tray icon Win32TrayImpl manages.
+         * Spec allows multiple ids per HWND; we don't need them.
+         */
+        const val TRAY_ICON_UID: Int = 1
+
+        /** Custom message id Shell_NotifyIcon dispatches to our WndProc. */
+        const val WM_TRAY_CALLBACK: Int = WM_USER + 1
 
         /** PeekMessage flags from winuser.h. */
         const val PM_NOREMOVE: Int = 0x0000
@@ -267,5 +321,53 @@ internal class Win32Bindings private constructor(
         ValueLayout.JAVA_LONG,                                  // LRESULT
         ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
         ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,           // HWND, UINT, WPARAM, LPARAM
+    )
+
+    /**
+     * `NOTIFYICONDATAW` from shellapi.h — the parameter to
+     * `Shell_NotifyIconW`. Modern (Win7+) variant, total size 976 bytes
+     * on x86_64. The kernel checks `cbSize` against its own struct
+     * version and rejects outdated values, so set it to
+     * `MemoryLayout.byteSize().toInt()` and we get version negotiation
+     * for free.
+     *
+     * ```c
+     * typedef struct _NOTIFYICONDATAW {
+     *   DWORD cbSize;             // 4   + 4 pad → 8
+     *   HWND  hWnd;               // 8       → 16
+     *   UINT  uID;                // 4       → 20
+     *   UINT  uFlags;             // 4       → 24
+     *   UINT  uCallbackMessage;   // 4   + 4 pad → 32
+     *   HICON hIcon;              // 8       → 40
+     *   WCHAR szTip[128];         // 256     → 296
+     *   DWORD dwState;            // 4       → 300
+     *   DWORD dwStateMask;        // 4       → 304
+     *   WCHAR szInfo[256];        // 512     → 816
+     *   union { UINT uTimeout; UINT uVersion; }; // 4 → 820
+     *   WCHAR szInfoTitle[64];    // 128     → 948
+     *   DWORD dwInfoFlags;        // 4       → 952
+     *   GUID  guidItem;           // 16      → 968
+     *   HICON hBalloonIcon;       // 8       → 976
+     * } NOTIFYICONDATAW;
+     * ```
+     */
+    val notifyIconDataLayout: MemoryLayout = MemoryLayout.structLayout(
+        ValueLayout.JAVA_INT.withName("cbSize"),
+        MemoryLayout.paddingLayout(4),
+        ValueLayout.ADDRESS.withName("hWnd"),
+        ValueLayout.JAVA_INT.withName("uID"),
+        ValueLayout.JAVA_INT.withName("uFlags"),
+        ValueLayout.JAVA_INT.withName("uCallbackMessage"),
+        MemoryLayout.paddingLayout(4),
+        ValueLayout.ADDRESS.withName("hIcon"),
+        MemoryLayout.sequenceLayout(128, ValueLayout.JAVA_SHORT).withName("szTip"),
+        ValueLayout.JAVA_INT.withName("dwState"),
+        ValueLayout.JAVA_INT.withName("dwStateMask"),
+        MemoryLayout.sequenceLayout(256, ValueLayout.JAVA_SHORT).withName("szInfo"),
+        ValueLayout.JAVA_INT.withName("uTimeoutOrVersion"),
+        MemoryLayout.sequenceLayout(64, ValueLayout.JAVA_SHORT).withName("szInfoTitle"),
+        ValueLayout.JAVA_INT.withName("dwInfoFlags"),
+        MemoryLayout.sequenceLayout(16, ValueLayout.JAVA_BYTE).withName("guidItem"),
+        ValueLayout.ADDRESS.withName("hBalloonIcon"),
     )
 }

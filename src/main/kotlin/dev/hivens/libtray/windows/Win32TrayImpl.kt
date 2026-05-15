@@ -5,8 +5,10 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import org.slf4j.LoggerFactory
+import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.Linker
+import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
@@ -17,6 +19,8 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import javax.imageio.ImageIO
 
 /**
  * Windows tray backend on top of `Shell_NotifyIcon` + a hidden
@@ -50,13 +54,32 @@ internal class Win32TrayImpl private constructor(
     private val hwnd: MemorySegment,
     private val classNameSeg: MemorySegment,
     private val hInstance: MemorySegment,
-    @Suppress("UNUSED_PARAMETER") initial: TrayBuilder,
+    initial: TrayBuilder,
 ) : Tray {
 
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
     @Volatile private var open = AtomicBoolean(true)
     private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+
+    /**
+     * Reusable NOTIFYICONDATAW struct. Allocated once on the bindings
+     * arena, mutated for each NIM_ADD / NIM_MODIFY / NIM_DELETE call.
+     * The shell takes a snapshot of the struct contents during each
+     * Shell_NotifyIcon call, so reuse is safe.
+     */
+    private val notifyIconData: MemorySegment = bindings.arena.allocate(bindings.notifyIconDataLayout)
+
+    /**
+     * Currently-installed HICON. Replaced atomically when [setIcon]
+     * fires; the prior HICON gets DestroyIcon'd on success so we don't
+     * leak GDI handles. Initially holds the icon built from the
+     * builder's iconBytes.
+     */
+    private val iconHandle = AtomicReference<MemorySegment?>(null)
+
+    /** Tracks the latest tooltip string for re-applying after setIcon. */
+    @Volatile private var tooltip: String = initial.tooltip ?: ""
 
     /** Background pump thread — `PeekMessageW` + `DispatchMessageW` loop. */
     private val pumpThread = Thread({ pumpLoop() }, "libtray-win32-${ProcessHandle.current().pid()}").apply {
@@ -66,18 +89,65 @@ internal class Win32TrayImpl private constructor(
     init {
         HWND_INSTANCES[hwnd.address()] = this
         pumpThread.start()
+
+        // Build HICON from the initial PNG; null is a soft failure —
+        // we still register the icon entry (Shell_NotifyIcon allows
+        // NIF_MESSAGE without NIF_ICON), the user just sees a blank
+        // square in the tray. Logging at warn so the issue is visible.
+        val initialIcon = pngToHicon(initial.iconBytes)
+        if (initialIcon == null) {
+            log.warn("PNG → HICON conversion returned null; tray entry will register without an icon")
+        } else {
+            iconHandle.set(initialIcon)
+        }
+
+        initNotifyIconData(initialIcon)
+        if (!shellNotifyIcon(Win32Bindings.NIM_ADD)) {
+            log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
+        }
+        // Opt into NOTIFYICON_VERSION_4 — modern mouse-message format
+        // (Task #112 needs this to read button events from lParam).
+        if (!shellNotifyIcon(Win32Bindings.NIM_SETVERSION)) {
+            log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
+        }
     }
 
     override val isOpen: Boolean get() = open.get()
 
-    // ── State setters — stubs for Phase 3 foundation ─────────────────────
-    // Real implementations land in tasks #111 (icon + tooltip) and #112
-    // (menu). Returning false is the documented "backend doesn't support
-    // this yet" contract; callers degrade gracefully.
+    override fun setTooltip(text: String): Boolean {
+        if (!open.get()) return false
+        tooltip = text
+        writeWideStringField(notifyIconData, "szTip", 128, text)
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+        return shellNotifyIcon(Win32Bindings.NIM_MODIFY)
+    }
 
-    override fun setTooltip(text: String): Boolean = false
-    override fun setIcon(iconBytes: ByteArray): Boolean = false
-    override fun setMenu(menu: TrayMenu?): Boolean = false
+    override fun setIcon(iconBytes: ByteArray): Boolean {
+        if (!open.get()) return false
+        require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
+        val newIcon = pngToHicon(iconBytes) ?: run {
+            log.warn("PNG → HICON conversion returned null; setIcon ignored")
+            return false
+        }
+        // Atomically swap the icon handle; destroy the old one only after
+        // the swap succeeds so we never have the struct pointing at a
+        // freed HICON. CompareAndSet not needed — setIcon serialised by
+        // caller convention (single tray-control path).
+        val prev = iconHandle.getAndSet(newIcon)
+        notifyIconData.set(
+            ValueLayout.ADDRESS,
+            bindings.notifyIconDataLayout.byteOffset(MemoryLayout.PathElement.groupElement("hIcon")),
+            newIcon,
+        )
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+        val ok = shellNotifyIcon(Win32Bindings.NIM_MODIFY)
+        if (prev != null && prev.address() != 0L) {
+            runCatching { bindings.handle("DestroyIcon").invokeExact(prev) as Int }
+        }
+        return ok
+    }
+
+    override fun setMenu(menu: TrayMenu?): Boolean = false  // Task #112
 
     override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
         handlers.add(handler)
@@ -86,6 +156,16 @@ internal class Win32TrayImpl private constructor(
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        // Remove the tray icon BEFORE tearing down the window — once the
+        // HWND is destroyed the shell may still hold an entry pointed at
+        // a stale handle, which can leave a ghost icon until the next
+        // explorer.exe restart. NIM_DELETE first is the documented order.
+        runCatching { shellNotifyIcon(Win32Bindings.NIM_DELETE) }
+        iconHandle.getAndSet(null)?.let { hicon ->
+            if (hicon.address() != 0L) {
+                runCatching { bindings.handle("DestroyIcon").invokeExact(hicon) as Int }
+            }
+        }
         // Post WM_CLOSE so the pump thread wakes up out of PeekMessage
         // and exits cleanly. DefWindowProc translates WM_CLOSE → DestroyWindow,
         // which fires WM_DESTROY on the same thread → PostQuitMessage(0)
@@ -102,6 +182,123 @@ internal class Win32TrayImpl private constructor(
         runCatching {
             bindings.handle("UnregisterClassW").invokeExact(classNameSeg, hInstance) as Int
         }
+    }
+
+    // ── Shell_NotifyIcon helpers ─────────────────────────────────────────
+
+    private fun shellNotifyIcon(message: Int): Boolean {
+        return runCatching {
+            (bindings.handle("Shell_NotifyIconW").invokeExact(message, notifyIconData) as Int) != 0
+        }.getOrElse { t ->
+            log.warn("Shell_NotifyIcon (msg={}) threw: {}", message, t.message)
+            false
+        }
+    }
+
+    private fun lastError(): Int = runCatching {
+        bindings.handle("GetLastError").invokeExact() as Int
+    }.getOrDefault(0)
+
+    private fun initNotifyIconData(initialIcon: MemorySegment?) {
+        val data = notifyIconData
+        val layout = bindings.notifyIconDataLayout
+        // Zero everything first — the struct is reused, and stale bits
+        // in szInfo / guidItem fields would confuse the shell.
+        for (i in 0 until layout.byteSize()) {
+            data.set(ValueLayout.JAVA_BYTE, i, 0.toByte())
+        }
+        data.set(ValueLayout.JAVA_INT, off("cbSize"), layout.byteSize().toInt())
+        data.set(ValueLayout.ADDRESS, off("hWnd"), hwnd)
+        data.set(ValueLayout.JAVA_INT, off("uID"), Win32Bindings.TRAY_ICON_UID)
+        data.set(ValueLayout.JAVA_INT, off("uCallbackMessage"), Win32Bindings.WM_TRAY_CALLBACK)
+        data.set(ValueLayout.ADDRESS, off("hIcon"), initialIcon ?: MemorySegment.NULL)
+        data.set(ValueLayout.JAVA_INT, off("uTimeoutOrVersion"), Win32Bindings.NOTIFYICON_VERSION_4)
+        writeWideStringField(data, "szTip", 128, tooltip)
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP)
+    }
+
+    /** Mutate just the uFlags field — every NIM_MODIFY needs the flags it wants applied. */
+    private fun notifyIconDataFlags(flags: Int) {
+        notifyIconData.set(ValueLayout.JAVA_INT, off("uFlags"), flags)
+    }
+
+    private fun off(name: String): Long =
+        bindings.notifyIconDataLayout.byteOffset(MemoryLayout.PathElement.groupElement(name))
+
+    /**
+     * Write a wide-string into a fixed-size WCHAR array field, NUL-padded
+     * to the field length. Truncates to (maxChars - 1) so there's room
+     * for the terminator. Used for szTip and friends.
+     */
+    private fun writeWideStringField(data: MemorySegment, fieldName: String, maxChars: Int, value: String) {
+        val fieldOffset = off(fieldName)
+        // Zero the whole field first to wipe any prior longer value.
+        for (i in 0 until maxChars) {
+            data.set(ValueLayout.JAVA_SHORT, fieldOffset + i * 2L, 0.toShort())
+        }
+        val truncated = if (value.length >= maxChars) value.substring(0, maxChars - 1) else value
+        for ((i, ch) in truncated.withIndex()) {
+            data.set(ValueLayout.JAVA_SHORT, fieldOffset + i * 2L, ch.code.toShort())
+        }
+    }
+
+    // ── PNG → HICON conversion ───────────────────────────────────────────
+    //
+    // Decode via ImageIO (zero-extra-deps; libtray's Linux backend uses the
+    // same path), convert ARGB→BGRA, flip vertically (CreateIcon expects
+    // bottom-up DIB), call CreateIcon. With a 32bpp icon + a zero AND
+    // mask, modern Windows uses the alpha channel for transparency.
+
+    private fun pngToHicon(bytes: ByteArray): MemorySegment? {
+        val img = runCatching { ImageIO.read(ByteArrayInputStream(bytes)) }.getOrNull() ?: run {
+            log.warn("ImageIO could not decode PNG ({} bytes)", bytes.size)
+            return null
+        }
+        val w = img.width
+        val h = img.height
+        if (w <= 0 || h <= 0 || w > 256 || h > 256) {
+            log.warn("PNG dimensions out of range: {}x{} (expected 1..256)", w, h)
+            return null
+        }
+        val argb = IntArray(w * h)
+        img.getRGB(0, 0, w, h, argb, 0, w)
+
+        // XOR bits = BGRA, bottom-up.
+        val xorBytes = ByteArray(w * h * 4)
+        for (y in 0 until h) {
+            val srcRowStart = (h - 1 - y) * w
+            val dstRowStart = y * w * 4
+            for (x in 0 until w) {
+                val px = argb[srcRowStart + x]
+                val a = (px ushr 24) and 0xff
+                val r = (px ushr 16) and 0xff
+                val g = (px ushr 8) and 0xff
+                val b = px and 0xff
+                xorBytes[dstRowStart + x * 4    ] = b.toByte()
+                xorBytes[dstRowStart + x * 4 + 1] = g.toByte()
+                xorBytes[dstRowStart + x * 4 + 2] = r.toByte()
+                xorBytes[dstRowStart + x * 4 + 3] = a.toByte()
+            }
+        }
+
+        // AND mask: 1bpp, scanlines aligned to 4-byte boundary. All zeros
+        // tells Windows "use alpha from XOR bits"; correct on Vista+.
+        val maskScanline = ((w + 31) / 32) * 4
+        val andBytes = ByteArray(maskScanline * h)
+
+        val xorSeg = bindings.arena.allocate(xorBytes.size.toLong())
+        xorSeg.asByteBuffer().put(xorBytes)
+        val andSeg = bindings.arena.allocate(andBytes.size.toLong())
+        andSeg.asByteBuffer().put(andBytes)
+
+        val hicon = bindings.handle("CreateIcon").invokeExact(
+            hInstance, w, h, 1.toByte(), 32.toByte(), andSeg, xorSeg,
+        ) as MemorySegment
+        if (hicon.address() == 0L) {
+            log.warn("CreateIcon returned NULL (GetLastError={})", lastError())
+            return null
+        }
+        return hicon
     }
 
     // ── Background dispatch loop ─────────────────────────────────────────
