@@ -230,6 +230,14 @@ internal class ObjcBindings private constructor(
         const val NS_VARIABLE_STATUS_ITEM_LENGTH: Double = -1.0
 
         /**
+         * `NSSquareStatusItemLength` — fixed square width matching the
+         * menu bar height. More forgiving than `NSVariableStatusItemLength`
+         * when the icon paint pipeline is wonky: even an empty button
+         * takes up a square slot, which is at least visible to the user.
+         */
+        const val NS_SQUARE_STATUS_ITEM_LENGTH: Double = -2.0
+
+        /**
          * Load runtime + AppKit + Foundation into a fresh shared arena
          * and bind every symbol in [LOAD_SET]. Returns null when not on
          * macOS (`dlopen` fails) or any required symbol is missing —

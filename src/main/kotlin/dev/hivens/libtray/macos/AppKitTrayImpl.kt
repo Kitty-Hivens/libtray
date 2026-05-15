@@ -79,6 +79,12 @@ internal class AppKitTrayImpl private constructor(
 
     init {
         INSTANCE_REGISTRY[instanceId] = this
+        // Belt-and-suspenders: set a short text title FIRST so even if
+        // the image pipeline silently fails (NSImage decoded fine but
+        // SystemUIServer drops it), the menu bar shows SOMETHING. The
+        // title gets overwritten visually by setImage if the image
+        // does succeed; otherwise it stays as the visible fallback.
+        applyTitleFallback("●")
         if (initial.iconBytes.isNotEmpty()) applyIcon(initial.iconBytes)
         initial.tooltip?.takeIf { it.isNotEmpty() }?.let { applyTooltip(it) }
         initial.menu?.let { applyMenu(it) }
@@ -159,10 +165,19 @@ internal class AppKitTrayImpl private constructor(
                 return@autoreleasepool
             }
             log.info("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
+            // Force template OFF — by default macOS may try to render
+            // our colored PNG as a black-only template (auto-inverting
+            // in dark mode), which can blank out colored-only icons.
+            // setTemplate:NO tells AppKit to use the image as-is.
+            runCatching {
+                bindings.handle("objc_msgSend_void_long").invokeExact(
+                    image, bindings.sel("setTemplate:"), 0L,
+                ) as Unit
+            }
             bindings.handle("objc_msgSend_void_id").invokeExact(
                 statusButton, bindings.sel("setImage:"), image,
             ) as Unit
-            log.info("applyIcon: setImage: dispatched to status button")
+            log.info("applyIcon: setImage: dispatched to status button (template=NO)")
         }
     }
 
@@ -433,11 +448,16 @@ internal class AppKitTrayImpl private constructor(
                     return@runCatching null
                 }
 
-                log.info("[create] step 4/5: statusItemWithLength:")
+                log.info("[create] step 4/5: statusItemWithLength: (square)")
+                // Square length forces a fixed visible slot — variable
+                // sizing can collapse to zero width when the icon
+                // pipeline doesn't fully register, leaving an
+                // invisible status item that's "there" technically
+                // but indistinguishable from absence.
                 val statusItem = bindings.handle("objc_msgSend_id_double")
                     .invokeExact(
                         systemStatusBar, bindings.sel("statusItemWithLength:"),
-                        ObjcBindings.NS_VARIABLE_STATUS_ITEM_LENGTH,
+                        ObjcBindings.NS_SQUARE_STATUS_ITEM_LENGTH,
                     ) as MemorySegment
                 if (statusItem.address() == 0L) {
                     log.warn("statusItemWithLength: returned NULL")
