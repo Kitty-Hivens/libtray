@@ -328,11 +328,17 @@ internal class SniTrayImpl private constructor(
 
     private fun appendVariantIconPixmap(call: Arena, parent: MemorySegment, pixmaps: List<Pixmap>) {
         // IconPixmap signature: a(iiay) — array of (width, height, ARGB32-network-order bytes).
-        val sig = call.allocateUtf8("(iiay)")
+        // Variant outer signature is the FULL type "a(iiay)"; the array's
+        // element signature is the struct alone "(iiay)". Initial commit
+        // had both as "(iiay)" which made libdbus reject the array open
+        // ("Writing an element of type array, but the expected type here
+        // is struct") — caught by manual smoke on Hyprland.
+        val variantSig = call.allocateUtf8("a(iiay)")
+        val elementSig = call.allocateUtf8("(iiay)")
         val variant = call.allocate(bindings.messageIterLayout)
-        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
+        openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, variantSig, variant)
         val arr = call.allocate(bindings.messageIterLayout)
-        openContainer(variant, DBusBindings.DBUS_TYPE_ARRAY, sig, arr)
+        openContainer(variant, DBusBindings.DBUS_TYPE_ARRAY, elementSig, arr)
 
         for (px in pixmaps) {
             val struct = call.allocate(bindings.messageIterLayout)
