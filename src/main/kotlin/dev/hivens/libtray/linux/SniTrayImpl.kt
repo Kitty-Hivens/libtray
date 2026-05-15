@@ -61,6 +61,20 @@ internal class SniTrayImpl private constructor(
 
     private val log = LoggerFactory.getLogger("libtray.SniTray")
 
+    /**
+     * SNI `Id` property — must be a stable, application-wide slug per spec
+     * ("name that should be unique for this application and consistent
+     * between sessions"). KDE Plasma surfaces this in tooltips when it
+     * doesn't recognise the app, so leaking the auto-generated bus name
+     * (`org.kde.StatusNotifierItem-PID-N`) here produces visually broken
+     * tooltips of the form `<bus-name> • <Title> — <ToolTip.body>`.
+     * Derive a slug from the human title instead.
+     */
+    private val appId: String = slugifyForSni(initial.title)
+
+    /** SNI `Title` property — the human-readable application name. */
+    private val appTitle: String = initial.title
+
     @Volatile private var iconBytes: ByteArray = initial.iconBytes
     @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
     @Volatile private var tooltip: String = initial.tooltip ?: ""
@@ -261,8 +275,8 @@ internal class SniTrayImpl private constructor(
     private fun appendVariantForProperty(call: Arena, parent: MemorySegment, propName: String) {
         when (propName) {
             "Category"      -> appendVariantString(call, parent, "ApplicationStatus")
-            "Id"            -> appendVariantString(call, parent, itemId)
-            "Title"         -> appendVariantString(call, parent, itemId)
+            "Id"            -> appendVariantString(call, parent, appId)
+            "Title"         -> appendVariantString(call, parent, appTitle)
             "Status"        -> appendVariantString(call, parent, status)
             "WindowId"      -> appendVariantInt(call, parent, 0)
             "IconName"      -> appendVariantString(call, parent, "")
@@ -322,9 +336,12 @@ internal class SniTrayImpl private constructor(
     }
 
     private fun appendVariantToolTip(call: Arena, parent: MemorySegment, body: String) {
-        // ToolTip signature: (sa(iiay)ss) — (icon_name, icon_data,
-        // title, body). We populate icon_name="", icon_data=empty,
-        // title=itemId, body=tooltip.
+        // ToolTip signature: (sa(iiay)ss) — (icon_name, icon_data, title, body).
+        //
+        // KDE Plasma renders ToolTip as `<title> (bold) <body>` *and* shows
+        // SNI `Title` above. If we set tooltip-title=appTitle we get the
+        // app name twice; if we set it to itemId we leak the bus name.
+        // Empty title gives the cleanest result: `<Title>  <body>`.
         val sig = call.allocateUtf8("(sa(iiay)ss)")
         val variant = call.allocate(bindings.messageIterLayout)
         openContainer(parent, DBusBindings.DBUS_TYPE_VARIANT, sig, variant)
@@ -337,7 +354,7 @@ internal class SniTrayImpl private constructor(
         val emptyArr = call.allocate(bindings.messageIterLayout)
         openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, emptyArrSig, emptyArr)
         closeContainer(struct, emptyArr)
-        appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, itemId)       // title
+        appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, "")           // title (deliberately empty — see comment above)
         appendBasicString(call, struct, DBusBindings.DBUS_TYPE_STRING, body)         // body
         closeContainer(variant, struct)
 
@@ -796,6 +813,23 @@ internal class SniTrayImpl private constructor(
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.SniTray")
         private val itemCounter = AtomicInteger(0)
+
+        /**
+         * Derive an SNI `Id` from the human-readable title. Spec calls for
+         * "a name that should be unique for this application and consistent
+         * between sessions" — so lowercase, drop everything that's not
+         * `[a-z0-9]`, fall back to "tray" if the result is empty (titles
+         * made of pure CJK / cyrillic / emoji would otherwise produce an
+         * empty Id, which some hosts reject).
+         */
+        internal fun slugifyForSni(title: String): String {
+            val slug = buildString(title.length) {
+                for (ch in title.lowercase()) {
+                    if (ch in 'a'..'z' || ch in '0'..'9') append(ch)
+                }
+            }
+            return slug.ifEmpty { "tray" }
+        }
 
         // Properties exposed on the StatusNotifierItem object — used by
         // GetAll to enumerate, and by Get to dispatch.
