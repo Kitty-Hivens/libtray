@@ -380,8 +380,13 @@ internal class AppKitTrayImpl private constructor(
             lastBindings = bindings
 
             return runCatching {
+                log.info("[create] step 1/5: ensure NSApplication is initialised")
+                ensureNSApplicationInitialised(bindings)
+
+                log.info("[create] step 2/5: register LibtrayMenuTarget class")
                 ensureMenuTargetClass(bindings)
 
+                log.info("[create] step 3/5: get [NSStatusBar systemStatusBar]")
                 val nsStatusBarCls = bindings.cls("NSStatusBar")
                 val systemStatusBar = bindings.handle("objc_msgSend_id")
                     .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
@@ -389,6 +394,8 @@ internal class AppKitTrayImpl private constructor(
                     log.warn("[NSStatusBar systemStatusBar] returned NULL")
                     return@runCatching null
                 }
+
+                log.info("[create] step 4/5: statusItemWithLength:")
                 val statusItem = bindings.handle("objc_msgSend_id_double")
                     .invokeExact(
                         systemStatusBar, bindings.sel("statusItemWithLength:"),
@@ -398,12 +405,10 @@ internal class AppKitTrayImpl private constructor(
                     log.warn("statusItemWithLength: returned NULL")
                     return@runCatching null
                 }
-                // Retain so the system status bar's autorelease pool
-                // doesn't reclaim it the moment the calling thread
-                // returns to its run loop.
                 val retainedItem = bindings.handle("objc_retain")
                     .invokeExact(statusItem) as MemorySegment
 
+                log.info("[create] step 5/5: get statusItem.button")
                 val button = bindings.handle("objc_msgSend_id")
                     .invokeExact(retainedItem, bindings.sel("button")) as MemorySegment
                 if (button.address() == 0L) {
@@ -415,6 +420,35 @@ internal class AppKitTrayImpl private constructor(
                 log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
                 AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
             }.onFailure { log.warn("AppKit tray construction threw: {}", it.message) }.getOrNull()
+        }
+
+        /**
+         * Cocoa requires `NSApplication` to be initialised before
+         * `NSStatusBar`'s side of the AppKit machinery is touched.
+         * In a JVM context that's typically taken care of by AWT
+         * auto-init (BufferedImage / ImageIO touch the toolkit), but
+         * for headless or AWT-cold launches the call hangs without
+         * an `NSApplication` instance to pin AppKit's main runloop.
+         *
+         * `[NSApplication sharedApplication]` is idempotent — first call
+         * creates the singleton + AppKit infrastructure, subsequent
+         * calls return the existing instance. Safe to invoke every
+         * time `Tray.create` runs.
+         *
+         * Won't kick the actual NSApplication run loop (we don't call
+         * `[app run]` — that would block the calling thread forever).
+         * NSStatusBar operations don't need a running event loop, just
+         * the singleton existing.
+         */
+        @Synchronized
+        private fun ensureNSApplicationInitialised(bindings: ObjcBindings) {
+            runCatching {
+                val cls = bindings.cls("NSApplication")
+                bindings.handle("objc_msgSend_id")
+                    .invokeExact(cls, bindings.sel("sharedApplication")) as MemorySegment
+            }.onFailure {
+                log.warn("[NSApplication sharedApplication] threw: {} — proceeding anyway", it.message)
+            }
         }
 
         /**
