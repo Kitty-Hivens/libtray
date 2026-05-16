@@ -735,7 +735,7 @@ internal class SniTrayImpl private constructor(
 
     private fun readMessageString(handle: java.lang.invoke.MethodHandle, msg: MemorySegment): String? {
         val ptr = handle.invokeExact(msg) as MemorySegment
-        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getUtf8String(0)
+        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getString(0)
     }
 
     private fun readBasicString(call: Arena, iter: MemorySegment): String? {
@@ -744,7 +744,7 @@ internal class SniTrayImpl private constructor(
         val out = call.allocate(ValueLayout.ADDRESS)
         bindings.handle("dbus_message_iter_get_basic").invokeExact(iter, out) as Unit
         val ptr = out.get(ValueLayout.ADDRESS, 0)
-        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getUtf8String(0)
+        return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getString(0)
     }
 
     private fun readInt(call: Arena, iter: MemorySegment): Int? {
@@ -1041,16 +1041,3 @@ private fun Arena.allocateUtf8(s: String): MemorySegment {
     return segment
 }
 
-/**
- * Read a UTF-8 null-terminated string from a native pointer. Reinterprets
- * with a generous max length so getUtf8String can scan to the terminator.
- */
-private fun MemorySegment.getUtf8String(offset: Long): String {
-    // Find the null terminator within reasonable bounds.
-    val maxScan = minOf(byteSize() - offset, 1L shl 20)  // cap at 1MB
-    var len = 0L
-    while (len < maxScan && get(ValueLayout.JAVA_BYTE, offset + len) != 0.toByte()) len++
-    val bytes = ByteArray(len.toInt())
-    MemorySegment.copy(this, ValueLayout.JAVA_BYTE, offset, bytes, 0, len.toInt())
-    return String(bytes, Charsets.UTF_8)
-}
