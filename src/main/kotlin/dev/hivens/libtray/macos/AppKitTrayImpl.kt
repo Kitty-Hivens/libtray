@@ -518,19 +518,24 @@ internal class AppKitTrayImpl private constructor(
          *
          *   1. `[NSApplication sharedApplication]` — materialises the
          *      singleton + AppKit infrastructure. Idempotent.
-         *   2. `[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular]`
-         *      — the JVM defaults to LSUIElement-ish accessory mode
-         *      (or worse, "prohibited" when launched without a Dock
-         *      entry), which silently suppresses NSStatusBar
-         *      registration: the call returns a non-NULL NSStatusItem
-         *      but the icon never paints. Switching to "regular"
-         *      makes the process a normal GUI participant, status
-         *      bar item shows up.
+         *   2. `[NSApp setActivationPolicy:NSApplicationActivationPolicyAccessory]`
+         *      — accessory mode is the canonical "menu-bar agent" policy:
+         *      no Dock icon, no ⌘-tab presence, but full eligibility to
+         *      install NSStatusBar items. `Regular` (the previous choice)
+         *      requires a real `.app` bundle to behave sanely; running
+         *      `java …` with `Regular` gets weird half-state from
+         *      Launch Services ("application is damaged", missing main
+         *      menu). `Accessory` works for both bundled `.app` AND
+         *      plain-JVM launches, so it's the correct default for a
+         *      tray library.
          *
-         * We do NOT call `[NSApp run]` — that would block the calling
-         * thread forever. NSStatusBar operations work without an
-         * active run loop; only the singleton + activation policy
-         * matter for visibility.
+         * **Run loop ownership.** This method does NOT call `[NSApp run]`.
+         * The host application owns the Cocoa main run loop — Compose
+         * Desktop / Skiko does this automatically by virtue of being a
+         * Cocoa app. Headless callers (the smoke harness) must run their
+         * own `[NSApp run]` on the main thread, otherwise NSStatusItem
+         * registration messages queue up but never reach SystemUIServer
+         * via mach IPC — the item exists in our process but never paints.
          */
         @Synchronized
         private fun ensureNSApplicationInitialised(bindings: ObjcBindings) {
@@ -539,9 +544,9 @@ internal class AppKitTrayImpl private constructor(
                 val app = bindings.handle("objc_msgSend_id")
                     .invokeExact(cls, bindings.sel("sharedApplication")) as MemorySegment
                 if (app.address() != 0L) {
-                    // NSApplicationActivationPolicyRegular = 0
                     bindings.handle("objc_msgSend_void_long").invokeExact(
-                        app, bindings.sel("setActivationPolicy:"), 0L,
+                        app, bindings.sel("setActivationPolicy:"),
+                        ObjcBindings.NS_APP_POLICY_ACCESSORY,
                     ) as Unit
                     // Required for status items to register with SystemUIServer
                     // — without finishLaunching the app is "in flux" from
@@ -550,14 +555,7 @@ internal class AppKitTrayImpl private constructor(
                         bindings.handle("objc_msgSend_id")
                             .invokeExact(app, bindings.sel("finishLaunching")) as MemorySegment
                     }
-                    // Activate so we're foreground enough for the menu bar
-                    // shell to wake up and re-poll status items.
-                    runCatching {
-                        bindings.handle("objc_msgSend_void_long").invokeExact(
-                            app, bindings.sel("activateIgnoringOtherApps:"), 1L,
-                        ) as Unit
-                    }
-                    log.info("[create] NSApplication activation policy = Regular, finishLaunching + activateIgnoringOtherApps fired")
+                    log.info("[create] NSApplication activation policy = Accessory, finishLaunching fired")
                 }
             }.onFailure {
                 log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {} — proceeding anyway", it.message)

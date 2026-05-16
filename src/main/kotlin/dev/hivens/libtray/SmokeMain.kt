@@ -1,8 +1,10 @@
 package dev.hivens.libtray
 
+import dev.hivens.libtray.macos.ObjcBindings
 import java.awt.Color
 import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
+import java.lang.foreign.MemorySegment
 import javax.imageio.ImageIO
 
 /**
@@ -104,6 +106,68 @@ fun main() {
     })
 
     println("[smoke] tray live. Click / right-click / Ctrl-C to test. Tray will stay until SIGINT.")
-    exitFlag.await()  // Ctrl-C handler in the JDK delivers SIGINT → JVM exit → shutdown hook
-    tray.close()
+
+    val osName = System.getProperty("os.name", "").lowercase()
+    if (osName.contains("mac") || osName.contains("darwin")) {
+        runMacCocoaLoopUntil(exitFlag) { tray.close() }
+    } else {
+        exitFlag.await()  // Ctrl-C handler in the JDK delivers SIGINT → JVM exit → shutdown hook
+        tray.close()
+    }
+}
+
+/**
+ * macOS-only smoke harness exit path. NSStatusItem registration uses
+ * mach IPC to talk to SystemUIServer, and the replies are dispatched
+ * via the Cocoa main run loop — without an active loop the icon
+ * exists in our process but never paints. AWT EDT does not satisfy
+ * Cocoa: a JVM launched with `-XstartOnFirstThread` runs `main` on
+ * OS thread 0, which IS the Cocoa main thread, and we have to keep
+ * it pumping with `[NSApp run]` until the user picks "Exit".
+ *
+ * Architecture:
+ *  - Background watcher waits on [exitFlag] (fired by the menu "Exit"
+ *    handler). On wake, it closes the tray, then sends `terminate:`
+ *    to NSApp which lets the run loop return cleanly.
+ *  - Main thread enters `[NSApp run]` — blocks here until terminate.
+ *
+ * Production Aura doesn't need this code path: Compose Desktop /
+ * Skiko owns the Cocoa main loop already.
+ */
+private fun runMacCocoaLoopUntil(
+    exitFlag: java.util.concurrent.CountDownLatch,
+    closeTray: () -> Unit,
+) {
+    val bindings = ObjcBindings.load() ?: run {
+        System.err.println("[smoke] ObjcBindings.load() failed on macOS — cannot run Cocoa loop")
+        exitFlag.await()
+        closeTray()
+        return
+    }
+    val nsAppCls = bindings.cls("NSApplication")
+    val sharedApp = bindings.handle("objc_msgSend_id")
+        .invokeExact(nsAppCls, bindings.sel("sharedApplication")) as MemorySegment
+
+    Thread({
+        exitFlag.await()
+        println("[smoke] exitFlag tripped → close tray + [NSApp terminate:]")
+        runCatching { closeTray() }
+        runCatching {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                sharedApp, bindings.sel("terminate:"), MemorySegment.NULL,
+            ) as Unit
+        }
+    }, "libtray-smoke-exit-watcher").apply {
+        isDaemon = false
+        start()
+    }
+
+    println("[smoke] entering [NSApp run] on main thread")
+    bindings.handle("objc_msgSend_void").invokeExact(
+        sharedApp, bindings.sel("run"),
+    ) as Unit
+    // [NSApp terminate:] calls exit() under the hood; this point is
+    // typically unreachable. Kept for the (theoretical) case where a
+    // future NSApplicationDelegate vetoes termination.
+    println("[smoke] [NSApp run] returned")
 }

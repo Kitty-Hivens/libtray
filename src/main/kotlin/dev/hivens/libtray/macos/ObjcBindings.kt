@@ -216,6 +216,11 @@ internal class ObjcBindings private constructor(
                 FunctionDescriptor.ofVoid(
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
 
+            // void msgSend(id, SEL) — zero-arg void calls, e.g. [NSApp run]
+            Triple("objc_msgSend_void",      "objc_msgSend",
+                FunctionDescriptor.ofVoid(
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
+
             // long msgSend(id, SEL) — tag getter (NSInteger = long)
             Triple("objc_msgSend_long",      "objc_msgSend",
                 FunctionDescriptor.of(ValueLayout.JAVA_LONG,
@@ -236,6 +241,25 @@ internal class ObjcBindings private constructor(
          * takes up a square slot, which is at least visible to the user.
          */
         const val NS_SQUARE_STATUS_ITEM_LENGTH: Double = -2.0
+
+        /**
+         * `NSApplicationActivationPolicyRegular` — full GUI app (Dock
+         * icon, menu bar, ⌘-tab eligible). Requires a real `.app`
+         * bundle to behave correctly; a plain JVM process running with
+         * `java …` gets weird half-state ("application is damaged"
+         * pop-ups, missing menu bar). Not what we want for a tray-only
+         * library.
+         */
+        const val NS_APP_POLICY_REGULAR: Long = 0L
+
+        /**
+         * `NSApplicationActivationPolicyAccessory` — background agent
+         * with menu-bar UI but no Dock icon and no ⌘-tab presence.
+         * The correct policy for a status-bar-only application —
+         * SystemUIServer recognises us as a legitimate menu-bar
+         * participant without demanding `.app`-bundle ceremony.
+         */
+        const val NS_APP_POLICY_ACCESSORY: Long = 1L
 
         /**
          * Load runtime + AppKit + Foundation into a fresh shared arena
