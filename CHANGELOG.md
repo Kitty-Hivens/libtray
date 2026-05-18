@@ -5,6 +5,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+- Linux backend: `dbus_connection_flush` no longer runs on the caller
+  thread. Public mutators (`setTooltip`, `setMenu`, `setIcon`) enqueue
+  the outgoing message on a `LinkedBlockingQueue<MemorySegment>`; a
+  dedicated `libtray-sni-sender-<pid>` daemon thread drains the queue
+  and performs the blocking `send` + `flush` + `unref` triplet there.
+  A multi-signal burst (e.g. `setMenu` emits `LayoutUpdated`, a
+  following `setTooltip` emits `NewTitle` + `NewToolTip`) previously
+  stalled the caller for over a second on a busy session bus -- in
+  UI-toolkit consumers (AWT/EDT, Compose Desktop's Swing dispatcher,
+  JavaFX) this manifested as full-window freezes.
+
 ### Added
 - Repository scaffold: Apache 2.0 license, Gradle/Kotlin build,
   Java 22 toolchain (Project Panama floor — `java.lang.foreign`

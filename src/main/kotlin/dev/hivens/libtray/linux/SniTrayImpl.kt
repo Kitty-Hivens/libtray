@@ -10,6 +10,8 @@ import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.imageio.ImageIO
@@ -102,8 +104,39 @@ internal class SniTrayImpl private constructor(
         isDaemon = true
     }
 
+    /**
+     * Outgoing D-Bus messages awaiting send. Public API methods (setTooltip,
+     * setMenu, setIcon, replyEmpty etc.) enqueue here and return immediately;
+     * the [senderThread] picks each one up, calls `dbus_connection_send` +
+     * flush + unref, and moves on.
+     *
+     * Pre-fix: every public call did send + flush + unref synchronously on
+     * the caller thread. `dbus_connection_flush` blocks until the message
+     * actually leaves on the wire, which on a busy session bus can take
+     * up to several hundred ms per call. UI consumers (Compose Desktop,
+     * Swing) call this from the EDT — so during a state-change burst
+     * (e.g. a "launch starting" tray-status update emits two signals back
+     * to back) the EDT could stall for 1-2 s, producing a fully-frozen
+     * application window. Captured in the field via Aura's puppet diag
+     * snapshot on 2026-05-18: `AWT-EventQueue-0` `RUNNABLE inNative=true`
+     * deep in `DowncallStub.invoke` -> `sendAndUnref`.
+     *
+     * Unbounded by design. The realistic upper bound on queue depth is
+     * tens of messages (setMenu fans out into a single LayoutUpdated;
+     * setTooltip fans out into two; setIcon into one). A misbehaving
+     * caller hammering setMenu() in a tight loop would still bottleneck
+     * on the sender thread's flush rate, not on memory.
+     */
+    private val outgoing = LinkedBlockingQueue<MemorySegment>()
+
+    /** Sender thread — drains [outgoing], performs the blocking flush there instead of on the caller. */
+    private val senderThread = Thread({ senderLoop() }, "libtray-sni-sender-${ProcessHandle.current().pid()}").apply {
+        isDaemon = true
+    }
+
     init {
         pumpThread.start()
+        senderThread.start()
     }
 
     override val isOpen: Boolean get() = open.get()
@@ -146,10 +179,12 @@ internal class SniTrayImpl private constructor(
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
-        // pumpLoop checks open.get() each iteration and exits within
-        // the next read_write timeout (1s). Don't hard-interrupt — that
-        // could leave the connection in a weird half-closed state with
-        // the watcher still expecting our service.
+        // pumpLoop + senderLoop both check open.get() and exit within
+        // their next poll (~1s). Don't hard-interrupt — that could
+        // leave the connection in a weird half-closed state with the
+        // watcher still expecting our service, AND in the sender's
+        // case could lose half-built outgoing messages mid-FFM call.
+        senderThread.join(2_000)
         pumpThread.join(2_000)
         try {
             bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
@@ -798,13 +833,70 @@ internal class SniTrayImpl private constructor(
         sendAndUnref(reply)
     }
 
+    /**
+     * Queue an outgoing message for the [senderThread] to send + flush +
+     * unref. Returns immediately; the actual blocking native work happens
+     * off the caller thread. See [outgoing]'s KDoc for the EDT-freeze
+     * incident that drove this off-thread refactor.
+     *
+     * Null/zero-address segments are dropped silently — the prior
+     * synchronous version would have crashed in `dbus_connection_send`;
+     * we keep that contract by short-circuiting earlier.
+     */
     private fun sendAndUnref(reply: MemorySegment) {
-        Arena.ofConfined().use { call ->
-            val serial = call.allocate(ValueLayout.JAVA_INT)
-            bindings.handle("dbus_connection_send").invokeExact(connection, reply, serial) as Int
-            bindings.handle("dbus_connection_flush").invokeExact(connection) as Unit
+        if (reply.address() == 0L) return
+        if (!open.get()) {
+            // Already closing: don't enqueue (sender may have exited).
+            // Drop the ref directly so libdbus's internal refcount goes
+            // to zero and the message memory is reclaimed.
+            runCatching { bindings.handle("dbus_message_unref").invokeExact(reply) as Unit }
+            return
         }
-        bindings.handle("dbus_message_unref").invokeExact(reply) as Unit
+        // LinkedBlockingQueue#offer with no capacity bound always succeeds.
+        // Defensive `else` would be dead code; rely on the contract.
+        outgoing.put(reply)
+    }
+
+    /**
+     * Drains [outgoing] in a loop, calling `dbus_connection_send` + flush
+     * + unref for each queued message. This is the thread that takes the
+     * D-Bus flush latency hit so the EDT doesn't have to.
+     *
+     * Lives until [open] flips to false. On shutdown, drains any
+     * still-queued messages without sending them (their refcount is
+     * dropped so native memory isn't leaked) — the host has already been
+     * told via the previous Status/Closing dance that we're going away,
+     * so racing one last NewTitle out the door has no value.
+     */
+    private fun senderLoop() {
+        val send  = bindings.handle("dbus_connection_send")
+        val flush = bindings.handle("dbus_connection_flush")
+        val unref = bindings.handle("dbus_message_unref")
+        while (open.get()) {
+            val msg = try {
+                outgoing.poll(1, TimeUnit.SECONDS) ?: continue
+            } catch (_: InterruptedException) {
+                continue
+            }
+            try {
+                Arena.ofConfined().use { call ->
+                    val serial = call.allocate(ValueLayout.JAVA_INT)
+                    send.invokeExact(connection, msg, serial) as Int
+                    flush.invokeExact(connection) as Unit
+                }
+            } catch (t: Throwable) {
+                log.warn("sender: send/flush failed, dropping message: {}", t.message)
+            } finally {
+                runCatching { unref.invokeExact(msg) as Unit }
+            }
+        }
+        // Final drain: anything queued between the last poll() and the
+        // open=false transition. We unref without sending so libdbus's
+        // outgoing queue doesn't hold our refs past connection_unref.
+        while (true) {
+            val msg = outgoing.poll() ?: break
+            runCatching { unref.invokeExact(msg) as Unit }
+        }
     }
 
     private data class Pixmap(val width: Int, val height: Int, val argbNetworkOrder: ByteArray)
