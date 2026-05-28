@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Fixed
+- Windows backend: tray icon no longer renders upside down (#4). The
+  PNG-to-HICON path was flipping the color rows into bottom-up order
+  before `CreateIcon`. `CreateIcon` builds DDBs (via `CreateBitmap`),
+  whose scanlines run top-to-bottom; bottom-up is the DIB convention,
+  not the DDB one. Rows are now fed top-down, matching what the shell
+  expects. The bug stayed invisible on vertically near-symmetric
+  glyphs and only showed on asymmetric icons.
 - Linux backend: `dbus_connection_flush` no longer runs on the caller
   thread. Public mutators (`setTooltip`, `setMenu`, `setIcon`) enqueue
   the outgoing message on a `LinkedBlockingQueue<MemorySegment>`; a
