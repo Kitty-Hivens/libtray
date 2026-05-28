@@ -269,9 +269,14 @@ internal class Win32TrayImpl private constructor(
     // ── PNG → HICON conversion ───────────────────────────────────────────
     //
     // Decode via ImageIO (zero-extra-deps; libtray's Linux backend uses the
-    // same path), convert ARGB→BGRA, flip vertically (CreateIcon expects
-    // bottom-up DIB), call CreateIcon. With a 32bpp icon + a zero AND
-    // mask, modern Windows uses the alpha channel for transparency.
+    // same path), convert ARGB->BGRA, call CreateIcon. With a 32bpp icon +
+    // a zero AND mask, modern Windows uses the alpha channel for
+    // transparency.
+    //
+    // Row order is top-down: CreateIcon builds DDBs (it calls CreateBitmap
+    // internally), and DDB scanlines run top-to-bottom. The bottom-up
+    // default only applies to DIBs (CreateDIBitmap with positive height).
+    // Feeding bottom-up rows here paints the glyph upside down (issue #4).
 
     private fun pngToHicon(bytes: ByteArray): MemorySegment? {
         val img = runCatching { ImageIO.read(ByteArrayInputStream(bytes)) }.getOrNull() ?: run {
@@ -287,10 +292,10 @@ internal class Win32TrayImpl private constructor(
         val argb = IntArray(w * h)
         img.getRGB(0, 0, w, h, argb, 0, w)
 
-        // XOR bits = BGRA, bottom-up.
+        // XOR bits = BGRA, top-down (see row-order note above).
         val xorBytes = ByteArray(w * h * 4)
         for (y in 0 until h) {
-            val srcRowStart = (h - 1 - y) * w
+            val srcRowStart = y * w
             val dstRowStart = y * w * 4
             for (x in 0 until w) {
                 val px = argb[srcRowStart + x]
