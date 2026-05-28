@@ -48,6 +48,58 @@ tasks.register<JavaExec>("runSmoke") {
     isIgnoreExitValue = true
 }
 
+// JavaFX repro harness for issue #5 (macOS tray crash inside a JavaFX
+// host). Isolated source set so JavaFX never reaches the published
+// artifact, the main compile, or the test classpath. JavaFX artifacts are
+// platform-classified, so pick the classifier matching whoever runs the
+// task (only macOS actually reproduces #5; other OSes just sanity-check
+// JavaFX/libtray coexistence).
+val javafxVersion = "25.0.3"
+val javafxClassifier: String = run {
+    val os = System.getProperty("os.name").lowercase()
+    val aarch64 = System.getProperty("os.arch").lowercase() in setOf("aarch64", "arm64")
+    when {
+        os.contains("mac") || os.contains("darwin") -> if (aarch64) "mac-aarch64" else "mac"
+        os.contains("win") -> if (aarch64) "win-aarch64" else "win"
+        else -> if (aarch64) "linux-aarch64" else "linux"
+    }
+}
+
+val javafxSmoke: SourceSet by sourceSets.creating {
+    compileClasspath += sourceSets.main.get().output
+    runtimeClasspath += sourceSets.main.get().output
+}
+
+dependencies {
+    "javafxSmokeImplementation"(libs.slf4j.api)
+    "javafxSmokeRuntimeOnly"(libs.slf4j.simple)
+    listOf("javafx-base", "javafx-graphics").forEach { module ->
+        "javafxSmokeImplementation"("org.openjfx:$module:$javafxVersion:$javafxClassifier")
+    }
+}
+
+tasks.register<JavaExec>("runJavaFxSmoke") {
+    group = "verification"
+    description = "Issue #5 repro: create a libtray tray inside a live JavaFX host (macOS-focused)."
+    classpath = javafxSmoke.runtimeClasspath
+    mainClass.set("dev.hivens.libtray.JavaFxSmokeMainKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // JavaFX manages its own main-thread acquisition on macOS, so unlike
+    // runSmoke we do NOT force -XstartOnFirstThread by default (matches a
+    // normal JavaFX launch). If JavaFX refuses to start on a given host
+    // complaining about the main thread, retry with `-PfxFirstThread`.
+    if (project.hasProperty("fxFirstThread") &&
+        System.getProperty("os.name").lowercase().contains("mac")
+    ) {
+        jvmArgs("-XstartOnFirstThread")
+    }
+    systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "info")
+    systemProperty("org.slf4j.simpleLogger.showDateTime", "true")
+    systemProperty("org.slf4j.simpleLogger.dateTimeFormat", "HH:mm:ss.SSS")
+    standardInput = System.`in`
+    isIgnoreExitValue = true
+}
+
 group = "dev.hivens"
 // Version comes from the git tag at CI time via `-PappVersion=<tag>`;
 // falls back to `git describe` for local development. Mirrors Aura's
