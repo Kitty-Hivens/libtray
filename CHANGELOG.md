@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Fixed
+- macOS backend: no longer crashes a host UI toolkit on tray creation
+  (#5). When a host (JavaFX/Glass, Compose/Skiko, AWT) already owned
+  NSApplication and was running its event loop, libtray re-ran
+  `[NSApp finishLaunching]` and flipped the activation policy to
+  Accessory; on JavaFX/Intel this destabilised Glass's CVDisplayLink
+  pulse timer and crashed the JVM with a SIGSEGV in `objc_msgSend`.
+  The NSApp bootstrap is now gated on `[NSApp isRunning]`: host-owned
+  apps get just the status item, while libtray still bootstraps NSApp
+  when it owns it (headless / smoke).
 - Windows backend: tray icon no longer renders upside down (#4). The
   PNG-to-HICON path was flipping the color rows into bottom-up order
   before `CreateIcon`. `CreateIcon` builds DDBs (via `CreateBitmap`),
