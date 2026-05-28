@@ -93,6 +93,14 @@ tasks.register<JavaExec>("runJavaFxSmoke") {
     ) {
         jvmArgs("-XstartOnFirstThread")
     }
+    // Force JavaFX's software render pipeline. JavaFX 25 defaults to Metal
+    // on macOS, which cannot initialise on a GPU-less host: a QEMU macOS
+    // VM dies in MTLContext_nInitialize ("Failed to create shader
+    // library") before any tray code runs. The #5 crash lives in Glass's
+    // CVDisplayLink pulse timer, independent of the render backend, so
+    // software rendering keeps the repro valid while letting JavaFX start
+    // anywhere (VM, CI, headless).
+    systemProperty("prism.order", "sw")
     systemProperty("org.slf4j.simpleLogger.defaultLogLevel", "info")
     systemProperty("org.slf4j.simpleLogger.showDateTime", "true")
     systemProperty("org.slf4j.simpleLogger.dateTimeFormat", "HH:mm:ss.SSS")
