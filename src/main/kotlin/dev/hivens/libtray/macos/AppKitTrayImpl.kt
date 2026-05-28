@@ -529,13 +529,26 @@ internal class AppKitTrayImpl private constructor(
          *      plain-JVM launches, so it's the correct default for a
          *      tray library.
          *
-         * **Run loop ownership.** This method does NOT call `[NSApp run]`.
-         * The host application owns the Cocoa main run loop — Compose
-         * Desktop / Skiko does this automatically by virtue of being a
-         * Cocoa app. Headless callers (the smoke harness) must run their
-         * own `[NSApp run]` on the main thread, otherwise NSStatusItem
+         * **Only when WE own NSApp.** Steps 1-2 are correct *only* when
+         * libtray is bootstrapping NSApplication itself (headless / the
+         * smoke harness). When a host UI toolkit (JavaFX/Glass, Compose
+         * Desktop/Skiko, AWT) already created NSApp and is running its
+         * event loop, re-running `finishLaunching` re-posts
+         * `NSApplicationDidFinishLaunching` and flipping the activation
+         * policy stomps the host's Dock/UI presence. Both destabilise the
+         * host's run-loop machinery: on JavaFX/Intel this crashed Glass's
+         * CVDisplayLink-based pulse timer with a SIGSEGV in `objc_msgSend`
+         * (issue #5). So when `[NSApp isRunning]` reports the host already
+         * owns the loop, leave NSApp untouched and just install the status
+         * item: the host has already done the bootstrap we'd otherwise do.
+         *
+         * **Run loop ownership.** This method never calls `[NSApp run]`.
+         * The host application owns the Cocoa main run loop; Compose
+         * Desktop / Skiko / JavaFX do this by virtue of being Cocoa apps.
+         * Headless callers (the smoke harness) must run their own
+         * `[NSApp run]` on the main thread, otherwise NSStatusItem
          * registration messages queue up but never reach SystemUIServer
-         * via mach IPC — the item exists in our process but never paints.
+         * via mach IPC: the item exists in our process but never paints.
          */
         @Synchronized
         private fun ensureNSApplicationInitialised(bindings: ObjcBindings) {
@@ -543,22 +556,49 @@ internal class AppKitTrayImpl private constructor(
                 val cls = bindings.cls("NSApplication")
                 val app = bindings.handle("objc_msgSend_id")
                     .invokeExact(cls, bindings.sel("sharedApplication")) as MemorySegment
-                if (app.address() != 0L) {
-                    bindings.handle("objc_msgSend_void_long").invokeExact(
-                        app, bindings.sel("setActivationPolicy:"),
-                        ObjcBindings.NS_APP_POLICY_ACCESSORY,
-                    ) as Unit
-                    // Required for status items to register with SystemUIServer
-                    // — without finishLaunching the app is "in flux" from
-                    // SystemUIServer's POV and refuses to paint our entry.
-                    runCatching {
-                        bindings.handle("objc_msgSend_id")
-                            .invokeExact(app, bindings.sel("finishLaunching")) as MemorySegment
-                    }
-                    log.info("[create] NSApplication activation policy = Accessory, finishLaunching fired")
+                if (app.address() == 0L) return@runCatching
+
+                if (isNSAppRunning(bindings, app)) {
+                    log.info("[create] NSApplication already running (host-owned); leaving activation policy + launch state to the host")
+                    return@runCatching
                 }
+
+                bindings.handle("objc_msgSend_void_long").invokeExact(
+                    app, bindings.sel("setActivationPolicy:"),
+                    ObjcBindings.NS_APP_POLICY_ACCESSORY,
+                ) as Unit
+                // Required for status items to register with SystemUIServer:
+                // without finishLaunching the app is "in flux" from
+                // SystemUIServer's POV and refuses to paint our entry.
+                runCatching {
+                    bindings.handle("objc_msgSend_id")
+                        .invokeExact(app, bindings.sel("finishLaunching")) as MemorySegment
+                }
+                log.info("[create] NSApplication activation policy = Accessory, finishLaunching fired")
             }.onFailure {
-                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {} — proceeding anyway", it.message)
+                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {}; proceeding anyway", it.message)
+            }
+        }
+
+        /**
+         * `[NSApp isRunning]`: true once a host UI toolkit has called
+         * `[NSApp run]` and its event loop is live. Used to decide whether
+         * libtray must bootstrap NSApplication or should keep its hands off
+         * a host-owned one (see [ensureNSApplicationInitialised]).
+         *
+         * `isRunning` returns a `BOOL` (one byte in `al` on x86_64); we
+         * mask the low byte rather than trust the upper bits of the
+         * 64-bit return register, which the ABI leaves undefined for
+         * sub-word returns.
+         */
+        private fun isNSAppRunning(bindings: ObjcBindings, app: MemorySegment): Boolean {
+            return runCatching {
+                val ret = bindings.handle("objc_msgSend_long")
+                    .invokeExact(app, bindings.sel("isRunning")) as Long
+                (ret and 0xffL) != 0L
+            }.getOrElse {
+                log.warn("[NSApp isRunning] threw: {}; assuming not running", it.message)
+                false
             }
         }
 
