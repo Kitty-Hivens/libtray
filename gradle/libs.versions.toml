@@ -16,6 +16,11 @@ javaTarget = "22"
 junit  = "5.11.4"
 kotest = "5.9.1"
 
+# Maven Central publishing (signing + Central Portal upload). Pinned here;
+# VERIFY the latest at plugins.gradle.org/plugin/com.vanniktech.maven.publish
+# and bump -- this is a starting point, not necessarily the newest.
+mavenPublish = "0.30.0"
+
 [libraries]
 slf4j-api    = { group = "org.slf4j", name = "slf4j-api",    version.ref = "slf4j" }
 slf4j-simple = { group = "org.slf4j", name = "slf4j-simple", version.ref = "slf4j" }
@@ -25,4 +30,5 @@ junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform
 kotest-assertions       = { group = "io.kotest", name = "kotest-assertions-core",          version.ref = "kotest" }
 
 [plugins]
-kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+kotlin-jvm   = { id = "org.jetbrains.kotlin.jvm",       version.ref = "kotlin" }
+mavenPublish = { id = "com.vanniktech.maven.publish",   version.ref = "mavenPublish" }

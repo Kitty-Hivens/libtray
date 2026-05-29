@@ -1,7 +1,11 @@
+import com.vanniktech.maven.publish.SonatypeHost
+
 plugins {
     alias(libs.plugins.kotlin.jvm)
     `java-library`
-    `maven-publish`
+    // vanniktech: applies maven-publish + signing, targets the new Central
+    // Portal. Replaces the bare `maven-publish` + hand-rolled publishing block.
+    alias(libs.plugins.mavenPublish)
 }
 
 // Dedicated configuration so the smoke harness can pull in an SLF4J
@@ -128,8 +132,9 @@ java {
     // download one transparently.
     sourceCompatibility = JavaVersion.VERSION_22
     targetCompatibility = JavaVersion.VERSION_22
-    withSourcesJar()
-    withJavadocJar()
+    // No withSourcesJar()/withJavadocJar() here -- the vanniktech plugin
+    // builds and publishes the sources + javadoc jars itself; declaring
+    // them again would double-register the artifacts.
 }
 
 kotlin {
@@ -173,31 +178,47 @@ tasks.withType<Jar>().configureEach {
     }
 }
 
-publishing {
-    publications {
-        create<MavenPublication>("maven") {
-            from(components["java"])
-            pom {
-                name.set("libtray")
-                description.set("Cross-platform system tray for JVM 22+ via Project Panama.")
-                url.set("https://github.com/Kitty-Hivens/libtray")
-                licenses {
-                    license {
-                        name.set("Apache-2.0")
-                        url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
-                    }
-                }
-                developers {
-                    developer {
-                        id.set("kitty-hivens")
-                        name.set("Kitty-Hivens")
-                    }
-                }
-                scm {
-                    url.set("https://github.com/Kitty-Hivens/libtray")
-                    connection.set("scm:git:https://github.com/Kitty-Hivens/libtray.git")
-                }
+// Maven Central publishing via the vanniktech plugin (new Central Portal,
+// central.sonatype.com). It builds the sources + javadoc jars, signs every
+// artifact, assembles the deployment bundle, and uploads it to the Central
+// Portal Publisher API.
+//
+// Secrets come from ~/.gradle/gradle.properties or env -- NEVER commit them:
+//   mavenCentralUsername / mavenCentralPassword : Central Portal user token
+//       (Central Portal -> Account -> Generate User Token), NOT the login.
+//   signingInMemoryKey / signingInMemoryKeyPassword (+ optional ...KeyId) :
+//       the ASCII-armored GPG private key + its passphrase.
+//
+// Publish: `./gradlew publishToMavenCentral` (validates, leaves it pending
+// for a manual Publish in the portal) or `publishAndReleaseToMavenCentral`
+// (auto-release). The version is taken from the git tag (see `version`
+// above), so tag v0.1.0 before publishing.
+mavenPublishing {
+    // Pin the new Central Portal (central.sonatype.com) explicitly -- that's
+    // where the verified namespace lives, and the no-arg default has varied
+    // by plugin version (older defaults hit legacy OSSRH). Don't drop the arg.
+    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
+    signAllPublications()
+    coordinates("dev.hivens", "libtray", project.version.toString())
+    pom {
+        name.set("libtray")
+        description.set("Cross-platform system tray for JVM 22+ via Project Panama.")
+        url.set("https://github.com/Kitty-Hivens/libtray")
+        licenses {
+            license {
+                name.set("Apache-2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
             }
+        }
+        developers {
+            developer {
+                id.set("kitty-hivens")
+                name.set("Kitty-Hivens")
+            }
+        }
+        scm {
+            url.set("https://github.com/Kitty-Hivens/libtray")
+            connection.set("scm:git:https://github.com/Kitty-Hivens/libtray.git")
         }
     }
 }
