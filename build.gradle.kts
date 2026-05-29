@@ -1,11 +1,13 @@
-import com.vanniktech.maven.publish.SonatypeHost
-
 plugins {
     alias(libs.plugins.kotlin.jvm)
     `java-library`
     // vanniktech: applies maven-publish + signing, targets the new Central
     // Portal. Replaces the bare `maven-publish` + hand-rolled publishing block.
     alias(libs.plugins.mavenPublish)
+    // Declared so the `signing { }` type-safe accessor + useGpgCmd() resolve
+    // (vanniktech applies signing transitively, but that doesn't generate the
+    // Kotlin DSL accessor for this script). Idempotent.
+    `signing`
 }
 
 // Dedicated configuration so the smoke harness can pull in an SLF4J
@@ -194,10 +196,9 @@ tasks.withType<Jar>().configureEach {
 // (auto-release). The version is taken from the git tag (see `version`
 // above), so tag v0.1.0 before publishing.
 mavenPublishing {
-    // Pin the new Central Portal (central.sonatype.com) explicitly -- that's
-    // where the verified namespace lives, and the no-arg default has varied
-    // by plugin version (older defaults hit legacy OSSRH). Don't drop the arg.
-    publishToMavenCentral(SonatypeHost.CENTRAL_PORTAL)
+    // Central Portal (central.sonatype.com). Legacy OSSRH was removed in
+    // recent plugin versions, so the no-arg form targets the portal.
+    publishToMavenCentral()
     signAllPublications()
     coordinates("dev.hivens", "libtray", project.version.toString())
     pom {
@@ -220,5 +221,18 @@ mavenPublishing {
             url.set("https://github.com/Kitty-Hivens/libtray")
             connection.set("scm:git:https://github.com/Kitty-Hivens/libtray.git")
         }
+    }
+}
+
+signing {
+    // Local release signs through the gpg keyring: BouncyCastle's in-memory
+    // reader chokes on modern GnuPG secret-key exports ("checksum mismatch"),
+    // so we hand signing to the gpg command. CI can still inject an in-memory
+    // key via signingInMemoryKey (vanniktech handles that), in which case we
+    // leave signing to it and skip useGpgCmd.
+    if (!providers.gradleProperty("signingInMemoryKey").isPresent &&
+        System.getenv("ORG_GRADLE_PROJECT_signingInMemoryKey") == null
+    ) {
+        useGpgCmd()
     }
 }

@@ -52,8 +52,7 @@ one that affects them without grokking the others.
 <details>
   <summary>Install</summary>
 
-Maven Central coordinates land with the first tagged release. For now, use
-JitPack or build from source.
+Available on Maven Central:
 
 ```kotlin
 dependencies {
@@ -104,17 +103,16 @@ tray.close()
 <details>
   <summary>Status</summary>
 
-**Pre-release.** API may shift before 1.0. Linux SNI + Windows
-Shell_NotifyIcon backends shipped; macOS is next.
+**Pre-1.0.** API may still shift before 1.0. All three backends shipped
+(Linux SNI, Windows Shell_NotifyIcon, macOS NSStatusItem).
 
 Built and validated against:
 
 - Aura Launcher (`Kitty-Hivens/Aura-Launcher`) — primary downstream
 - Linux: Hyprland, KDE Plasma — verified
-- Windows: code complete (Shell_NotifyIcon + popup menu via Project Panama),
-  awaiting community validation across Win10 / Win11 / Server SKUs
-- macOS: pending (no Mac in maintainer's hands; community contributors with
-  Apple Silicon are the current path to validation)
+- Windows: Shell_NotifyIcon + popup menu — verified on Win10 / Win11
+- macOS: NSStatusItem + menu — verified on a macOS VM and a community
+  JavaFX consumer (both JVM and GraalVM native-image)
 </details>
 
 ---

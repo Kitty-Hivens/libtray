@@ -19,7 +19,7 @@ kotest = "5.9.1"
 # Maven Central publishing (signing + Central Portal upload). Pinned here;
 # VERIFY the latest at plugins.gradle.org/plugin/com.vanniktech.maven.publish
 # and bump -- this is a starting point, not necessarily the newest.
-mavenPublish = "0.30.0"
+mavenPublish = "0.36.0"
 
 [libraries]
 slf4j-api    = { group = "org.slf4j", name = "slf4j-api",    version.ref = "slf4j" }
