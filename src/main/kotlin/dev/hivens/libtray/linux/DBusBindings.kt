@@ -26,7 +26,7 @@ import java.lang.invoke.MethodHandle
  * (https://gitlab.freedesktop.org/dbus/dbus). Where this file says
  * "DBUS_TYPE_FOO" the value matches the C macro of the same name.
  */
-internal class DBusBindings private constructor(
+internal class DBusBindings internal constructor(
     val arena: Arena,
     val handles: Map<String, MethodHandle>,
 ) {
