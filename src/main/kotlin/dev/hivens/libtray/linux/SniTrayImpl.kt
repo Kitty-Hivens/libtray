@@ -54,7 +54,7 @@ import javax.imageio.ImageIO
  * desktop's own menu UI render the [TrayMenu] is a follow-up commit.
  * `Menu` property reports "/" (no DBusMenu) until then.
  */
-internal class SniTrayImpl private constructor(
+internal class SniTrayImpl internal constructor(
     private val bindings: DBusBindings,
     private val connection: MemorySegment,
     private val itemId: String,
@@ -127,7 +127,10 @@ internal class SniTrayImpl private constructor(
      * caller hammering setMenu() in a tight loop would still bottleneck
      * on the sender thread's flush rate, not on memory.
      */
-    private val outgoing = LinkedBlockingQueue<MemorySegment>()
+    // internal (not private) so the sender-thread tests can enqueue
+    // recognizable segments directly and assert drain / ordering without
+    // a live session bus. See SniTrayImplSenderTest.
+    internal val outgoing = LinkedBlockingQueue<MemorySegment>()
 
     /** Sender thread — drains [outgoing], performs the blocking flush there instead of on the caller. */
     private val senderThread = Thread({ senderLoop() }, "libtray-sni-sender-${ProcessHandle.current().pid()}").apply {
