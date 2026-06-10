@@ -191,14 +191,14 @@ tasks.withType<Jar>().configureEach {
 //   signingInMemoryKey / signingInMemoryKeyPassword (+ optional ...KeyId) :
 //       the ASCII-armored GPG private key + its passphrase.
 //
-// Publish: `./gradlew publishToMavenCentral` (validates, leaves it pending
-// for a manual Publish in the portal) or `publishAndReleaseToMavenCentral`
-// (auto-release). The version is taken from the git tag (see `version`
-// above), so tag v0.1.0 before publishing.
+// Publish: `./gradlew publishToMavenCentral` -- with automaticRelease the
+// deployment goes all the way through instead of sitting VALIDATED in the
+// portal waiting for a manual Publish click. The version is taken from the
+// git tag (see `version` above), so tag vX.Y.Z before publishing.
 mavenPublishing {
     // Central Portal (central.sonatype.com). Legacy OSSRH was removed in
-    // recent plugin versions, so the no-arg form targets the portal.
-    publishToMavenCentral()
+    // recent plugin versions, so this targets the portal.
+    publishToMavenCentral(automaticRelease = true)
     signAllPublications()
     coordinates("dev.hivens", "libtray", project.version.toString())
     pom {
