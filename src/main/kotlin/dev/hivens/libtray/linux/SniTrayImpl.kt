@@ -189,11 +189,24 @@ internal class SniTrayImpl internal constructor(
         // case could lose half-built outgoing messages mid-FFM call.
         senderThread.join(2_000)
         pumpThread.join(2_000)
+        // Final drain: the pump thread (joined second) can enqueue a reply
+        // after the sender did its last drain, so unref anything still in
+        // `outgoing` rather than leak the libdbus message.
+        val unref = bindings.handle("dbus_message_unref")
+        while (true) {
+            val leftover = outgoing.poll() ?: break
+            runCatching { unref.invokeExact(leftover) as Unit }
+        }
         try {
             bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
         } catch (t: Throwable) {
             log.warn("dbus_connection_unref threw on shutdown: {}", t.message)
         }
+        // Release the shared arena (library lookup + every downcall handle).
+        // Safe now that both threads are joined; the SNI backend uses no upcall
+        // stubs, so -- unlike Win32 / macOS -- there is no separate long-lived
+        // arena that must outlive close().
+        runCatching { bindings.arena.close() }
     }
 
     // ── Background dispatch loop ─────────────────────────────────────────
@@ -226,42 +239,110 @@ internal class SniTrayImpl internal constructor(
     }
 
     private fun dispatchOne(msg: MemorySegment) {
+        val type   = bindings.handle("dbus_message_get_type").invokeExact(msg) as Int
         val iface  = readMessageString(bindings.handle("dbus_message_get_interface"), msg) ?: return
         val member = readMessageString(bindings.handle("dbus_message_get_member"),    msg) ?: return
         val path   = readMessageString(bindings.handle("dbus_message_get_path"),      msg) ?: ""
+
+        // Bus signals first. NameOwnerChanged tells us the StatusNotifierWatcher
+        // restarted (issue #10); signals never owe a reply, so return after.
+        if (iface == "org.freedesktop.DBus") {
+            if (member == "NameOwnerChanged") handleNameOwnerChanged(msg)
+            return
+        }
+
+        // Everything below is a method call we answer. A stray signal that
+        // slips through a match rule is dropped without a (wrongly-typed) reply.
+        if (type != DBusBindings.DBUS_MESSAGE_TYPE_METHOD_CALL) return
 
         when (iface) {
             "org.freedesktop.DBus.Properties" -> when (member) {
                 "Get"     -> handlePropertiesGet(msg)
                 "GetAll"  -> handlePropertiesGetAll(msg)
-                else      -> log.debug("Unhandled Properties.{}", member)
+                else      -> replyUnknownMethod(msg, iface, member)
             }
-            "org.kde.StatusNotifierItem" -> when (member) {
-                "Activate"           -> { fire(TrayEvent.Activated);          replyEmpty(msg) }
-                "SecondaryActivate"  -> { fire(TrayEvent.MiddleActivated);    replyEmpty(msg) }
-                "ContextMenu"        -> { fire(TrayEvent.MenuRequested);      replyEmpty(msg) }
-                "Scroll"             -> replyEmpty(msg)  // no scroll events in TrayEvent for now
-                else                 -> log.debug("Unhandled SNI.{}", member)
+            "org.kde.StatusNotifierItem" -> {
+                // SNI methods exist only on /StatusNotifierItem; a call routed
+                // to another object path is not ours to honour.
+                if (path != "/StatusNotifierItem") {
+                    replyUnknownMethod(msg, iface, member)
+                    return
+                }
+                when (member) {
+                    "Activate"          -> { fire(TrayEvent.Activated);       replyEmpty(msg) }
+                    "SecondaryActivate" -> { fire(TrayEvent.MiddleActivated); replyEmpty(msg) }
+                    "ContextMenu"       -> { fire(TrayEvent.MenuRequested);   replyEmpty(msg) }
+                    "Scroll"            -> replyEmpty(msg)  // no scroll events in TrayEvent for now
+                    else                -> replyUnknownMethod(msg, iface, member)
+                }
             }
             "org.freedesktop.DBus.Introspectable" -> when (member) {
                 "Introspect" -> handleIntrospect(msg, path)
-                else         -> log.debug("Unhandled Introspectable.{}", member)
+                else         -> replyUnknownMethod(msg, iface, member)
             }
-            "com.canonical.dbusmenu" -> when (member) {
-                "GetLayout"           -> handleMenuGetLayout(msg)
-                "GetGroupProperties"  -> handleMenuGetGroupProperties(msg)
-                "GetProperty"         -> handleMenuGetProperty(msg)
-                "Event"               -> handleMenuEvent(msg)
-                "EventGroup"          -> handleMenuEventGroup(msg)
-                "AboutToShow"         -> handleMenuAboutToShow(msg)
-                "AboutToShowGroup"    -> handleMenuAboutToShowGroup(msg)
-                else                  -> log.debug("Unhandled dbusmenu.{}", member)
+            "com.canonical.dbusmenu" -> {
+                if (path != "/MenuBar") {
+                    replyUnknownMethod(msg, iface, member)
+                    return
+                }
+                when (member) {
+                    "GetLayout"          -> handleMenuGetLayout(msg)
+                    "GetGroupProperties" -> handleMenuGetGroupProperties(msg)
+                    "GetProperty"        -> handleMenuGetProperty(msg)
+                    "Event"              -> handleMenuEvent(msg)
+                    "EventGroup"         -> handleMenuEventGroup(msg)
+                    "AboutToShow"        -> handleMenuAboutToShow(msg)
+                    "AboutToShowGroup"   -> handleMenuAboutToShowGroup(msg)
+                    else                 -> replyUnknownMethod(msg, iface, member)
+                }
             }
-            "org.freedesktop.DBus" -> {
-                // Bus signals (NameOwnerChanged etc) — informational, ignore.
-            }
-            else -> log.debug("Unhandled iface={} member={} path={}", iface, member, path)
+            else -> replyUnknownMethod(msg, iface, member)
         }
+    }
+
+    /**
+     * Re-register the item when a StatusNotifierWatcher (re)appears. A fresh
+     * watcher process starts with an empty registry, so without this the icon
+     * vanishes on a tray-host restart and never returns (issue #10). Also
+     * covers cold start: an item created before any watcher registers the
+     * moment one shows up.
+     */
+    private fun handleNameOwnerChanged(msg: MemorySegment) {
+        Arena.ofConfined().use { call ->
+            val iter = call.allocate(bindings.messageIterLayout)
+            if ((bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int) == 0) return
+            val name = readBasicString(call, iter) ?: return
+            if (name != WATCHER_NAME_KDE && name != WATCHER_NAME_FDO) return
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int  // skip old_owner
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int  // to new_owner
+            val newOwner = readBasicString(call, iter) ?: ""
+            if (newOwner.isEmpty()) return  // watcher went away; nothing to do until it returns
+            log.info("StatusNotifierWatcher gained a new owner ({}); re-registering {}", name, itemId)
+            Arena.ofConfined().use { reg -> registerWithWatcher(bindings, connection, itemId, reg) }
+        }
+    }
+
+    /** Send a D-Bus error reply (UnknownMethod / UnknownInterface / ...) in answer to a method call. */
+    private fun replyError(msg: MemorySegment, errorName: String, errorMessage: String) {
+        Arena.ofConfined().use { call ->
+            val nameSeg = call.allocateUtf8(errorName)
+            val msgSeg  = call.allocateUtf8(errorMessage)
+            val reply = bindings.handle("dbus_message_new_error").invokeExact(msg, nameSeg, msgSeg) as MemorySegment
+            if (reply.address() == 0L) return
+            sendAndUnref(reply)
+        }
+    }
+
+    /**
+     * Answer an unhandled method call with UnknownMethod. Leaving a method
+     * call unanswered blocks the caller to its own timeout (~25 s) -- some
+     * hosts probe objects before subscribing and would stall on startup.
+     * Skipped when the caller set NO_REPLY_EXPECTED.
+     */
+    private fun replyUnknownMethod(msg: MemorySegment, iface: String, member: String) {
+        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
+        log.debug("Unhandled method {}.{} -- replying UnknownMethod", iface, member)
+        replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No such method $iface.$member")
     }
 
     private fun fire(event: TrayEvent) {
@@ -282,7 +363,8 @@ internal class SniTrayImpl internal constructor(
             val propName  = readBasicString(call, iter) ?: return replyEmpty(msg)
 
             if (ifaceName != "org.kde.StatusNotifierItem") {
-                replyEmpty(msg)
+                replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
+                    "No properties for interface $ifaceName")
                 return
             }
             val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
@@ -299,7 +381,8 @@ internal class SniTrayImpl internal constructor(
             (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
             val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
             if (ifaceName != "org.kde.StatusNotifierItem") {
-                replyEmpty(msg)
+                replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
+                    "No properties for interface $ifaceName")
                 return
             }
 
@@ -777,8 +860,15 @@ internal class SniTrayImpl internal constructor(
     }
 
     private fun readBasicString(call: Arena, iter: MemorySegment): String? {
-        val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
-        if (argType.toByte() != DBusBindings.DBUS_TYPE_STRING) return null
+        val argType = (bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int).toByte()
+        // STRING, OBJECT_PATH and SIGNATURE are all NUL-terminated char* on the
+        // wire; accept all three so path/signature args don't silently read null.
+        if (argType != DBusBindings.DBUS_TYPE_STRING &&
+            argType != DBusBindings.DBUS_TYPE_OBJECT_PATH &&
+            argType != DBusBindings.DBUS_TYPE_SIGNATURE
+        ) {
+            return null
+        }
         val out = call.allocate(ValueLayout.ADDRESS)
         bindings.handle("dbus_message_iter_get_basic").invokeExact(iter, out) as Unit
         val ptr = out.get(ValueLayout.ADDRESS, 0)
@@ -937,6 +1027,19 @@ internal class SniTrayImpl internal constructor(
         private val log = LoggerFactory.getLogger("libtray.SniTray")
         private val itemCounter = AtomicInteger(0)
 
+        private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
+        private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
+
+        /**
+         * Release a DBusError. `dbus_error_free` is safe whether or not the
+         * error is set (it resets to the init state), so call it on every
+         * failure path after `dbus_error_init` rather than leak the heap
+         * strings libdbus fills in.
+         */
+        private fun freeError(bindings: DBusBindings, error: MemorySegment) {
+            runCatching { bindings.handle("dbus_error_free").invokeExact(error) as Unit }
+        }
+
         /**
          * Derive an SNI `Id` from the human-readable title. Spec calls for
          * "a name that should be unique for this application and consistent
@@ -1049,7 +1152,8 @@ internal class SniTrayImpl internal constructor(
                     DBusBindings.DBUS_BUS_SESSION, error,
                 ) as MemorySegment
                 if (conn.address() == 0L) {
-                    log.info("dbus_bus_get returned NULL — no session bus, SNI unavailable")
+                    log.info("dbus_bus_get returned NULL -- no session bus, SNI unavailable")
+                    freeError(bindings, error)
                     return@use null
                 }
 
@@ -1060,8 +1164,9 @@ internal class SniTrayImpl internal constructor(
                     conn, nameSeg, flags, error,
                 ) as Int
                 if (nameResult != DBusBindings.DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
-                    log.warn("dbus_bus_request_name returned {} for {} — SNI registration failed",
+                    log.warn("dbus_bus_request_name returned {} for {} -- SNI registration failed",
                         nameResult, itemId)
+                    freeError(bindings, error)
                     bindings.handle("dbus_connection_unref").invokeExact(conn) as Unit
                     return@use null
                 }
@@ -1074,6 +1179,17 @@ internal class SniTrayImpl internal constructor(
                     log.info("StatusNotifierWatcher registration failed for {}; icon may not appear " +
                         "until a tray host comes online", itemId)
                 }
+
+                // Re-register when the watcher restarts (issue #10): subscribe to
+                // NameOwnerChanged; dispatchOne filters it to a watcher name and
+                // re-announces on a new owner. Also recovers the cold-start case.
+                runCatching {
+                    val rule = setup.allocateUtf8(
+                        "type='signal',sender='org.freedesktop.DBus'," +
+                            "interface='org.freedesktop.DBus',member='NameOwnerChanged'",
+                    )
+                    bindings.handle("dbus_bus_add_match").invokeExact(conn, rule, error) as Unit
+                }.onFailure { log.warn("AddMatch for NameOwnerChanged failed: {}", it.message) }
 
                 SniTrayImpl(bindings, conn, itemId, builder)
             }
@@ -1122,17 +1238,5 @@ internal class SniTrayImpl internal constructor(
     }
 }
 
-/**
- * Allocate a UTF-8 null-terminated string in this arena. libdbus expects
- * `const char *` style strings in every text field.
- */
-private fun Arena.allocateUtf8(s: String): MemorySegment {
-    val bytes = s.toByteArray(Charsets.UTF_8)
-    val segment = allocate((bytes.size + 1).toLong())
-    if (bytes.isNotEmpty()) {
-        MemorySegment.copy(bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.size)
-    }
-    segment.set(ValueLayout.JAVA_BYTE, bytes.size.toLong(), 0)
-    return segment
-}
+// allocateUtf8 now lives in DBusBindings.kt (shared across the linux package).
 

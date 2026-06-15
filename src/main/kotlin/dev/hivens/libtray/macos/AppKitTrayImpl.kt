@@ -17,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * macOS tray backend on top of `NSStatusBar` / `NSStatusItem` via the
@@ -43,15 +44,14 @@ import java.util.concurrent.atomic.AtomicInteger
  *      Per-item NSInteger tag indexes the libtray id slot for reverse
  *      lookup in the upcall handler.
  *
- * **Threading.** All AppKit calls below run on the caller's thread.
- * macOS technically wants AppKit on the main thread; in practice
- * NSStatusItem operations are forgiving, but rare edge cases (high-load
- * menu rebuilds during animations) can warn. Aura's tray lifecycle
- * runs on a dedicated I/O coroutine, single-threaded for tray-state
- * mutations — no concurrent access. Smoke harness is single-threaded
- * too. If a downstream emerges that hammers the API concurrently, wrap
- * calls in `dispatch_async(dispatch_get_main_queue, ^{ ... })` — needs
- * libdispatch bindings, deferred until needed.
+ * **Threading.** Mutating calls (setIcon / setTooltip / setMenu) marshal
+ * onto the Cocoa main queue via libdispatch (`dispatch_async_f`, see
+ * [runOnMainQueue]): a call already on the main thread runs inline, any other
+ * thread enqueues. AppKit therefore always runs where it wants regardless of
+ * which thread the consumer calls from, and the public setters still return as
+ * soon as the enqueue succeeds. The `onMenuItem:` upcall already arrives on
+ * the main thread by AppKit's contract. [close] tears down synchronously on
+ * the caller thread.
  */
 internal class AppKitTrayImpl private constructor(
     private val bindings: ObjcBindings,
@@ -124,21 +124,42 @@ internal class AppKitTrayImpl private constructor(
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
-        runCatching { clearMenu() }
-        // [[NSStatusBar systemStatusBar] removeStatusItem:item]
-        runCatching {
-            val nsStatusBarCls = bindings.cls("NSStatusBar")
-            val systemStatusBar = bindings.handle("objc_msgSend_id")
-                .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
-            bindings.handle("objc_msgSend_void_id").invokeExact(
-                systemStatusBar, bindings.sel("removeStatusItem:"), statusItem,
-            ) as Unit
-        }
-        // Release our retained reference to the status item itself
-        runCatching {
-            bindings.handle("objc_release").invokeExact(statusItem) as Unit
-        }
         INSTANCE_REGISTRY.remove(instanceId)
+        // Tear down SYNCHRONOUSLY on the caller thread, not via the async
+        // runOnMainQueue path: close() flips `open` first, which would make a
+        // marshaled clearMenu a no-op (ghost icon), and a queued teardown could
+        // run after we return.
+        autoreleasepool {
+            val prev = currentMenu
+            currentMenu = MemorySegment.NULL
+            if (prev.address() != 0L) {
+                runCatching {
+                    bindings.handle("objc_msgSend_void_id").invokeExact(
+                        statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
+                    ) as Unit
+                }
+                runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
+            }
+            tagToId.clear()
+            // [[NSStatusBar systemStatusBar] removeStatusItem:item]
+            runCatching {
+                val nsStatusBarCls = bindings.cls("NSStatusBar")
+                val systemStatusBar = bindings.handle("objc_msgSend_id")
+                    .invokeExact(nsStatusBarCls, bindings.sel("systemStatusBar")) as MemorySegment
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    systemStatusBar, bindings.sel("removeStatusItem:"), statusItem,
+                ) as Unit
+            }
+            // Release our retained reference to the status item itself.
+            runCatching { bindings.handle("objc_release").invokeExact(statusItem) as Unit }
+        }
+        // The ObjcBindings arena is deliberately NOT closed here (unlike the
+        // Linux / Win32 backends). runOnMainQueue can leave actions queued on
+        // the GCD main queue that still reference this instance's msgSend
+        // handles, and the menu-target class + its upcall stub are already
+        // process-lifetime; closing the arena would risk a use-after-free for a
+        // deferred action. The cost is a one-time set of downcall handles,
+        // reclaimed at process exit.
     }
 
     // ── Internals: AppKit operations ─────────────────────────────────────
@@ -150,34 +171,40 @@ internal class AppKitTrayImpl private constructor(
      * the button retains the image when set.
      */
     private fun applyIcon(pngBytes: ByteArray) {
-        autoreleasepool {
-            val nsData = bindings.nsData(pngBytes)
-            log.info("applyIcon: NSData allocated, addr=0x{} bytes={}",
-                nsData.address().toString(16), pngBytes.size)
-            val nsImageCls = bindings.cls("NSImage")
-            val allocated = bindings.handle("objc_msgSend_id")
-                .invokeExact(nsImageCls, bindings.sel("alloc")) as MemorySegment
-            val image = bindings.handle("objc_msgSend_id_id")
-                .invokeExact(allocated, bindings.sel("initWithData:"), nsData) as MemorySegment
-            if (image.address() == 0L) {
-                log.warn("[NSImage initWithData:] returned NULL — invalid PNG? Falling back to text title.")
-                applyTitleFallback("●")
-                return@autoreleasepool
-            }
-            log.info("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
-            // Force template OFF — by default macOS may try to render
-            // our colored PNG as a black-only template (auto-inverting
-            // in dark mode), which can blank out colored-only icons.
-            // setTemplate:NO tells AppKit to use the image as-is.
-            runCatching {
-                bindings.handle("objc_msgSend_void_long").invokeExact(
-                    image, bindings.sel("setTemplate:"), 0L,
+        runOnMainQueue {
+            autoreleasepool {
+                val nsData = bindings.nsData(pngBytes)
+                log.info("applyIcon: NSData allocated, addr=0x{} bytes={}",
+                    nsData.address().toString(16), pngBytes.size)
+                val nsImageCls = bindings.cls("NSImage")
+                val allocated = bindings.handle("objc_msgSend_id")
+                    .invokeExact(nsImageCls, bindings.sel("alloc")) as MemorySegment
+                val image = bindings.handle("objc_msgSend_id_id")
+                    .invokeExact(allocated, bindings.sel("initWithData:"), nsData) as MemorySegment
+                if (image.address() == 0L) {
+                    log.warn("[NSImage initWithData:] returned NULL -- invalid PNG? Falling back to text title.")
+                    setButtonTitle("●")
+                    return@autoreleasepool
+                }
+                log.info("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
+                // Force template OFF -- by default macOS may render our colored
+                // PNG as a black-only template (auto-inverting in dark mode),
+                // blanking out colored-only icons. setTemplate:NO uses it as-is.
+                runCatching {
+                    bindings.handle("objc_msgSend_void_long").invokeExact(
+                        image, bindings.sel("setTemplate:"), 0L,
+                    ) as Unit
+                }
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    statusButton, bindings.sel("setImage:"), image,
                 ) as Unit
+                // Clear the bullet fallback set in init: Ventura+ NSStatusBarButton
+                // shows BOTH image and title, leaving a stray dot beside the icon.
+                setButtonTitle("")
+                // setImage: retains the image; release our alloc +1 so it doesn't leak.
+                bindings.handle("objc_release").invokeExact(image) as Unit
+                log.info("applyIcon: setImage: dispatched to status button (template=NO)")
             }
-            bindings.handle("objc_msgSend_void_id").invokeExact(
-                statusButton, bindings.sel("setImage:"), image,
-            ) as Unit
-            log.info("applyIcon: setImage: dispatched to status button (template=NO)")
         }
     }
 
@@ -187,7 +214,12 @@ internal class AppKitTrayImpl private constructor(
      * SOMETHING shows up in the menu bar instead of an invisible
      * zero-width entry.
      */
-    private fun applyTitleFallback(text: String) {
+    /**
+     * Set the status button's title directly. The caller must already be on the
+     * Cocoa main queue (e.g. inside [applyIcon]'s marshaled block); use
+     * [applyTitleFallback] from anywhere else.
+     */
+    private fun setButtonTitle(text: String) {
         runCatching {
             val nsString = bindings.nsString(text)
             bindings.handle("objc_msgSend_void_id").invokeExact(
@@ -196,12 +228,18 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
+    private fun applyTitleFallback(text: String) {
+        runOnMainQueue { autoreleasepool { setButtonTitle(text) } }
+    }
+
     private fun applyTooltip(text: String) {
-        autoreleasepool {
-            val nsString = bindings.nsString(text)
-            bindings.handle("objc_msgSend_void_id").invokeExact(
-                statusButton, bindings.sel("setToolTip:"), nsString,
-            ) as Unit
+        runOnMainQueue {
+            autoreleasepool {
+                val nsString = bindings.nsString(text)
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    statusButton, bindings.sel("setToolTip:"), nsString,
+                ) as Unit
+            }
         }
     }
 
@@ -212,46 +250,48 @@ internal class AppKitTrayImpl private constructor(
      * one when [setMenu:] lands, so we drop our previous strong ref.
      */
     private fun applyMenu(menu: TrayMenu) {
-        autoreleasepool {
-            tagToId.clear()
-            val nsMenuCls = bindings.cls("NSMenu")
-            val emptyTitle = bindings.nsString("")
-            val allocatedMenu = bindings.handle("objc_msgSend_id")
-                .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
-            val newMenu = bindings.handle("objc_msgSend_id_id")
-                .invokeExact(allocatedMenu, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
+        runOnMainQueue {
+            autoreleasepool {
+                tagToId.clear()
+                val nsMenuCls = bindings.cls("NSMenu")
+                val emptyTitle = bindings.nsString("")
+                val allocatedMenu = bindings.handle("objc_msgSend_id")
+                    .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
+                val newMenu = bindings.handle("objc_msgSend_id_id")
+                    .invokeExact(allocatedMenu, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
 
-            appendItems(newMenu, menu.items)
+                appendItems(newMenu, menu.items)
 
-            // Retain BEFORE swapping so we own the new menu beyond
-            // the autorelease pool. setMenu: also retains internally,
-            // but we want a clean lifecycle owned at our level.
-            val retainedNew = bindings.handle("objc_retain")
-                .invokeExact(newMenu) as MemorySegment
+                // The alloc +1 IS our strong ref -- park it in currentMenu.
+                // setMenu: takes its own retain. (The old code added an extra
+                // objc_retain on top of the alloc +1 but released only one of
+                // them on swap: that was the per-setMenu NSMenu leak.)
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    statusItem, bindings.sel("setMenu:"), newMenu,
+                ) as Unit
 
-            bindings.handle("objc_msgSend_void_id").invokeExact(
-                statusItem, bindings.sel("setMenu:"), retainedNew,
-            ) as Unit
-
-            val prev = currentMenu
-            currentMenu = retainedNew
-            if (prev.address() != 0L) {
-                bindings.handle("objc_release").invokeExact(prev) as Unit
+                val prev = currentMenu
+                currentMenu = newMenu
+                if (prev.address() != 0L) {
+                    bindings.handle("objc_release").invokeExact(prev) as Unit
+                }
             }
         }
     }
 
     private fun clearMenu() {
-        autoreleasepool {
-            bindings.handle("objc_msgSend_void_id").invokeExact(
-                statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
-            ) as Unit
-            val prev = currentMenu
-            currentMenu = MemorySegment.NULL
-            if (prev.address() != 0L) {
-                runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
+        runOnMainQueue {
+            autoreleasepool {
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
+                ) as Unit
+                val prev = currentMenu
+                currentMenu = MemorySegment.NULL
+                if (prev.address() != 0L) {
+                    runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
+                }
+                tagToId.clear()
             }
-            tagToId.clear()
         }
     }
 
@@ -300,6 +340,9 @@ internal class AppKitTrayImpl private constructor(
                     bindings.handle("objc_msgSend_void_id").invokeExact(
                         parentMenu, bindings.sel("addItem:"), menuItem,
                     ) as Unit
+                    // addItem: retains the item; release our alloc +1 so each
+                    // NSMenuItem doesn't leak on every setMenu.
+                    bindings.handle("objc_release").invokeExact(menuItem) as Unit
                 }
                 is TrayMenuItem.Submenu -> {
                     val title = bindings.nsString(item.label)
@@ -328,6 +371,9 @@ internal class AppKitTrayImpl private constructor(
                     bindings.handle("objc_msgSend_void_id").invokeExact(
                         parentMenu, bindings.sel("addItem:"), parentItem,
                     ) as Unit
+                    // setSubmenu: / addItem: each retain; release our alloc +1s.
+                    bindings.handle("objc_release").invokeExact(childMenu) as Unit
+                    bindings.handle("objc_release").invokeExact(parentItem) as Unit
                 }
             }
         }
@@ -357,6 +403,34 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
+    /**
+     * Run [action] on the Cocoa main queue (issue #3). Already on the main
+     * thread -> run inline (dispatch_async would needlessly defer a tick).
+     * Otherwise enqueue via `dispatch_async_f`. If libdispatch did not resolve
+     * ([ObjcBindings.mainQueue] is NULL) fall back to running inline.
+     */
+    private fun runOnMainQueue(action: () -> Unit) {
+        if (!open.get()) return
+        if (isCocoaMainThread(bindings)) {
+            runCatching { action() }
+            return
+        }
+        val queue = bindings.mainQueue
+        if (queue.address() == 0L) {
+            runCatching { action() }
+            return
+        }
+        val id = dispatchCounter.getAndIncrement()
+        PENDING[id] = action
+        val enqueued = runCatching {
+            bindings.handle("dispatch_async_f").invokeExact(
+                queue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
+            ) as Unit
+            true
+        }.getOrDefault(false)
+        if (!enqueued) PENDING.remove(id)  // never came back; don't strand the entry
+    }
+
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
@@ -364,6 +438,40 @@ internal class AppKitTrayImpl private constructor(
 
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
+
+        // ── Main-queue marshaling (issue #3) ──────────────────────────────
+        // Pending runOnMainQueue actions, keyed by a monotonic id handed to
+        // dispatch_async_f as the opaque context pointer. The trampoline looks
+        // the action up by id, runs it, drops it. One process-wide upcall stub
+        // serves every instance.
+        private val PENDING = ConcurrentHashMap<Long, () -> Unit>()
+        private val dispatchCounter = AtomicLong(0)
+        @Volatile private var trampolineStub: MemorySegment? = null
+        @Volatile private var trampolineArena: Arena? = null
+
+        /** GCD work function `void f(void* context)`: run the pending action the context id names. */
+        @JvmStatic
+        fun dispatchTrampoline(context: MemorySegment) {
+            val action = PENDING.remove(context.address()) ?: return
+            runCatching { action() }.onFailure { log.warn("main-queue action threw: {}", it.message) }
+        }
+
+        /** The single shared upcall stub bridging GCD to [dispatchTrampoline]. Built once, process-lifetime. */
+        @Synchronized
+        private fun dispatchTrampolineStub(): MemorySegment {
+            trampolineStub?.let { return it }
+            val arena = Arena.ofShared()
+            val handle = MethodHandles.lookup().findStatic(
+                AppKitTrayImpl::class.java, "dispatchTrampoline",
+                MethodType.methodType(Void.TYPE, MemorySegment::class.java),
+            )
+            val stub = Linker.nativeLinker().upcallStub(
+                handle, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS), arena,
+            )
+            trampolineArena = arena
+            trampolineStub = stub
+            return stub
+        }
 
         /**
          * The shared `LibtrayMenuTarget_<pid>` Objective-C class built

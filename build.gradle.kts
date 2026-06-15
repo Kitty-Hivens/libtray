@@ -10,22 +10,16 @@ plugins {
     `signing`
 }
 
-// Dedicated configuration so the smoke harness can pull in an SLF4J
-// binding (slf4j-simple) without polluting the published library
-// artifact. The library API exposes slf4j-api only; consumers bring
-// their own binding (logback, log4j2, etc).
-val smokeRuntime: Configuration by configurations.creating {
-    extendsFrom(configurations.runtimeClasspath.get())
-}
-
-dependencies {
-    "smokeRuntime"(libs.slf4j.simple)
-}
-
+// SmokeMain lives in the TEST source set (src/test) so it stays OUT of the
+// published library jar yet keeps `internal` access to the backends (the macOS
+// smoke loop reaches ObjcBindings, which a plain custom source set could not
+// see -- Kotlin only friend-paths the test compilation). The test runtime
+// classpath already carries the slf4j-simple binding (testRuntimeOnly), so
+// runSmoke reuses it rather than a dedicated configuration.
 tasks.register<JavaExec>("runSmoke") {
     group = "verification"
     description = "Open a tray icon and print click events. Ctrl-C to exit."
-    classpath = sourceSets.main.get().runtimeClasspath + smokeRuntime
+    classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("dev.hivens.libtray.SmokeMainKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     // macOS pins NSStatusItem (and every NSWindow constructor it

@@ -5,6 +5,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.1.1]
+
+### Fixed
+- Linux: the `DBusMessageIter` scratch buffer was 64 bytes, but the
+  struct is 72 on x86_64 / aarch64 -- libdbus wrote its trailing pointer
+  8 bytes past the allocation on every `dbus_message_iter_*` call,
+  silently corrupting adjacent arena memory. Reserved 80.
+- Linux: unhandled D-Bus method calls now receive an
+  `org.freedesktop.DBus.Error.UnknownMethod` reply instead of silence.
+  A caller that probes an object before subscribing otherwise blocked to
+  its own ~25 s timeout. `Properties.Get` / `GetAll` for a foreign
+  interface returns `UnknownInterface` rather than a mistyped empty
+  reply, and method dispatch is filtered by object path (SNI on
+  `/StatusNotifierItem`, dbusmenu on `/MenuBar`).
+- Linux: `DBusError` is freed on the `dbus_bus_get` /
+  `dbus_bus_request_name` failure paths and after `registerWithWatcher`
+  -- libdbus heap-allocates the error's `name` / `message`, which the
+  confined arena does not own. `readBasicString` now also accepts
+  OBJECT_PATH and SIGNATURE, not only STRING.
+- Linux: `close()` drains the outgoing queue after both worker threads
+  join. The pump thread (joined second) could enqueue a reply after the
+  sender thread's final drain, leaking that libdbus message.
+- Linux / Windows: the per-instance Panama arena (library lookup +
+  downcall handles, and the Win32 reusable `NOTIFYICONDATA`) is closed
+  on `close()`, so repeated create/close cycles no longer leak native
+  memory. macOS keeps its arena for the process lifetime -- the new
+  main-queue path (below) can hold deferred references to it.
+- macOS: NSMenu, NSMenuItem, child NSMenu and NSImage objects no longer
+  leak one reference each on every `setMenu` / `setIcon`. Alloc-owned
+  objects are released after the call that retains them (the menu had an
+  extra `objc_retain` on top of the alloc +1 with only one release; the
+  items and the image were never released at all).
+- macOS: the text bullet fallback is cleared once a real icon installs.
+  Ventura+ `NSStatusBarButton` renders both an image and a title, which
+  left a stray dot beside the icon.
+- Windows: closing while a context menu is open no longer hangs for the
+  menu's lifetime. `close()` posts `WM_CANCELMODE` to the owner window
+  so the tracking `TrackPopupMenu` returns and the pump thread can then
+  process `WM_CLOSE`.
+
+### Added
+- macOS: mutating calls (`setIcon` / `setTooltip` / `setMenu`) marshal
+  onto the Cocoa main queue via libdispatch (`dispatch_async_f`); a call
+  already on the main thread runs inline. AppKit now always runs on the
+  main thread regardless of which thread the consumer calls from (#3).
+- Linux: the item re-registers with the StatusNotifierWatcher when the
+  tray host restarts (subscribes to `NameOwnerChanged`). Previously the
+  icon vanished permanently on a shell / tray-widget restart, and an
+  item created before any watcher existed never recovered (#10).
+
+### Changed
+- `SmokeMain` moved into the test source set so it no longer ships in
+  the published library jar.
+
+## [0.1.0]
+
 ### Fixed
 - macOS backend: no longer crashes a host UI toolkit on tray creation
   (#5). When a host (JavaFX/Glass, Compose/Skiko, AWT) already owned

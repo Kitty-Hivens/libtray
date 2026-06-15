@@ -37,6 +37,8 @@ internal class ObjcBindings private constructor(
     val handles: Map<String, MethodHandle>,
     private val classCache: MutableMap<String, MemorySegment>,
     private val selCache:   MutableMap<String, MemorySegment>,
+    /** Address of the GCD main queue (`_dispatch_main_q`), or NULL if libdispatch didn't resolve. */
+    val mainQueue: MemorySegment,
 ) {
 
     fun handle(name: String): MethodHandle =
@@ -73,9 +75,11 @@ internal class ObjcBindings private constructor(
     // ── NSString / NSData helpers ────────────────────────────────────────
 
     /**
-     * Build an `NSString*` from a JVM string. Allocated as autoreleased,
-     * so call sites that need long-lived references should `objc_retain`
-     * the result.
+     * Build an `NSString*` from a JVM string. The result is AUTORELEASED:
+     * call it inside an active `autoreleasepool { }` (the backend's apply*
+     * helpers all do) and `objc_retain` it if you need a reference past the
+     * pool. Calling with no pool in scope leaks the string -- or, once some
+     * pool drains, hands back a dangling pointer.
      */
     fun nsString(text: String): MemorySegment {
         val cls = cls("NSString")
@@ -115,6 +119,10 @@ internal class ObjcBindings private constructor(
             "libobjc.A.dylib",
             "/System/Library/Frameworks/AppKit.framework/AppKit",
             "/System/Library/Frameworks/Foundation.framework/Foundation",
+            // libdispatch: dispatch_async_f + the _dispatch_main_q global, for
+            // marshaling AppKit calls onto the main queue (issue #3). Resolves
+            // through the libSystem umbrella on current macOS.
+            "/usr/lib/libSystem.B.dylib",
         )
 
         /**
@@ -225,6 +233,11 @@ internal class ObjcBindings private constructor(
             Triple("objc_msgSend_long",      "objc_msgSend",
                 FunctionDescriptor.of(ValueLayout.JAVA_LONG,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
+
+            // dispatch_async_f(queue, context, work) -- block-free GCD enqueue
+            // backing runOnMainQueue (issue #3). work is void(*)(void* ctx).
+            Triple("dispatch_async_f", "dispatch_async_f",
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
         )
 
         /**
@@ -289,7 +302,12 @@ internal class ObjcBindings private constructor(
                     }
                 handles[alias] = linker.downcallHandle(sym, descriptor)
             }
-            return ObjcBindings(arena, handles, HashMap(), HashMap())
+            // _dispatch_main_q is a DATA symbol (the global main queue); its
+            // address is exactly what dispatch_get_main_queue() returns. Absent
+            // -> NULL, and runOnMainQueue degrades to a direct call.
+            val mainQueue = lookups.firstNotNullOfOrNull { it.find("_dispatch_main_q").orElse(null) }
+                ?: MemorySegment.NULL
+            return ObjcBindings(arena, handles, HashMap(), HashMap(), mainQueue)
         }
     }
 }

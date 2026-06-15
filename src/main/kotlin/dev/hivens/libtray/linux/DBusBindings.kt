@@ -43,6 +43,9 @@ internal class DBusBindings internal constructor(
         const val DBUS_BUS_SYSTEM:  Int = 1
         const val DBUS_BUS_STARTER: Int = 2
 
+        /** Message type from dbus/dbus-protocol.h -- only method calls owe a reply. */
+        const val DBUS_MESSAGE_TYPE_METHOD_CALL: Int = 1
+
         /** Type signatures from dbus/dbus-protocol.h. Single-byte ASCII. */
         const val DBUS_TYPE_INVALID:     Byte = 0
         const val DBUS_TYPE_BYTE:        Byte = 'y'.code.toByte()
@@ -112,6 +115,13 @@ internal class DBusBindings internal constructor(
                 null,
                 listOf(ValueLayout.ADDRESS),
             ),
+            // Match rules -- used to observe NameOwnerChanged for the
+            // StatusNotifierWatcher so the item re-registers when the tray
+            // host restarts (issue #10).
+            Triple("dbus_bus_add_match",
+                null,                                          // void
+                listOf(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS), // conn, rule, error*
+            ),
 
             // Message construction
             Triple("dbus_message_new_method_call",
@@ -162,6 +172,10 @@ internal class DBusBindings internal constructor(
             ),
             Triple("dbus_message_get_serial",
                 ValueLayout.JAVA_INT,
+                listOf(ValueLayout.ADDRESS),
+            ),
+            Triple("dbus_message_get_no_reply",
+                ValueLayout.JAVA_INT,                          // dbus_bool_t
                 listOf(ValueLayout.ADDRESS),
             ),
 
@@ -281,10 +295,30 @@ internal class DBusBindings internal constructor(
     )
 
     /**
-     * `DBusMessageIter` is a stack-allocated cursor — libdbus says it's
-     * "small" but exposes no struct definition. The reference impl
-     * reserves 64 bytes which is more than enough for any pointer +
-     * scratch state. Allocating slightly more than needed is safe.
+     * `DBusMessageIter` is a stack-allocated cursor -- libdbus says it's
+     * "small" but exposes no struct definition in the public ABI. The real
+     * struct on x86_64 / aarch64 is 72 bytes: two pointers (16), nine 32-bit
+     * dummies + an int pad (40) = 56, then two trailing pointers `pad2`/`pad3`
+     * at offsets 56 and 64, ending at 72. A 64-byte buffer let libdbus write
+     * `pad3` (offset 64..71) past the allocation -- silent arena corruption on
+     * every `dbus_message_iter_*` call. Reserve 80 for headroom; over-allocating
+     * an opaque cursor is harmless.
      */
-    val messageIterLayout: MemoryLayout = MemoryLayout.sequenceLayout(64, ValueLayout.JAVA_BYTE)
+    val messageIterLayout: MemoryLayout = MemoryLayout.sequenceLayout(80, ValueLayout.JAVA_BYTE)
+}
+
+/**
+ * Allocate a UTF-8 NUL-terminated string in this arena. libdbus expects
+ * `const char *` style strings in every text field. Lives here (rather than
+ * as a private helper in a single backend file) so any libtray code in this
+ * package can reach it.
+ */
+internal fun java.lang.foreign.Arena.allocateUtf8(s: String): MemorySegment {
+    val bytes = s.toByteArray(Charsets.UTF_8)
+    val segment = allocate((bytes.size + 1).toLong())
+    if (bytes.isNotEmpty()) {
+        MemorySegment.copy(bytes, 0, segment, ValueLayout.JAVA_BYTE, 0, bytes.size)
+    }
+    segment.set(ValueLayout.JAVA_BYTE, bytes.size.toLong(), 0)
+    return segment
 }

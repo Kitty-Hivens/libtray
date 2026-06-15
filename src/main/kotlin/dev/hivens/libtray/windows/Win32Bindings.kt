@@ -43,9 +43,12 @@ internal class Win32Bindings private constructor(
         // ── Window message constants from winuser.h ─────────────────────────
         // We only declare the ones the tray dispatch actually keys on.
 
-        const val WM_DESTROY:  Int = 0x0002
-        const val WM_CLOSE:    Int = 0x0010
-        const val WM_QUIT:     Int = 0x0012
+        const val WM_DESTROY:    Int = 0x0002
+        const val WM_CLOSE:      Int = 0x0010
+        const val WM_QUIT:       Int = 0x0012
+        // Posted to the menu's owner window to cancel a tracking popup from
+        // another thread -- the cross-thread way out of TrackPopupMenu.
+        const val WM_CANCELMODE: Int = 0x001F
         const val WM_COMMAND:  Int = 0x0111
         const val WM_USER:     Int = 0x0400  // Shell_NotifyIcon callback base; we use WM_USER + 1
 

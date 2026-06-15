@@ -194,6 +194,18 @@ internal class Win32TrayImpl private constructor(
         // and exits cleanly. DefWindowProc translates WM_CLOSE → DestroyWindow,
         // which fires WM_DESTROY on the same thread → PostQuitMessage(0)
         // in the WndProc → pump sees WM_QUIT → loop exits.
+        // If a context menu is open, the pump thread is parked inside
+        // TrackPopupMenu's own modal loop and will never see WM_CLOSE, so
+        // pumpThread.join(2_000) below would time out for as long as the user
+        // holds the menu. WM_CANCELMODE posted to the owner window is the
+        // documented cross-thread way to cancel a tracked popup menu, so
+        // TrackPopupMenu returns and the pump can then process WM_CLOSE.
+        // (EndMenu would only end the CALLING thread's menu, not the pump's.)
+        runCatching {
+            bindings.handle("PostMessageW").invokeExact(
+                hwnd, Win32Bindings.WM_CANCELMODE, 0L, 0L,
+            ) as Int
+        }
         runCatching {
             bindings.handle("PostMessageW").invokeExact(
                 hwnd, Win32Bindings.WM_CLOSE, 0L, 0L,
@@ -206,6 +218,12 @@ internal class Win32TrayImpl private constructor(
         runCatching {
             bindings.handle("UnregisterClassW").invokeExact(classNameSeg, hInstance) as Int
         }
+        // Release the bindings arena (downcall handles + the reusable
+        // NOTIFYICONDATA struct). Safe now that the window is destroyed and the
+        // pump thread joined, so no WndProc will dereference these handles
+        // again. The process-wide WndProc upcall stub lives in its own arena
+        // (ensureWndProcStub) and is deliberately left open.
+        runCatching { bindings.arena.close() }
     }
 
     // ── Shell_NotifyIcon helpers ─────────────────────────────────────────
