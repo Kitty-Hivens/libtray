@@ -23,7 +23,10 @@ import javax.imageio.ImageIO
  * transitive dependencies.
  *
  * Wire-level dance, in order:
- *   1. Connect to the session bus.
+ *   1. Connect to the session bus on a private connection
+ *      (`dbus_bus_get_private`) -- we run our own pop_message loop, so a
+ *      shared connection's single queue would let another libdbus user in
+ *      the process steal our incoming property queries.
  *   2. Request our own well-known name `org.kde.StatusNotifierItem-PID-N`
  *      (PID + a per-process counter for the rare multi-tray case).
  *   3. The desktop's tray host (KDE plasmashell, GNOME's SNI extension,
@@ -197,6 +200,11 @@ internal class SniTrayImpl internal constructor(
             val leftover = outgoing.poll() ?: break
             runCatching { unref.invokeExact(leftover) as Unit }
         }
+        // Private connection: close (detach from the bus, release the socket)
+        // before the final unref. A shared dbus_bus_get connection must never
+        // be closed, but this backend owns a private one.
+        runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
+            .onFailure { log.warn("dbus_connection_close threw on shutdown: {}", it.message) }
         try {
             bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
         } catch (t: Throwable) {
@@ -217,7 +225,15 @@ internal class SniTrayImpl internal constructor(
         val unref      = bindings.handle("dbus_message_unref")
         while (open.get()) {
             try {
-                readWrite.invokeExact(connection, 1_000) as Int  // 1s blocking poll
+                val live = readWrite.invokeExact(connection, 1_000) as Int  // 1s blocking poll
+                if (live == 0) {
+                    // FALSE == the connection disconnected (session bus gone).
+                    // With exit_on_disconnect off it no longer _exit()s us, but
+                    // read_write now returns immediately -- sleep so a dead bus
+                    // doesn't pin a core. Nothing to recover until a fresh launch.
+                    Thread.sleep(1_000)
+                    continue
+                }
                 while (open.get()) {
                     val msg = popMessage.invokeExact(connection) as MemorySegment
                     if (msg.address() == 0L) break
@@ -1148,14 +1164,22 @@ internal class SniTrayImpl internal constructor(
                 val error = setup.allocate(bindings.errorLayout)
                 bindings.handle("dbus_error_init").invokeExact(error) as Unit
 
-                val conn = bindings.handle("dbus_bus_get").invokeExact(
+                // Private, not shared: see the dbus_bus_get_private note in
+                // DBusBindings.LOAD_SET -- a shared connection lets another
+                // libdbus user in the process pop our incoming property
+                // queries off the single shared queue, so the icon silently
+                // never renders.
+                val conn = bindings.handle("dbus_bus_get_private").invokeExact(
                     DBusBindings.DBUS_BUS_SESSION, error,
                 ) as MemorySegment
                 if (conn.address() == 0L) {
-                    log.info("dbus_bus_get returned NULL -- no session bus, SNI unavailable")
+                    log.info("dbus_bus_get_private returned NULL -- no session bus, SNI unavailable")
                     freeError(bindings, error)
                     return@use null
                 }
+                // Don't let a dropped session bus _exit() the host application.
+                bindings.handle("dbus_connection_set_exit_on_disconnect")
+                    .invokeExact(conn, 0) as Unit
 
                 val itemId = "org.kde.StatusNotifierItem-${ProcessHandle.current().pid()}-${itemCounter.incrementAndGet()}"
                 val nameSeg = setup.allocateUtf8(itemId)

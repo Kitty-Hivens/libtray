@@ -83,7 +83,15 @@ internal class DBusBindings internal constructor(
          */
         private val LOAD_SET: List<Triple<String, java.lang.foreign.MemoryLayout?, List<MemoryLayout>>> = listOf(
             // Connection lifecycle
-            Triple("dbus_bus_get",
+            //
+            // We open a PRIVATE connection (dbus_bus_get_private), not the
+            // process-shared dbus_bus_get one: this backend drains the bus
+            // with its own dbus_connection_pop_message loop, and a shared
+            // connection has a single incoming queue that any other libdbus
+            // user in the process (a sibling notification library, say) would
+            // pop from too -- stealing the tray host's property queries before
+            // our pump ever sees them. A private connection is ours alone.
+            Triple("dbus_bus_get_private",
                 ValueLayout.ADDRESS,                         // DBusConnection*
                 listOf(ValueLayout.JAVA_INT, ValueLayout.ADDRESS),  // type, error*
             ),
@@ -91,9 +99,24 @@ internal class DBusBindings internal constructor(
                 ValueLayout.JAVA_INT,                         // int
                 listOf(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS),
             ),
+            // A private connection must be explicitly closed before the final
+            // unref (a shared one must NOT be) -- close() detaches it from the
+            // bus and releases the socket.
+            Triple("dbus_connection_close",
+                null,                                          // void
+                listOf(ValueLayout.ADDRESS),
+            ),
             Triple("dbus_connection_unref",
                 null,                                          // void
                 listOf(ValueLayout.ADDRESS),
+            ),
+            // libdbus defaults exit_on_disconnect ON, which _exit()s the whole
+            // process if the session bus drops. A vanishing tray icon must not
+            // take the host application down -- turn it off and let the pump
+            // idle on a dead connection.
+            Triple("dbus_connection_set_exit_on_disconnect",
+                null,                                          // void
+                listOf(ValueLayout.ADDRESS, ValueLayout.JAVA_INT),  // conn, dbus_bool_t
             ),
             Triple("dbus_connection_read_write",
                 ValueLayout.JAVA_INT,                          // dbus_bool_t

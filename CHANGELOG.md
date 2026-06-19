@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.1.2]
+
+### Fixed
+- Linux: the SNI backend opens a private D-Bus connection
+  (`dbus_bus_get_private`) instead of the process-shared `dbus_bus_get`
+  one. A shared connection has a single incoming-message queue; when
+  another libdbus user in the same process runs its own
+  `dbus_connection_pop_message` loop (for instance a sibling
+  notification library), it could pop -- and discard -- the tray host's
+  property queries before this backend's pump saw them, so the icon
+  never rendered on startup and only appeared after the tray host was
+  restarted. A private connection is drained solely by our own pump.
+- Linux: `exit_on_disconnect` is turned off on the connection. libdbus
+  defaults it on, which `_exit()`s the whole process if the session bus
+  drops; the pump loop now idles on a dead connection instead of taking
+  the host application down with it.
+- Linux: `close()` closes the private connection before the final unref,
+  as the private-connection contract requires.
+
 ## [0.1.1]
 
 ### Fixed

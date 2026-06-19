@@ -43,6 +43,9 @@ class SniTrayImplSenderTest {
         rec.sent.isEmpty() shouldBe true
         rec.flushes.get() shouldBe 0
         rec.connUnrefs.get() shouldBe 1
+        // The private connection is closed exactly once, before the unref.
+        rec.connCloses.get() shouldBe 1
+        rec.connLifecycle.toList() shouldContainExactly listOf("close", "unref")
     }
 
     @Test
@@ -146,6 +149,7 @@ class SniTrayImplSenderTest {
             "dbus_connection_send" to l.bind(rec, "send", MethodType.methodType(int, seg, seg, seg)),
             "dbus_connection_flush" to l.bind(rec, "flush", MethodType.methodType(void, seg)),
             "dbus_message_unref" to l.bind(rec, "unref", MethodType.methodType(void, seg)),
+            "dbus_connection_close" to l.bind(rec, "connClose", MethodType.methodType(void, seg)),
             "dbus_connection_unref" to l.bind(rec, "connUnref", MethodType.methodType(void, seg)),
         )
         return DBusBindings(Arena.ofShared(), handles)
@@ -161,6 +165,10 @@ class SniTrayImplSenderTest {
         val unrefed = ConcurrentLinkedQueue<Long>()
         val flushes = AtomicInteger(0)
         val connUnrefs = AtomicInteger(0)
+        val connCloses = AtomicInteger(0)
+
+        /** Records "close"/"unref" so the test can pin their relative order. */
+        val connLifecycle = ConcurrentLinkedQueue<String>()
 
         /** Optional hook run at the start of each flush (mid-flush gating). */
         @Volatile var onFlush: (() -> Unit)? = null
@@ -185,8 +193,12 @@ class SniTrayImplSenderTest {
             unrefed.add(msg.address())
         }
 
+        fun connClose(connection: MemorySegment) {
+            connCloses.incrementAndGet(); connLifecycle.add("close")
+        }
+
         fun connUnref(connection: MemorySegment) {
-            connUnrefs.incrementAndGet()
+            connUnrefs.incrementAndGet(); connLifecycle.add("unref")
         }
     }
 
