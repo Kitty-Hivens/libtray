@@ -1,7 +1,6 @@
 [versions]
-# Pinned to match the Nexira launcher's Kotlin so cross-project Panama
-# bindings stay binary-compatible. Bump in lockstep until libtray has
-# more downstream consumers than just Nexira.
+# Pinned so Panama bindings stay binary-compatible across the projects
+# that share them. Bump deliberately, not on every Kotlin release.
 kotlin = "2.3.21"
 slf4j  = "2.0.16"
 

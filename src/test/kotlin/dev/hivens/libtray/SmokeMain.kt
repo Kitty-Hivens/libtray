@@ -41,7 +41,7 @@ fun main() {
         try {
             // Solid magenta circle on transparent background — easy to
             // spot in any tray theme.
-            g.color = Color(0xBB, 0x86, 0xFC)  // matches Nexira's primary
+            g.color = Color(0xBB, 0x86, 0xFC)
             g.fillOval(2, 2, 28, 28)
             g.color = Color.BLACK
             g.fillRect(14, 12, 4, 8)
@@ -131,8 +131,8 @@ fun main() {
  *    to NSApp which lets the run loop return cleanly.
  *  - Main thread enters `[NSApp run]` — blocks here until terminate.
  *
- * Production Nexira doesn't need this code path: Compose Desktop /
- * Skiko owns the Cocoa main loop already.
+ * A Compose Desktop / Skiko application doesn't need this code path:
+ * it owns the Cocoa main loop already.
  */
 private fun runMacCocoaLoopUntil(
     exitFlag: java.util.concurrent.CountDownLatch,
