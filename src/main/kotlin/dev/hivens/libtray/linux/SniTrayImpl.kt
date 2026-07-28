@@ -120,7 +120,7 @@ internal class SniTrayImpl internal constructor(
      * Swing) call this from the EDT — so during a state-change burst
      * (e.g. a "launch starting" tray-status update emits two signals back
      * to back) the EDT could stall for 1-2 s, producing a fully-frozen
-     * application window. Captured in the field via Aura's puppet diag
+     * application window. Captured in the field via Nexira's puppet diag
      * snapshot on 2026-05-18: `AWT-EventQueue-0` `RUNNABLE inNative=true`
      * deep in `DowncallStub.invoke` -> `sendAndUnref`.
      *

@@ -1,7 +1,7 @@
 [versions]
-# Pinned to match the Aura launcher's Kotlin so cross-project Panama
+# Pinned to match the Nexira launcher's Kotlin so cross-project Panama
 # bindings stay binary-compatible. Bump in lockstep until libtray has
-# more downstream consumers than just Aura.
+# more downstream consumers than just Nexira.
 kotlin = "2.3.21"
 slf4j  = "2.0.16"
 

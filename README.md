@@ -108,7 +108,7 @@ tray.close()
 
 Built and validated against:
 
-- Aura Launcher (`Kitty-Hivens/Aura-Launcher`) — primary downstream
+- Nexira (`Kitty-Hivens/Nexira`), the primary downstream
 - Linux: Hyprland, KDE Plasma — verified
 - Windows: Shell_NotifyIcon + popup menu — verified on Win10 / Win11
 - macOS: NSStatusItem + menu — verified on a macOS VM and a community
