@@ -184,10 +184,14 @@ tasks.withType<Jar>().configureEach {
 //   signingInMemoryKey / signingInMemoryKeyPassword (+ optional ...KeyId) :
 //       the ASCII-armored GPG private key + its passphrase.
 //
-// Publish: `./gradlew publishToMavenCentral` -- with automaticRelease the
-// deployment goes all the way through instead of sitting VALIDATED in the
-// portal waiting for a manual Publish click. The version is taken from the
-// git tag (see `version` above), so tag vX.Y.Z before publishing.
+// Publish: push a vX.Y.Z tag and .github/workflows/publish.yml does the rest,
+// passing the tag as -PappVersion and signing with the key CI holds. From a
+// workstation the same release is `./gradlew publishToMavenCentral
+// -PappVersion=X.Y.Z --no-configuration-cache`, signing through the keyring.
+// Pass the version either way: gradle.properties pins appVersion to a
+// SNAPSHOT, so the git-describe fallback above never gets to run.
+// automaticRelease then carries the deployment all the way through instead of
+// leaving it VALIDATED in the portal waiting for a manual Publish click.
 mavenPublishing {
     // Central Portal (central.sonatype.com). Legacy OSSRH was removed in
     // recent plugin versions, so this targets the portal.

@@ -1,0 +1,84 @@
+name: Publish
+
+# A release is cut from a tag: tag vX.Y.Z, push it, and this signs the
+# artifacts and uploads them to Maven Central. The version comes from the tag,
+# not from gradle.properties -- the appVersion there is a SNAPSHOT placeholder
+# for local builds and would publish nonsense coordinates. The job runs in the
+# maven-central environment, so the credentials sit behind that environment's
+# approval rather than firing on any pushed tag.
+on:
+  push:
+    tags: [ "v*", "[0-9]*" ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.1.2"
+        required: true
+
+env:
+  JAVA_VERSION: '22'
+  JAVA_DISTRIBUTION: 'temurin'
+
+jobs:
+  publish:
+    name: Publish to Maven Central
+    runs-on: ubuntu-latest
+    environment: maven-central
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          java-version: ${{ env.JAVA_VERSION }}
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Resolve the version
+        id: version
+        env:
+          # A dispatched run is where "v0.1.2" gets pasted in by hand; the tag
+          # path has already stripped the v.
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            v="${GITHUB_REF_NAME#v}"
+          else
+            v="${INPUT_VERSION#v}"
+          fi
+          case "$v" in
+            [0-9]*) ;;
+            *) echo "::error::version '$v' does not start with a digit"; exit 1 ;;
+          esac
+          case "$v" in
+            *[!0-9A-Za-z.-]*) echo "::error::version '$v' has characters a version does not"; exit 1 ;;
+          esac
+          echo "v=$v" >> "$GITHUB_OUTPUT"
+
+      # Central versions are immutable, and a reused one is rejected only at
+      # the end of the upload -- after everything has been built and signed.
+      - name: Guard the version
+        run: |
+          v='${{ steps.version.outputs.v }}'
+          if curl -fsI -o /dev/null "https://repo1.maven.org/maven2/dev/hivens/libtray/$v/libtray-$v.pom"; then
+            echo "::error::dev.hivens:libtray:$v is already on Central -- versions are immutable"
+            exit 1
+          fi
+          echo "publishing $v"
+
+      # The tag is what ships, so it is tested here rather than on the trust
+      # that main was green when it was cut.
+      - name: Build + test
+        run: ./gradlew build --stacktrace
+
+      - name: Publish
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          # The in-memory key is what makes the build skip useGpgCmd; the
+          # configuration cache is on in gradle.properties and the publish
+          # tasks do not survive it.
+          ./gradlew publishToMavenCentral \
+            -PappVersion='${{ steps.version.outputs.v }}' \
+            --no-configuration-cache
