@@ -39,7 +39,7 @@ jobs:
           # path has already stripped the v.
           INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             v="${GITHUB_REF_NAME#v}"
           else
             v="${INPUT_VERSION#v}"
@@ -56,8 +56,10 @@ jobs:
       # Central versions are immutable, and a reused one is rejected only at
       # the end of the upload -- after everything has been built and signed.
       - name: Guard the version
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
         run: |
-          v='${{ steps.version.outputs.v }}'
+          v="$VERSION"
           if curl -fsI -o /dev/null "https://repo1.maven.org/maven2/dev/hivens/libtray/$v/libtray-$v.pom"; then
             echo "::error::dev.hivens:libtray:$v is already on Central -- versions are immutable"
             exit 1
@@ -75,10 +77,11 @@ jobs:
           ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
           ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
           ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          VERSION: ${{ steps.version.outputs.v }}
         run: |
           # The in-memory key is what makes the build skip useGpgCmd; the
           # configuration cache is on in gradle.properties and the publish
           # tasks do not survive it.
           ./gradlew publishToMavenCentral \
-            -PappVersion='${{ steps.version.outputs.v }}' \
+            -PappVersion="$VERSION" \
             --no-configuration-cache
