@@ -1229,6 +1229,11 @@ internal class SniTrayImpl internal constructor(
                 if (conn.address() == 0L) {
                     log.info("dbus_bus_get_private returned NULL -- no session bus, SNI unavailable")
                     freeError(bindings, error)
+                    // Nothing was constructed, so nothing will ever close the
+                    // bindings arena -- do it here or every failed create()
+                    // (a headless CI run retrying, say) leaks the library
+                    // lookup plus a downcall handle per LOAD_SET entry.
+                    runCatching { bindings.arena.close() }
                     return@use null
                 }
                 // Don't let a dropped session bus _exit() the host application.
@@ -1245,7 +1250,9 @@ internal class SniTrayImpl internal constructor(
                     log.warn("dbus_bus_request_name returned {} for {} -- SNI registration failed",
                         nameResult, itemId)
                     freeError(bindings, error)
+                    bindings.handle("dbus_connection_close").invokeExact(conn) as Unit
                     bindings.handle("dbus_connection_unref").invokeExact(conn) as Unit
+                    runCatching { bindings.arena.close() }
                     return@use null
                 }
 
@@ -1267,6 +1274,10 @@ internal class SniTrayImpl internal constructor(
                             "interface='org.freedesktop.DBus',member='NameOwnerChanged'",
                     )
                     bindings.handle("dbus_bus_add_match").invokeExact(conn, rule, error) as Unit
+                    // add_match fills the DBusError on failure, and libdbus
+                    // heap-allocates its name / message strings -- the
+                    // confined arena does not own them.
+                    freeError(bindings, error)
                 }.onFailure { log.warn("AddMatch for NameOwnerChanged failed: {}", it.message) }
 
                 SniTrayImpl(bindings, conn, itemId, builder)
