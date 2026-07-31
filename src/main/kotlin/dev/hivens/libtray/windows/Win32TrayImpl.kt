@@ -12,6 +12,7 @@ import java.lang.foreign.Arena
 import java.lang.foreign.Linker
 import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
 import java.lang.invoke.MethodHandles
@@ -442,6 +443,11 @@ internal class Win32TrayImpl private constructor(
                 dispatchMessage.invokeExact(msg) as Long
             } catch (t: Throwable) {
                 log.warn("Win32 pump iteration threw: {}", t.message)
+                // Back off. Without this a permanently-failing call -- a
+                // closed arena after a failed create, say -- spins this
+                // daemon thread at 100% for the life of the process,
+                // writing a warn line per iteration.
+                Thread.sleep(500)
             }
         }
     }
@@ -689,9 +695,16 @@ internal class Win32TrayImpl private constructor(
         }
 
         /**
-         * Pre-instance DefWindowProc — needs its own Win32Bindings handle
-         * because we don't have a Tray instance to source one. Cached on
-         * first call so the lookup amortises.
+         * Pre-instance DefWindowProc, resolved onto the same process-lifetime
+         * arena as the WndProc stub.
+         *
+         * It must NOT come from a Win32Bindings instance: those arenas are
+         * per-Tray and are closed by close() and by the failed-create path,
+         * while this handle is reachable from the process-wide upcall stub
+         * for as long as any window exists. A handle whose arena has been
+         * closed throws on invoke, the fallback swallows that and returns 0,
+         * and returning 0 from WM_NCCREATE makes CreateWindowExW fail -- so a
+         * second Tray.create would silently produce no window.
          */
         @Volatile private var defWindowProcHandle: MethodHandle? = null
 
@@ -711,8 +724,6 @@ internal class Win32TrayImpl private constructor(
                 log.info("Win32 DLLs not loadable — Win32 tray unavailable")
                 return null
             }
-            // Cache DefWindowProc handle for the pre-instance fallback path.
-            defWindowProcHandle = bindings.handle("DefWindowProcW")
 
             val tray = runCatching {
                 createInternal(bindings, builder)
@@ -823,6 +834,14 @@ internal class Win32TrayImpl private constructor(
                 )
                 val arena = Arena.ofShared()
                 val stub = Linker.nativeLinker().upcallStub(handle, bindings.wndProcDescriptor, arena)
+                // Same arena, so the fallback stays callable for as long as
+                // the stub the OS holds -- see defWindowProcHandle's KDoc.
+                defWindowProcHandle = SymbolLookup.libraryLookup("user32", arena)
+                    .find("DefWindowProcW")
+                    .map { symbol ->
+                        Linker.nativeLinker().downcallHandle(symbol, bindings.defWindowProcDescriptor)
+                    }
+                    .orElse(null)
                 wndProcStub = stub
                 wndProcArena = arena
                 stub to arena

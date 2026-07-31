@@ -385,6 +385,18 @@ internal class Win32Bindings private constructor(
     )
 
     /**
+     * `LRESULT DefWindowProcW(HWND, UINT, WPARAM, LPARAM)` — same shape as
+     * [wndProcDescriptor] minus the callback direction. Declared here so the
+     * pre-instance fallback in [Win32TrayImpl] can bind the symbol onto its
+     * own process-lifetime arena instead of borrowing a per-Tray one.
+     */
+    val defWindowProcDescriptor: FunctionDescriptor = FunctionDescriptor.of(
+        ValueLayout.JAVA_LONG,                                  // LRESULT
+        ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,           // HWND, UINT, WPARAM, LPARAM
+    )
+
+    /**
      * `NOTIFYICONDATAW` from shellapi.h — the parameter to
      * `Shell_NotifyIconW`. Modern (Win7+) variant, total size 976 bytes
      * on x86_64. The kernel checks `cbSize` against its own struct

@@ -210,7 +210,7 @@ internal class SniTrayImpl internal constructor(
         // connection in a weird half-closed state with the watcher still
         // expecting our service, and could abandon a half-built outgoing
         // message mid-FFM call.
-        ioThread.join(2_000)
+        ioThread.join(JOIN_TIMEOUT_MS)
         // Final drain: a caller racing close() can enqueue after the loop
         // did its own last drain, so unref anything still in `outgoing`
         // rather than leak the libdbus message.
@@ -218,6 +218,20 @@ internal class SniTrayImpl internal constructor(
         while (true) {
             val leftover = outgoing.poll() ?: break
             runCatching { unref.invokeExact(leftover) as Unit }
+        }
+        // Everything below frees memory the I/O thread may still be reading.
+        // If it did not stop in time -- a `fire` handler that blocks, or a
+        // flush against a socket nobody is draining -- then unreffing the
+        // connection out from under a live `dbus_*` call is a segfault
+        // inside libdbus. Leaking one connection at shutdown is the better
+        // trade, so bail out and say why.
+        if (ioThread.isAlive) {
+            log.warn(
+                "libtray-sni did not stop within {} ms; leaving the D-Bus connection open rather " +
+                    "than freeing memory it is still using. The icon is gone either way.",
+                JOIN_TIMEOUT_MS,
+            )
+            return
         }
         // Private connection: close (detach from the bus, release the socket)
         // before the final unref. A shared dbus_bus_get connection must never
@@ -230,9 +244,9 @@ internal class SniTrayImpl internal constructor(
             log.warn("dbus_connection_unref threw on shutdown: {}", t.message)
         }
         // Release the shared arena (library lookup + every downcall handle).
-        // Safe now that both threads are joined; the SNI backend uses no upcall
-        // stubs, so -- unlike Win32 / macOS -- there is no separate long-lived
-        // arena that must outlive close().
+        // Safe now that the I/O thread is provably gone; the SNI backend uses no
+        // upcall stubs, so -- unlike Win32 / macOS -- there is no separate
+        // long-lived arena that must outlive close().
         runCatching { bindings.arena.close() }
     }
 
@@ -514,7 +528,7 @@ internal class SniTrayImpl internal constructor(
             "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
             "OverlayIconName"   -> appendVariantString(call, parent, "")
             "AttentionIconName" -> appendVariantString(call, parent, "")
-            // ToolTip deliberately empty — see [composedTitle] for the
+            // ToolTip deliberately empty — see [currentTitle] for the
             // single-source-of-truth rationale. Sending an empty struct
             // (rather than dropping the property) keeps the variant well-
             // typed for hosts that GET it before any LayoutUpdated.
@@ -828,7 +842,7 @@ internal class SniTrayImpl internal constructor(
      * enabled produce an event, which is what the other two backends can
      * physically deliver: a greyed HMENU item yields no command from
      * TrackPopupMenu, a separator has none, and an `MF_POPUP` / submenu
-     * parent returns the submenu rather than a selection. Anything the
+     * parent opens the submenu instead of returning a command. Anything the
      * host sends outside that set — nothing stops it, the node ids are
      * public over the bus — is dropped rather than handed to a consumer
      * that would never see it on Windows or macOS.
@@ -1055,6 +1069,17 @@ internal class SniTrayImpl internal constructor(
         // LinkedBlockingQueue#offer with no capacity bound always succeeds.
         // Defensive `else` would be dead code; rely on the contract.
         outgoing.put(reply)
+        // close() can run its final drain between the check above and this
+        // put, which would leave the message queued forever with its ref
+        // held. Re-check and drain what nobody is coming back for; poll() is
+        // atomic, so a message still reaches exactly one unref.
+        if (!open.get()) {
+            val unref = bindings.handle("dbus_message_unref")
+            while (true) {
+                val stranded = outgoing.poll() ?: break
+                runCatching { unref.invokeExact(stranded) as Unit }
+            }
+        }
     }
 
     private data class Pixmap(val width: Int, val height: Int, val argbNetworkOrder: ByteArray)
@@ -1104,6 +1129,23 @@ internal class SniTrayImpl internal constructor(
          * dispatch and sent at the top of the very next iteration.
          */
         private const val POLL_TIMEOUT_MS: Int = 100
+
+        /**
+         * How long close() waits for the I/O thread before giving up and
+         * leaving the connection allocated. Every blocking libdbus call the
+         * thread can be inside is bounded below this, so a healthy backend
+         * always joins.
+         */
+        private const val JOIN_TIMEOUT_MS: Long = 2_000
+
+        /**
+         * Reply timeout for the RegisterStatusNotifierItem call. Runs on the
+         * I/O thread when a watcher reappears, so it has to finish inside
+         * [JOIN_TIMEOUT_MS] or a close() racing a tray-host restart would
+         * abandon the thread mid-call. A watcher that has not answered in a
+         * second is not going to.
+         */
+        private const val WATCHER_REPLY_TIMEOUT_MS: Int = 1_000
 
         /**
          * Release a DBusError. `dbus_error_free` is safe whether or not the
@@ -1255,8 +1297,8 @@ internal class SniTrayImpl internal constructor(
                     log.warn("dbus_bus_request_name returned {} for {} -- SNI registration failed",
                         nameResult, itemId)
                     freeError(bindings, error)
-                    bindings.handle("dbus_connection_close").invokeExact(conn) as Unit
-                    bindings.handle("dbus_connection_unref").invokeExact(conn) as Unit
+                    runCatching { bindings.handle("dbus_connection_close").invokeExact(conn) as Unit }
+                    runCatching { bindings.handle("dbus_connection_unref").invokeExact(conn) as Unit }
                     runCatching { bindings.arena.close() }
                     return@use null
                 }
@@ -1316,7 +1358,7 @@ internal class SniTrayImpl internal constructor(
                 val error = setup.allocate(bindings.errorLayout)
                 bindings.handle("dbus_error_init").invokeExact(error) as Unit
                 val reply = bindings.handle("dbus_connection_send_with_reply_and_block").invokeExact(
-                    conn, msg, 5_000, error,
+                    conn, msg, WATCHER_REPLY_TIMEOUT_MS, error,
                 ) as MemorySegment
                 bindings.handle("dbus_message_unref").invokeExact(msg) as Unit
                 if (reply.address() != 0L) {
