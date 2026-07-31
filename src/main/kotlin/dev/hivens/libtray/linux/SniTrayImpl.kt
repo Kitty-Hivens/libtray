@@ -816,6 +816,26 @@ internal class SniTrayImpl internal constructor(
     }
 
     /**
+     * Translate a dbusmenu node id back into a [TrayEvent.MenuItemSelected]
+     * for the caller-supplied string id.
+     *
+     * Only [dev.hivens.libtray.TrayMenuItem.Standard] entries that are
+     * enabled produce an event, which is what the other two backends can
+     * physically deliver: a greyed HMENU item yields no command from
+     * TrackPopupMenu, a separator has none, and an `MF_POPUP` / submenu
+     * parent returns the submenu rather than a selection. Anything the
+     * host sends outside that set — nothing stops it, the node ids are
+     * public over the bus — is dropped rather than handed to a consumer
+     * that would never see it on Windows or macOS.
+     */
+    private fun fireMenuClick(nodeId: Int) {
+        val node = menuLayout?.nodeOf(nodeId) ?: return
+        if (node.kind != DBusMenuLayout.NodeKind.Standard) return  // separator, submenu parent, or the root
+        if (!node.enabled) return
+        fire(TrayEvent.MenuItemSelected(node.originalId))
+    }
+
+    /**
      * Event(id, eventId, data, timestamp) — host tells us about user
      * interaction. We care about "clicked"; everything else is acked
      * with an empty reply.
@@ -828,12 +848,7 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
             val eventId = readBasicString(call, iter) ?: return replyEmpty(msg)
             // data + timestamp ignored — we don't expose them as event fields.
-            if (eventId == "clicked") {
-                val originalId = menuLayout?.nodeOf(id)?.originalId
-                if (originalId != null && originalId != "<root>") {
-                    fire(TrayEvent.MenuItemSelected(originalId))
-                }
-            }
+            if (eventId == "clicked") fireMenuClick(id)
             replyEmpty(msg)
         }
     }
@@ -854,12 +869,7 @@ internal class SniTrayImpl internal constructor(
                 val id = readInt(call, structIter) ?: 0
                 bindings.handle("dbus_message_iter_next").invokeExact(structIter) as Int
                 val eventId = readBasicString(call, structIter) ?: ""
-                if (eventId == "clicked") {
-                    val originalId = menuLayout?.nodeOf(id)?.originalId
-                    if (originalId != null && originalId != "<root>") {
-                        fire(TrayEvent.MenuItemSelected(originalId))
-                    }
-                }
+                if (eventId == "clicked") fireMenuClick(id)
                 bindings.handle("dbus_message_iter_next").invokeExact(arrIter) as Int
             }
 
