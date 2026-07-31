@@ -8,6 +8,7 @@ import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Panama bindings to the Objective-C runtime + AppKit. Loaded once per
@@ -49,6 +50,13 @@ internal class ObjcBindings private constructor(
      * after the first lookup — class objects are stable for the JVM's
      * lifetime. Throws if the class isn't registered (typically a typo
      * or framework not loaded).
+     *
+     * The cache is concurrent because these lookups are not single-
+     * threaded: the apply* helpers run on the Cocoa main queue while
+     * [AppKitTrayImpl.close] resolves "NSStatusBar" and several selectors
+     * synchronously on whichever thread the consumer closed from. Two
+     * threads growing a plain HashMap can lose entries or spin forever
+     * inside a resize.
      */
     fun cls(name: String): MemorySegment = classCache.getOrPut(name) {
         Arena.ofConfined().use { tmp ->
@@ -307,7 +315,7 @@ internal class ObjcBindings private constructor(
             // -> NULL, and runOnMainQueue degrades to a direct call.
             val mainQueue = lookups.firstNotNullOfOrNull { it.find("_dispatch_main_q").orElse(null) }
                 ?: MemorySegment.NULL
-            return ObjcBindings(arena, handles, HashMap(), HashMap(), mainQueue)
+            return ObjcBindings(arena, handles, ConcurrentHashMap(), ConcurrentHashMap(), mainQueue)
         }
     }
 }

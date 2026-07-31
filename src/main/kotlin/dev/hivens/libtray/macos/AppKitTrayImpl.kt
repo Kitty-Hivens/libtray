@@ -182,7 +182,10 @@ internal class AppKitTrayImpl private constructor(
         runOnMainQueue {
             autoreleasepool {
                 val nsData = bindings.nsData(pngBytes)
-                log.info("applyIcon: NSData allocated, addr=0x{} bytes={}",
+                // Debug, not info: unlike the create-time steps below, this
+                // path runs on every setIcon call, and a consumer animating
+                // the tray glyph would get three lines per frame.
+                log.debug("applyIcon: NSData allocated, addr=0x{} bytes={}",
                     nsData.address().toString(16), pngBytes.size)
                 val nsImageCls = bindings.cls("NSImage")
                 val allocated = bindings.handle("objc_msgSend_id")
@@ -194,7 +197,7 @@ internal class AppKitTrayImpl private constructor(
                     setButtonTitle("●")
                     return@autoreleasepool
                 }
-                log.info("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
+                log.debug("applyIcon: NSImage created, addr=0x{}", image.address().toString(16))
                 // Force template OFF -- by default macOS may render our colored
                 // PNG as a black-only template (auto-inverting in dark mode),
                 // blanking out colored-only icons. setTemplate:NO uses it as-is.
@@ -211,7 +214,7 @@ internal class AppKitTrayImpl private constructor(
                 setButtonTitle("")
                 // setImage: retains the image; release our alloc +1 so it doesn't leak.
                 bindings.handle("objc_release").invokeExact(image) as Unit
-                log.info("applyIcon: setImage: dispatched to status button (template=NO)")
+                log.debug("applyIcon: setImage: dispatched to status button (template=NO)")
             }
         }
     }
@@ -267,6 +270,7 @@ internal class AppKitTrayImpl private constructor(
                     .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
                 val newMenu = bindings.handle("objc_msgSend_id_id")
                     .invokeExact(allocatedMenu, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
+                disableAutoenabling(newMenu)
 
                 appendItems(newMenu, menu.items)
 
@@ -309,6 +313,27 @@ internal class AppKitTrayImpl private constructor(
      * a child NSMenu attached via setSubmenu:. Separators use
      * `[NSMenuItem separatorItem]`.
      */
+    /**
+     * `[menu setAutoenablesItems:NO]`.
+     *
+     * NSMenu defaults this to YES, which makes AppKit recompute every
+     * item's enabled state at display time from the responder chain: an
+     * item whose action the target implements is force-enabled, and our
+     * `setEnabled:NO` is silently overwritten. Since our menu target does
+     * implement `onMenuItem:` for every Standard item, that meant
+     * [TrayMenuItem.enabled] = false rendered as a normal, clickable entry
+     * on macOS while Linux and Windows greyed it out. Turning auto-enabling
+     * off makes the explicit flag authoritative, which is what the
+     * cross-platform contract says.
+     */
+    private fun disableAutoenabling(menu: MemorySegment) {
+        runCatching {
+            bindings.handle("objc_msgSend_void_long").invokeExact(
+                menu, bindings.sel("setAutoenablesItems:"), 0L,
+            ) as Unit
+        }
+    }
+
     private fun appendItems(parentMenu: MemorySegment, items: List<TrayMenuItem>) {
         val nsMenuItemCls = bindings.cls("NSMenuItem")
         val onSelector = bindings.sel("onMenuItem:")
@@ -372,6 +397,7 @@ internal class AppKitTrayImpl private constructor(
                         .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
                     val childMenu = bindings.handle("objc_msgSend_id_id")
                         .invokeExact(childAllocated, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
+                    disableAutoenabling(childMenu)
                     appendItems(childMenu, item.items)
                     bindings.handle("objc_msgSend_void_id").invokeExact(
                         parentItem, bindings.sel("setSubmenu:"), childMenu,
@@ -416,6 +442,13 @@ internal class AppKitTrayImpl private constructor(
      * thread -> run inline (dispatch_async would needlessly defer a tick).
      * Otherwise enqueue via `dispatch_async_f`. If libdispatch did not resolve
      * ([ObjcBindings.mainQueue] is NULL) fall back to running inline.
+     *
+     * The queued body re-checks [open] on the main thread rather than
+     * trusting the check made here at enqueue time. [close] runs
+     * synchronously on the caller thread and releases the NSStatusItem; an
+     * action enqueued just before that would otherwise message a
+     * deallocated object — `setImage:` / `setMenu:` on a freed
+     * NSStatusItem, which is a use-after-free, not a no-op.
      */
     private fun runOnMainQueue(action: () -> Unit) {
         if (!open.get()) return
@@ -429,7 +462,7 @@ internal class AppKitTrayImpl private constructor(
             return
         }
         val id = dispatchCounter.getAndIncrement()
-        PENDING[id] = action
+        PENDING[id] = { if (open.get()) action() }
         val enqueued = runCatching {
             bindings.handle("dispatch_async_f").invokeExact(
                 queue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
