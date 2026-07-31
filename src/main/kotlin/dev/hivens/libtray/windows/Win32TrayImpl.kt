@@ -5,6 +5,7 @@ import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
+import dev.hivens.libtray.TrayMenuItem
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
@@ -43,14 +44,15 @@ import javax.imageio.ImageIO
  *      via `PeekMessageW` + `DispatchMessageW`.
  *   5. WndProc routes `WM_DESTROY` / `WM_USER+1` / `WM_COMMAND` to
  *      Kotlin-side handlers; everything else gets `DefWindowProcW`.
+ *   6. `Shell_NotifyIcon` NIM_ADD registers the icon (built from the
+ *      builder's PNG via [pngToHicon]), NIM_SETVERSION opts into the
+ *      v4 mouse-message format, NIM_MODIFY carries later icon / tooltip
+ *      changes, and NIM_DELETE removes the entry on [close].
  *
- * **Phase 3 of the libtray rollout — foundation only.** This file
- * registers the window and runs the pump. The actual `Shell_NotifyIcon`
- * call, the `HICON` conversion from PNG, and the popup menu wiring land
- * in subsequent commits (Tasks #111, #112). Until those land,
- * [Tray.create] still returns a Win32 instance — but [setTooltip],
- * [setIcon], [setMenu] all no-op (return false), and no icon shows up in
- * the system tray.
+ * Menu: no HMENU is held across calls. [setMenu] only stores the
+ * [TrayMenu]; the popup is built, tracked and destroyed inside
+ * [showContextMenu] on each right-click, which is what keeps repeated
+ * setMenu calls from leaking GDI handles.
  */
 internal class Win32TrayImpl private constructor(
     private val bindings: Win32Bindings,
@@ -202,15 +204,24 @@ internal class Win32TrayImpl private constructor(
         // documented cross-thread way to cancel a tracked popup menu, so
         // TrackPopupMenu returns and the pump can then process WM_CLOSE.
         // (EndMenu would only end the CALLING thread's menu, not the pump's.)
-        runCatching {
-            bindings.handle("PostMessageW").invokeExact(
-                hwnd, Win32Bindings.WM_CANCELMODE, 0L, 0L,
-            ) as Int
-        }
-        runCatching {
-            bindings.handle("PostMessageW").invokeExact(
-                hwnd, Win32Bindings.WM_CLOSE, 0L, 0L,
-            ) as Int
+        //
+        // Only with a real window. PostMessageW treats a NULL hWnd as
+        // PostThreadMessage to the CALLING thread -- so on the "window
+        // creation failed, tear the half-built instance down" path this
+        // would push WM_CANCELMODE and WM_CLOSE into the queue of whatever
+        // thread called close(), which for a UI consumer is the EDT. The
+        // pump has already exited in that case; there is nothing to signal.
+        if (hwnd.address() != 0L) {
+            runCatching {
+                bindings.handle("PostMessageW").invokeExact(
+                    hwnd, Win32Bindings.WM_CANCELMODE, 0L, 0L,
+                ) as Int
+            }
+            runCatching {
+                bindings.handle("PostMessageW").invokeExact(
+                    hwnd, Win32Bindings.WM_CLOSE, 0L, 0L,
+                ) as Int
+            }
         }
         pumpThread.join(2_000)
         HWND_INSTANCES.remove(hwnd.address())
@@ -487,6 +498,7 @@ internal class Win32TrayImpl private constructor(
             val y = highWordSigned(wParam)
             when (event) {
                 Win32Bindings.WM_LBUTTONUP -> fire(TrayEvent.Activated)
+                Win32Bindings.WM_MBUTTONUP -> fire(TrayEvent.MiddleActivated)
                 Win32Bindings.WM_RBUTTONUP, Win32Bindings.WM_CONTEXTMENU -> showContextMenu(x, y)
             }
             0L
@@ -578,7 +590,7 @@ internal class Win32TrayImpl private constructor(
      */
     private fun appendItems(
         parent: MemorySegment,
-        items: List<dev.hivens.libtray.TrayMenuItem>,
+        items: List<TrayMenuItem>,
         cmdToId: HashMap<Int, String>,
         nextCmd: AtomicInteger,
         tmpArena: Arena,
@@ -586,12 +598,12 @@ internal class Win32TrayImpl private constructor(
         val appendMenu = bindings.handle("AppendMenuW")
         for (item in items) {
             when (item) {
-                is dev.hivens.libtray.TrayMenuItem.Separator -> {
+                is TrayMenuItem.Separator -> {
                     runCatching {
                         appendMenu.invokeExact(parent, Win32Bindings.MF_SEPARATOR, 0L, MemorySegment.NULL) as Int
                     }
                 }
-                is dev.hivens.libtray.TrayMenuItem.Standard -> {
+                is TrayMenuItem.Standard -> {
                     val cmd = nextCmd.getAndIncrement()
                     cmdToId[cmd] = item.id
                     val labelSeg = allocateUtf16(tmpArena, item.label)
@@ -601,7 +613,7 @@ internal class Win32TrayImpl private constructor(
                         appendMenu.invokeExact(parent, flags, cmd.toLong(), labelSeg) as Int
                     }
                 }
-                is dev.hivens.libtray.TrayMenuItem.Submenu -> {
+                is TrayMenuItem.Submenu -> {
                     val child = runCatching {
                         bindings.handle("CreatePopupMenu").invokeExact() as MemorySegment
                     }.getOrNull()
@@ -702,11 +714,19 @@ internal class Win32TrayImpl private constructor(
             // Cache DefWindowProc handle for the pre-instance fallback path.
             defWindowProcHandle = bindings.handle("DefWindowProcW")
 
-            return runCatching {
+            val tray = runCatching {
                 createInternal(bindings, builder)
             }.onFailure { t ->
                 log.warn("Win32 tray construction threw: {}", t.message)
             }.getOrNull()
+            if (tray == null) {
+                // No instance owns the arena, so nothing will ever close it.
+                // Win32TrayImpl.close() closes the arena on the paths where an
+                // instance WAS constructed, so a second close here is a no-op
+                // the runCatching swallows.
+                runCatching { bindings.arena.close() }
+            }
+            return tray
         }
 
         private fun createInternal(bindings: Win32Bindings, builder: TrayBuilder): Tray? {

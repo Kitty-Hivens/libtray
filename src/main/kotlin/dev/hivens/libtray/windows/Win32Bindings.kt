@@ -54,6 +54,7 @@ internal class Win32Bindings private constructor(
 
         // Mouse messages forwarded by Shell_NotifyIcon as the lParam of WM_USER+1.
         const val WM_LBUTTONUP: Int = 0x0202
+        const val WM_MBUTTONUP: Int = 0x0208
         const val WM_RBUTTONUP: Int = 0x0205
         const val WM_CONTEXTMENU: Int = 0x007B
 
@@ -76,9 +77,10 @@ internal class Win32Bindings private constructor(
 
         /**
          * Symbols this binding loads. Each entry: name → (return layout or
-         * null for void, arg layouts...). The bindings cover Task #110's
-         * scope — message-only window + pump. Icon / tooltip / menu calls
-         * land in subsequent commits and should be appended here.
+         * null for void, arg layouts...). Covers the whole backend:
+         * message-only window + pump, Shell_NotifyIcon, icon construction
+         * and the popup menu. Append here, not at the call site, when
+         * reaching for a new Win32 call.
          *
          * `LRESULT`/`WPARAM`/`LPARAM`/`UINT_PTR`/`LONG_PTR` are all 64-bit
          * on x86_64 Windows — JAVA_LONG. `BOOL`/`UINT`/`int` are 32-bit —
@@ -185,7 +187,7 @@ internal class Win32Bindings private constructor(
                 listOf(ValueLayout.ADDRESS),                                // HICON
             ),
 
-            // ── user32: popup menu (Task #112) ─────────────────────────────
+            // ── user32: popup menu ─────────────────────────────────────────
             Triple("CreatePopupMenu",
                 ValueLayout.ADDRESS,                                        // HMENU
                 emptyList(),
@@ -260,7 +262,6 @@ internal class Win32Bindings private constructor(
          * delivery. Without this, Shell_NotifyIcon packs button events
          * into the lParam of WM_USER+1 in the legacy way; with it, we
          * get message ids in lParam directly + cursor position in wParam.
-         * Cleaner dispatch in Task #112.
          */
         const val NOTIFYICON_VERSION_4: Int = 4
 
