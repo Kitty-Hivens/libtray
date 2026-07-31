@@ -215,6 +215,20 @@ internal class DBusBindings internal constructor(
                 ValueLayout.JAVA_INT,
                 listOf(ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS),
             ),
+            // Bulk append for arrays of a fixed-size type -- one call for a
+            // whole `ay` instead of one per byte, which is what the icon
+            // pixmap needs (a 64x64 icon is 16384 elements, a 256x256 one
+            // 262144). Like append_basic, `value` is a pointer TO the buffer
+            // pointer: libdbus dereferences it once before marshalling.
+            Triple("dbus_message_iter_append_fixed_array",
+                ValueLayout.JAVA_INT,                          // dbus_bool_t
+                listOf(
+                    ValueLayout.ADDRESS,     // DBusMessageIter* (the open array)
+                    ValueLayout.JAVA_INT,    // int element_type
+                    ValueLayout.ADDRESS,     // const void* value -- &buffer
+                    ValueLayout.JAVA_INT,    // int n_elements
+                ),
+            ),
             Triple("dbus_message_iter_open_container",
                 ValueLayout.JAVA_INT,
                 listOf(ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS),

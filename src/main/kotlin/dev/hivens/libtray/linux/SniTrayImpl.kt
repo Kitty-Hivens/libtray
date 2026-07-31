@@ -617,18 +617,29 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_append_basic")
                 .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
 
-            // ay (byte array) — open, append each byte, close.
+            // ay (byte array) — open, bulk-append the ARGB bytes, close.
+            // append_fixed_array marshals the whole run in one downcall.
+            // Per-byte append_basic (what this used to do) cost one FFM
+            // downcall per byte: 16 KiB of downcalls for a 64x64 icon and
+            // 4.2 million for a 1024x1024 one, on every property query the
+            // host makes.
             val byteSig = call.allocateUtf8("y")
             val byteArr = call.allocate(bindings.messageIterLayout)
             openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, byteSig, byteArr)
-            // Append the ARGB bytes one by one — libdbus has a fixed-array
-            // append helper but it's not in the LOAD_SET; per-byte is
-            // slower but safe. Tray icons are 16-256px so worst case ~256KB.
-            val byteBuf = call.allocate(ValueLayout.JAVA_BYTE)
-            for (b in px.argbNetworkOrder) {
-                byteBuf.set(ValueLayout.JAVA_BYTE, 0, b)
-                bindings.handle("dbus_message_iter_append_basic")
-                    .invokeExact(byteArr, DBusBindings.DBUS_TYPE_BYTE.toInt(), byteBuf) as Int
+            if (px.argbNetworkOrder.isNotEmpty()) {
+                val bytes = call.allocate(px.argbNetworkOrder.size.toLong())
+                MemorySegment.copy(
+                    px.argbNetworkOrder, 0, bytes, ValueLayout.JAVA_BYTE, 0,
+                    px.argbNetworkOrder.size,
+                )
+                // libdbus dereferences `value` once, so hand it the address
+                // of a slot holding the buffer pointer, not the buffer.
+                val bytesPtr = call.allocate(ValueLayout.ADDRESS)
+                bytesPtr.set(ValueLayout.ADDRESS, 0, bytes)
+                bindings.handle("dbus_message_iter_append_fixed_array").invokeExact(
+                    byteArr, DBusBindings.DBUS_TYPE_BYTE.toInt(), bytesPtr,
+                    px.argbNetworkOrder.size,
+                ) as Int
             }
             closeContainer(struct, byteArr)
 
