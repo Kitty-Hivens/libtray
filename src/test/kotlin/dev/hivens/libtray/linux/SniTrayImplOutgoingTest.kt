@@ -12,28 +12,34 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
- * Sender-thread lifecycle + outgoing-queue drain coverage for the Linux
- * SNI backend (issue #2). No session bus required: [DBusBindings] is
- * replaced with a recording mock whose `handle()` returns MethodHandles
- * bound to JVM methods, and messages are enqueued as recognizable
- * zero-length segments straight into [SniTrayImpl.outgoing].
+ * I/O-thread lifecycle + outgoing-queue drain coverage for the Linux SNI
+ * backend (issue #2). No session bus required: [DBusBindings] is replaced
+ * with a recording mock whose `handle()` returns MethodHandles bound to JVM
+ * methods, and messages are enqueued as recognizable zero-length segments
+ * straight into [SniTrayImpl.outgoing].
  *
  * What this pins:
- *  - close() with nothing queued exits the sender and unrefs the
- *    connection exactly once.
- *  - the sender drains in FIFO order, flushing + unrefing each message.
+ *  - close() with nothing queued exits the loop and unrefs the connection
+ *    exactly once.
+ *  - the loop drains in FIFO order, flushing + unrefing each message.
  *  - close() mid-flush lets the in-flight send/flush/unref triplet finish
  *    and then drains the still-queued messages by unref WITHOUT sending.
  *  - concurrent emit from many threads loses nothing and keeps each
  *    thread's messages in submission order on the wire.
+ *  - a message queued during an iteration is sent before the loop blocks
+ *    in the next poll, and poll + send + flush all run on one thread.
+ *    Those last two are the reply-latency fix: libdbus holds the
+ *    connection's io path for the whole of `dbus_connection_read_write`,
+ *    so a flush from any other thread had to wait out the poll interval.
  */
-class SniTrayImplSenderTest {
+class SniTrayImplOutgoingTest {
 
     @Test
-    fun `close before any signal exits the sender and unrefs the connection once`() {
+    fun `close before any signal exits the loop and unrefs the connection once`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)
 
@@ -56,7 +62,10 @@ class SniTrayImplSenderTest {
 
         addrs.forEach { tray.outgoing.put(seg(it)) }
 
-        awaitUntil(2_000) { rec.sent.size == addrs.size } shouldBe true
+        // Wait on the unref, not the send: unref is the last of the
+        // send/flush/unref triplet, so waiting on `sent` can observe the
+        // final message mid-triplet and read a short `unrefed` below.
+        awaitUntil(2_000) { rec.unrefed.size == addrs.size } shouldBe true
         rec.sent.toList() shouldContainExactly addrs
         rec.unrefed.toList() shouldContainExactly addrs
         rec.flushes.get() shouldBe addrs.size
@@ -68,7 +77,7 @@ class SniTrayImplSenderTest {
         val rec = RecordingDbus()
         val flushEntered = CountDownLatch(1)
         val flushGate = CountDownLatch(1)
-        // Block the first (and only) flush so the sender is provably mid-
+        // Block the first (and only) flush so the loop is provably mid-
         // triplet on message 1 while 2 and 3 sit in the queue.
         rec.onFlush = {
             flushEntered.countDown()
@@ -77,7 +86,7 @@ class SniTrayImplSenderTest {
         val tray = newTray(rec)
 
         listOf(1L, 2L, 3L).forEach { tray.outgoing.put(seg(it)) }
-        flushEntered.await(2, TimeUnit.SECONDS) shouldBe true   // sender sent m1, is inside flush(m1)
+        flushEntered.await(2, TimeUnit.SECONDS) shouldBe true   // sent m1, now inside flush(m1)
 
         val closer = thread { tray.close() }
         awaitUntil(2_000) { !tray.isOpen } shouldBe true         // close() flipped open=false
@@ -119,6 +128,48 @@ class SniTrayImplSenderTest {
         tray.close()
     }
 
+    /**
+     * The reply-latency regression pin. A message queued while the loop sits
+     * in a poll -- which is what answering an incoming method call amounts
+     * to -- must go out before the loop enters the *next* poll, not after
+     * it. Asserting on the operation log rather than on elapsed time keeps
+     * this independent of the poll timeout's actual value.
+     */
+    @Test
+    fun `a message queued during a poll is sent before the next poll`() {
+        val rec = RecordingDbus()
+        val trayRef = AtomicReference<SniTrayImpl>()
+        val constructed = CountDownLatch(1)
+        val polls = AtomicInteger(0)
+        rec.onReadWrite = {
+            // Wait for the constructor to return so trayRef is populated --
+            // the loop starts from SniTrayImpl's init block and can reach
+            // this hook first. Only the first poll queues, so the log holds
+            // one unambiguous send.
+            constructed.await()
+            if (polls.incrementAndGet() == 1) trayRef.get().outgoing.put(seg(1))
+        }
+        val tray = newTray(rec)
+        trayRef.set(tray)
+        constructed.countDown()
+
+        awaitUntil(2_000) { rec.events.contains("send:1") } shouldBe true
+        rec.events.toList().take(4) shouldContainExactly listOf("poll", "send:1", "flush", "poll")
+        tray.close()
+    }
+
+    @Test
+    fun `polling, sending and flushing all happen on the single I O thread`() {
+        val rec = RecordingDbus()
+        val tray = newTray(rec)
+
+        (1L..3L).forEach { tray.outgoing.put(seg(it)) }
+        awaitUntil(2_000) { rec.sent.size == 3 } shouldBe true
+
+        rec.ioThreads.toSet() shouldBe setOf("libtray-sni-${ProcessHandle.current().pid()}")
+        tray.close()
+    }
+
     // ── harness ──────────────────────────────────────────────────────────
 
     private fun newTray(rec: RecordingDbus): SniTrayImpl =
@@ -128,13 +179,13 @@ class SniTrayImplSenderTest {
             "test-item",
             // Non-empty (TrayBuilder requires it) but not a real PNG --
             // pngToPixmaps just returns an empty pixmap list on decode
-            // failure, and the sender path never touches the icon anyway.
+            // failure, and the outgoing path never touches the icon anyway.
             TrayBuilder(title = "Test", iconBytes = byteArrayOf(1)),
         )
 
     /**
      * A [DBusBindings] whose `handle()` map is the recording mock. Only the
-     * symbols the pump + sender + close touch are bound; the call-site
+     * symbols the I/O loop + close touch are bound; the call-site
      * MethodTypes must match the libdbus descriptors exactly, since
      * `invokeExact` is strict.
      */
@@ -167,26 +218,42 @@ class SniTrayImplSenderTest {
         val connUnrefs = AtomicInteger(0)
         val connCloses = AtomicInteger(0)
 
+        /** Ordered log of the socket-facing calls, for the latency pin. */
+        val events = ConcurrentLinkedQueue<String>()
+
+        /** Names of the threads that made those calls. */
+        val ioThreads = ConcurrentLinkedQueue<String>()
+
         /** Records "close"/"unref" so the test can pin their relative order. */
         val connLifecycle = ConcurrentLinkedQueue<String>()
 
         /** Optional hook run at the start of each flush (mid-flush gating). */
         @Volatile var onFlush: (() -> Unit)? = null
 
+        /** Optional hook run inside each poll, standing in for an arriving call. */
+        @Volatile var onReadWrite: (() -> Unit)? = null
+
         // Real dbus_connection_read_write blocks up to timeoutMs; sleep a
-        // little so the pump loop doesn't busy-spin during the test.
+        // little so the loop doesn't busy-spin during the test.
         fun readWrite(connection: MemorySegment, timeoutMs: Int): Int {
-            Thread.sleep(20); return 1
+            record("poll")
+            onReadWrite?.invoke()
+            Thread.sleep(20)
+            return 1
         }
 
         fun popMessage(connection: MemorySegment): MemorySegment = MemorySegment.NULL
 
         fun send(connection: MemorySegment, msg: MemorySegment, serial: MemorySegment): Int {
-            sent.add(msg.address()); return 1
+            record("send:${msg.address()}")
+            sent.add(msg.address())
+            return 1
         }
 
         fun flush(connection: MemorySegment) {
-            onFlush?.invoke(); flushes.incrementAndGet()
+            record("flush")
+            onFlush?.invoke()
+            flushes.incrementAndGet()
         }
 
         fun unref(msg: MemorySegment) {
@@ -199,6 +266,11 @@ class SniTrayImplSenderTest {
 
         fun connUnref(connection: MemorySegment) {
             connUnrefs.incrementAndGet(); connLifecycle.add("unref")
+        }
+
+        private fun record(event: String) {
+            events.add(event)
+            ioThreads.add(Thread.currentThread().name)
         }
     }
 

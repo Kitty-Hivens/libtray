@@ -9,9 +9,9 @@ import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
+import java.lang.invoke.MethodHandle
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.imageio.ImageIO
@@ -50,12 +50,20 @@ import javax.imageio.ImageIO
  * `Linker.upcallStub` to give libdbus a callable C function pointer
  * — significantly more complex).
  *
- * Menu: this commit ships click-only. The right-click `ContextMenu`
- * method fires a [TrayEvent.MenuRequested] event so the host app can
- * show its own popup (Compose / Swing / JavaFX). The full DBusMenu
- * (`com.canonical.dbusmenu`) protocol implementation that lets the
- * desktop's own menu UI render the [TrayMenu] is a follow-up commit.
- * `Menu` property reports "/" (no DBusMenu) until then.
+ * That one thread owns the connection outright: each iteration sends
+ * whatever the public API and the previous iteration's replies left in
+ * [outgoing], then polls the socket, then dispatches what arrived. No
+ * other thread touches libdbus, which is what keeps reply latency at
+ * the bare bus round-trip — see [outgoing] for why a second sender
+ * thread cannot.
+ *
+ * Menu: the full DBusMenu (`com.canonical.dbusmenu`) protocol is served
+ * from `/MenuBar`, so the desktop's own menu UI renders the [TrayMenu] —
+ * see [handleMenuGetLayout] and [DBusMenuLayout] for the int-id mapping.
+ * The `Menu` property always advertises `/MenuBar`, even with no menu
+ * set. Right-click additionally fires [TrayEvent.MenuRequested] for hosts
+ * that want to know; it is informational, the host has already opened the
+ * menu by then.
  */
 internal class SniTrayImpl internal constructor(
     private val bindings: DBusBindings,
@@ -102,47 +110,54 @@ internal class SniTrayImpl internal constructor(
 
     private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
 
-    /** Background dispatch thread — pulls messages, hands to [dispatchOne]. */
-    private val pumpThread = Thread({ pumpLoop() }, "libtray-sni-${ProcessHandle.current().pid()}").apply {
+    /** The single D-Bus I/O thread — sends [outgoing], polls, dispatches. */
+    private val ioThread = Thread({ dispatchLoop() }, "libtray-sni-${ProcessHandle.current().pid()}").apply {
         isDaemon = true
     }
 
     /**
      * Outgoing D-Bus messages awaiting send. Public API methods (setTooltip,
-     * setMenu, setIcon, replyEmpty etc.) enqueue here and return immediately;
-     * the [senderThread] picks each one up, calls `dbus_connection_send` +
-     * flush + unref, and moves on.
+     * setMenu, setIcon) and the replies built in [dispatchOne] enqueue here
+     * and return immediately; the I/O thread picks each one up at the top of
+     * its next iteration and calls `dbus_connection_send` + flush + unref.
      *
-     * Pre-fix: every public call did send + flush + unref synchronously on
-     * the caller thread. `dbus_connection_flush` blocks until the message
-     * actually leaves on the wire, which on a busy session bus can take
-     * up to several hundred ms per call. UI consumers (Compose Desktop,
-     * Swing) call this from the EDT — so during a state-change burst
-     * (e.g. a "launch starting" tray-status update emits two signals back
-     * to back) the EDT could stall for 1-2 s, producing a fully-frozen
-     * application window. Captured in the field via Nexira's puppet diag
-     * snapshot on 2026-05-18: `AWT-EventQueue-0` `RUNNABLE inNative=true`
-     * deep in `DowncallStub.invoke` -> `sendAndUnref`.
+     * Two problems shaped this, in order.
+     *
+     * First, every public call did send + flush + unref synchronously on the
+     * caller thread. `dbus_connection_flush` blocks until the message
+     * actually leaves on the wire, which on a busy session bus can take up
+     * to several hundred ms per call. UI consumers (Compose Desktop, Swing)
+     * call this from the EDT — so during a state-change burst (e.g. a
+     * "launch starting" tray-status update emits two signals back to back)
+     * the EDT could stall for 1-2 s, producing a fully-frozen application
+     * window. Captured in the field as `AWT-EventQueue-0` `RUNNABLE
+     * inNative=true` deep in `DowncallStub.invoke` -> `sendAndUnref`.
+     *
+     * Second, the queue's first form drained on a *separate* sender thread,
+     * which traded the freeze for host-visible latency. libdbus serialises
+     * all socket work behind a per-connection io-path lock, and
+     * `dbus_connection_read_write` holds that lock for the entire duration
+     * of its blocking poll — with no way to interrupt it early. A flush
+     * issued from any other thread therefore waited out the poll, so every
+     * reply to the tray host was delayed by up to the poll timeout: a
+     * right-click costs the host an AboutToShow plus a GetLayout, which
+     * meant roughly two seconds before the menu appeared. Draining from the
+     * polling thread itself, between iterations, removes the contention
+     * rather than shortening the wait.
      *
      * Unbounded by design. The realistic upper bound on queue depth is
      * tens of messages (setMenu fans out into a single LayoutUpdated;
      * setTooltip fans out into two; setIcon into one). A misbehaving
      * caller hammering setMenu() in a tight loop would still bottleneck
-     * on the sender thread's flush rate, not on memory.
+     * on the I/O thread's flush rate, not on memory.
      */
-    // internal (not private) so the sender-thread tests can enqueue
+    // internal (not private) so the I/O-thread tests can enqueue
     // recognizable segments directly and assert drain / ordering without
-    // a live session bus. See SniTrayImplSenderTest.
+    // a live session bus. See SniTrayImplOutgoingTest.
     internal val outgoing = LinkedBlockingQueue<MemorySegment>()
 
-    /** Sender thread — drains [outgoing], performs the blocking flush there instead of on the caller. */
-    private val senderThread = Thread({ senderLoop() }, "libtray-sni-sender-${ProcessHandle.current().pid()}").apply {
-        isDaemon = true
-    }
-
     init {
-        pumpThread.start()
-        senderThread.start()
+        ioThread.start()
     }
 
     override val isOpen: Boolean get() = open.get()
@@ -185,16 +200,15 @@ internal class SniTrayImpl internal constructor(
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
-        // pumpLoop + senderLoop both check open.get() and exit within
-        // their next poll (~1s). Don't hard-interrupt — that could
-        // leave the connection in a weird half-closed state with the
-        // watcher still expecting our service, AND in the sender's
-        // case could lose half-built outgoing messages mid-FFM call.
-        senderThread.join(2_000)
-        pumpThread.join(2_000)
-        // Final drain: the pump thread (joined second) can enqueue a reply
-        // after the sender did its last drain, so unref anything still in
-        // `outgoing` rather than leak the libdbus message.
+        // dispatchLoop checks open.get() and exits within its next poll
+        // (~POLL_TIMEOUT_MS). Don't hard-interrupt — that could leave the
+        // connection in a weird half-closed state with the watcher still
+        // expecting our service, and could abandon a half-built outgoing
+        // message mid-FFM call.
+        ioThread.join(2_000)
+        // Final drain: a caller racing close() can enqueue after the loop
+        // did its own last drain, so unref anything still in `outgoing`
+        // rather than leak the libdbus message.
         val unref = bindings.handle("dbus_message_unref")
         while (true) {
             val leftover = outgoing.poll() ?: break
@@ -217,15 +231,31 @@ internal class SniTrayImpl internal constructor(
         runCatching { bindings.arena.close() }
     }
 
-    // ── Background dispatch loop ─────────────────────────────────────────
+    // ── D-Bus I/O loop ───────────────────────────────────────────────────
 
-    private fun pumpLoop() {
+    /**
+     * The whole D-Bus I/O loop, on one thread. Order within an iteration
+     * matters: [drainOutgoing] runs *first*, so a reply that [dispatchOne]
+     * queued at the end of the previous iteration goes out before this
+     * thread commits to another blocking poll. Reply latency is then the
+     * bus round-trip, not the poll interval.
+     *
+     * Consequences of owning both directions here: a [TrayEvent] handler
+     * that blocks (they are invoked from [fire], on this thread) now also
+     * holds up outgoing signals, and a flush against a wedged socket stalls
+     * incoming dispatch. Both are bounded by the same libdbus lock either
+     * way — a second thread could only queue behind it.
+     */
+    private fun dispatchLoop() {
         val popMessage = bindings.handle("dbus_connection_pop_message")
         val readWrite  = bindings.handle("dbus_connection_read_write")
+        val send       = bindings.handle("dbus_connection_send")
+        val flush      = bindings.handle("dbus_connection_flush")
         val unref      = bindings.handle("dbus_message_unref")
         while (open.get()) {
             try {
-                val live = readWrite.invokeExact(connection, 1_000) as Int  // 1s blocking poll
+                drainOutgoing(send, flush, unref)
+                val live = readWrite.invokeExact(connection, POLL_TIMEOUT_MS) as Int
                 if (live == 0) {
                     // FALSE == the connection disconnected (session bus gone).
                     // With exit_on_disconnect off it no longer _exit()s us, but
@@ -246,10 +276,45 @@ internal class SniTrayImpl internal constructor(
                     }
                 }
             } catch (t: Throwable) {
-                log.warn("D-Bus pump iteration threw: {}", t.message)
+                log.warn("D-Bus I/O iteration threw: {}", t.message)
                 // Sleep briefly so a permanently-broken bus doesn't
                 // burn CPU at 100% logging.
                 Thread.sleep(500)
+            }
+        }
+        // Final drain: anything queued between the last drain and the
+        // open=false transition. We unref without sending so libdbus's
+        // outgoing queue doesn't hold our refs past connection_unref —
+        // the host was already told we're going away, so racing one last
+        // NewTitle out the door has no value.
+        while (true) {
+            val msg = outgoing.poll() ?: break
+            runCatching { unref.invokeExact(msg) as Unit }
+        }
+    }
+
+    /**
+     * Send + flush + unref every queued message. Runs on the I/O thread, so
+     * the flush contends with nothing: it is a socket write, not a wait for
+     * some other thread to release the connection's io path.
+     *
+     * Stops as soon as [open] flips so a concurrent [close] doesn't have to
+     * wait out a long queue; whatever is left is unrefed unsent by the
+     * final drain in [dispatchLoop].
+     */
+    private fun drainOutgoing(send: MethodHandle, flush: MethodHandle, unref: MethodHandle) {
+        while (open.get()) {
+            val msg = outgoing.poll() ?: break
+            try {
+                Arena.ofConfined().use { call ->
+                    val serial = call.allocate(ValueLayout.JAVA_INT)
+                    send.invokeExact(connection, msg, serial) as Int
+                    flush.invokeExact(connection) as Unit
+                }
+            } catch (t: Throwable) {
+                log.warn("send/flush failed, dropping message: {}", t.message)
+            } finally {
+                runCatching { unref.invokeExact(msg) as Unit }
             }
         }
     }
@@ -870,7 +935,7 @@ internal class SniTrayImpl internal constructor(
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    private fun readMessageString(handle: java.lang.invoke.MethodHandle, msg: MemorySegment): String? {
+    private fun readMessageString(handle: MethodHandle, msg: MemorySegment): String? {
         val ptr = handle.invokeExact(msg) as MemorySegment
         return if (ptr.address() == 0L) null else ptr.reinterpret(Long.MAX_VALUE).getString(0)
     }
@@ -943,10 +1008,10 @@ internal class SniTrayImpl internal constructor(
     }
 
     /**
-     * Queue an outgoing message for the [senderThread] to send + flush +
-     * unref. Returns immediately; the actual blocking native work happens
-     * off the caller thread. See [outgoing]'s KDoc for the EDT-freeze
-     * incident that drove this off-thread refactor.
+     * Queue an outgoing message for the I/O thread to send + flush + unref.
+     * Returns immediately; the actual blocking native work happens off the
+     * caller thread. See [outgoing]'s KDoc for the EDT-freeze incident that
+     * drove this off-thread refactor.
      *
      * Null/zero-address segments are dropped silently — the prior
      * synchronous version would have crashed in `dbus_connection_send`;
@@ -955,7 +1020,7 @@ internal class SniTrayImpl internal constructor(
     private fun sendAndUnref(reply: MemorySegment) {
         if (reply.address() == 0L) return
         if (!open.get()) {
-            // Already closing: don't enqueue (sender may have exited).
+            // Already closing: don't enqueue (the I/O thread may have exited).
             // Drop the ref directly so libdbus's internal refcount goes
             // to zero and the message memory is reclaimed.
             runCatching { bindings.handle("dbus_message_unref").invokeExact(reply) as Unit }
@@ -964,48 +1029,6 @@ internal class SniTrayImpl internal constructor(
         // LinkedBlockingQueue#offer with no capacity bound always succeeds.
         // Defensive `else` would be dead code; rely on the contract.
         outgoing.put(reply)
-    }
-
-    /**
-     * Drains [outgoing] in a loop, calling `dbus_connection_send` + flush
-     * + unref for each queued message. This is the thread that takes the
-     * D-Bus flush latency hit so the EDT doesn't have to.
-     *
-     * Lives until [open] flips to false. On shutdown, drains any
-     * still-queued messages without sending them (their refcount is
-     * dropped so native memory isn't leaked) — the host has already been
-     * told via the previous Status/Closing dance that we're going away,
-     * so racing one last NewTitle out the door has no value.
-     */
-    private fun senderLoop() {
-        val send  = bindings.handle("dbus_connection_send")
-        val flush = bindings.handle("dbus_connection_flush")
-        val unref = bindings.handle("dbus_message_unref")
-        while (open.get()) {
-            val msg = try {
-                outgoing.poll(1, TimeUnit.SECONDS) ?: continue
-            } catch (_: InterruptedException) {
-                continue
-            }
-            try {
-                Arena.ofConfined().use { call ->
-                    val serial = call.allocate(ValueLayout.JAVA_INT)
-                    send.invokeExact(connection, msg, serial) as Int
-                    flush.invokeExact(connection) as Unit
-                }
-            } catch (t: Throwable) {
-                log.warn("sender: send/flush failed, dropping message: {}", t.message)
-            } finally {
-                runCatching { unref.invokeExact(msg) as Unit }
-            }
-        }
-        // Final drain: anything queued between the last poll() and the
-        // open=false transition. We unref without sending so libdbus's
-        // outgoing queue doesn't hold our refs past connection_unref.
-        while (true) {
-            val msg = outgoing.poll() ?: break
-            runCatching { unref.invokeExact(msg) as Unit }
-        }
     }
 
     private data class Pixmap(val width: Int, val height: Int, val argbNetworkOrder: ByteArray)
@@ -1045,6 +1068,16 @@ internal class SniTrayImpl internal constructor(
 
         private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
         private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
+
+        /**
+         * How long `dbus_connection_read_write` blocks per iteration. It
+         * bounds two things: how long a state change pushed from the caller
+         * (setTooltip / setIcon / setMenu) waits before its signal is sent,
+         * and how long close() waits for the I/O thread to notice. Replies
+         * to the tray host are not bounded by it — those are queued during
+         * dispatch and sent at the top of the very next iteration.
+         */
+        private const val POLL_TIMEOUT_MS: Int = 100
 
         /**
          * Release a DBusError. `dbus_error_free` is safe whether or not the
