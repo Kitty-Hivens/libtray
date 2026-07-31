@@ -2,6 +2,7 @@ package dev.hivens.libtray
 
 import org.slf4j.Logger
 import java.awt.Image
+import java.awt.RenderingHints
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -67,7 +68,20 @@ internal object IconScaling {
             val out = BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB)
             val g = out.createGraphics()
             try {
-                g.drawImage(scaled, 0, 0, null)
+                // getScaledInstance hands back an Image that is produced
+                // asynchronously, and drawImage with a null observer draws
+                // only what happens to be ready. It returns false when that
+                // was not everything -- in which case redo the reduction
+                // straight from the BufferedImage, which is synchronous.
+                // Bilinear is the weaker filter, but a slightly soft icon
+                // beats a blank one.
+                if (!g.drawImage(scaled, 0, 0, null)) {
+                    g.setRenderingHint(
+                        RenderingHints.KEY_INTERPOLATION,
+                        RenderingHints.VALUE_INTERPOLATION_BILINEAR,
+                    )
+                    g.drawImage(image, 0, 0, targetWidth, targetHeight, null)
+                }
             } finally {
                 g.dispose()
             }

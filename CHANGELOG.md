@@ -19,6 +19,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `Properties.GetAll` answers in 40-46 ms instead of 744-1816 ms.
 
 ### Changed
+- **Binary-incompatible:** `TrayBuilder` gained a fifth property, so its
+  constructor and generated `copy` changed shape. Kotlin code recompiled
+  against 0.1.3 is unaffected, but a jar compiled against 0.1.2 that
+  relies on the default arguments hits `NoSuchMethodError`, and Java
+  callers of the four-argument constructor stop compiling. Recompile
+  downstream consumers. (Pre-1.0: the API can still shift.)
 - `TrayEvent` documents per-backend coverage instead of promising that
   every backend fires at least `Activated`. It does not: macOS routes the
   primary button into the `NSStatusItem` menu and libtray installs no
@@ -70,10 +76,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   overwrite `setEnabled:NO` for every item whose action the menu target
   implements -- so disabled entries rendered as normal clickable ones,
   unlike on Linux and Windows.
-- macOS: an AppKit call marshalled onto the main queue re-checks the
-  open flag before running. `close()` tears down synchronously on the
-  caller thread and releases the `NSStatusItem`, so an action enqueued
-  just before it could message a deallocated object.
+- macOS: an AppKit call marshalled onto the main queue re-checks the open
+  flag before running, so a queued `setIcon` / `setMenu` that has not
+  started by the time `close()` releases the `NSStatusItem` no longer
+  messages a deallocated object. It does not close the window entirely:
+  `close()` still runs on the caller's thread, so an action already
+  executing when it lands can still race. Calling `close()` from the same
+  thread that drives the tray avoids that.
 - macOS: the Objective-C class and selector caches are concurrent maps.
   `close()` resolves both from the caller's thread while queued actions
   resolve them on the main queue; two threads growing a plain `HashMap`
@@ -90,7 +99,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   half-built instance pushed two stray window messages into whatever
   thread called `close()` -- the EDT, for a UI consumer.
 - Windows: the bindings arena is released when `create()` fails, matching
-  the Linux fix above.
+  the Linux fix above. The pre-instance `DefWindowProcW` used by the
+  WndProc fallback is bound onto the process-lifetime arena rather than a
+  per-Tray one, so a failed or closed instance cannot leave it pointing
+  into freed memory -- which would have made a later `Tray.create` return
+  a window that was never created.
+- Windows: the message pump backs off after a failed iteration instead of
+  spinning. A permanently-failing `PeekMessageW` -- against a closed
+  arena, say -- pinned a core for the life of the process.
+- Linux: `close()` leaves the D-Bus connection allocated instead of
+  freeing it when the I/O thread has not stopped in time, and the
+  watcher re-registration's reply timeout is bounded below that budget.
+  Freeing the connection while the thread is still inside a libdbus call
+  -- reachable through a blocking `onEvent` handler, or a tray host
+  restarting during shutdown -- crashed in libdbus rather than in
+  anything a consumer could see.
 
 ## [0.1.2]
 

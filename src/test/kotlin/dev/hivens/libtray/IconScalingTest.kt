@@ -55,6 +55,20 @@ class IconScalingTest {
     }
 
     @Test
+    fun `the scaled icon still carries the picture`() {
+        // Dimensions alone would also pass for a fully blank result, which
+        // is the failure mode of drawing an asynchronously-produced Image:
+        // getScaledInstance does not block, so a null-observer drawImage can
+        // legitimately paint nothing. Assert on pixels instead.
+        val img = ImageIO.read(ByteArrayInputStream(IconScaling.fit(png(1024, 1024), 64, log)))
+
+        val centre = img.getRGB(32, 32)
+        (centre ushr 24 and 0xFF) shouldBe 0xFF          // opaque inside the circle
+        (centre and 0xFFFFFF) shouldBe 0xBB86FC          // and the colour we drew
+        (img.getRGB(0, 0) ushr 24 and 0xFF) shouldBe 0   // transparent outside it
+    }
+
+    @Test
     fun `a non-square icon keeps its aspect ratio`() {
         // The long edge sets the bound; the short one follows, and neither
         // may exceed the limit or the Win32 backend would still reject it.

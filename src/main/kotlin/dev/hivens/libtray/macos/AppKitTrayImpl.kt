@@ -308,12 +308,6 @@ internal class AppKitTrayImpl private constructor(
     }
 
     /**
-     * Recursively append [items] into [parentMenu] (NSMenu*). Standard
-     * items get a fresh tag mapped to their libtray id; submenus build
-     * a child NSMenu attached via setSubmenu:. Separators use
-     * `[NSMenuItem separatorItem]`.
-     */
-    /**
      * `[menu setAutoenablesItems:NO]`.
      *
      * NSMenu defaults this to YES, which makes AppKit recompute every
@@ -334,6 +328,12 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
+    /**
+     * Recursively append [items] into [parentMenu] (NSMenu*). Standard
+     * items get a fresh tag mapped to their libtray id; submenus build
+     * a child NSMenu attached via setSubmenu:. Separators use
+     * `[NSMenuItem separatorItem]`.
+     */
     private fun appendItems(parentMenu: MemorySegment, items: List<TrayMenuItem>) {
         val nsMenuItemCls = bindings.cls("NSMenuItem")
         val onSelector = bindings.sel("onMenuItem:")
