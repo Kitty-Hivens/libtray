@@ -25,8 +25,9 @@ import javax.imageio.ImageIO
  *   3. Hover the icon. Tooltip should read "libtray smoke test".
  *   4. Left-click the icon. Stdout should print
  *      `[smoke] event: Activated (left click)`.
- *   5. Right-click the icon. A two-item menu should appear:
- *      "Click me (noop)" + "Exit", separated by a horizontal line.
+ *   5. Right-click the icon (LEFT-click on macOS, where NSStatusItem
+ *      opens its menu on the primary button). A two-item menu should
+ *      appear: "Click me (noop)" + "Exit", separated by a horizontal line.
  *   6. Click "Click me (noop)". Stdout should print
  *      `[smoke] event: MenuItemSelected id=noop`.
  *   7. Right-click again, click "Exit". Stdout should print
@@ -77,7 +78,9 @@ fun main() {
                 "here means a Panama upcall stub or RegisterClassExW failed — check the JVM has " +
                 "--enable-native-access=ALL-UNNAMED and is JDK 22+)."
             os.contains("mac") || os.contains("darwin") ->
-                "macOS: NSStatusItem backend not yet implemented (Phase 4)."
+                "macOS: the status item must be created on the Cocoa main thread (OS thread 0). " +
+                "`./gradlew runSmoke` already passes -XstartOnFirstThread; null here usually means " +
+                "AppKit / libobjc did not load, or Tray.create ran off the main thread."
             else -> "Unrecognised OS: $os. libtray supports Linux, Windows, macOS."
         }
         System.err.println("Tray.create returned null. $hint")
@@ -92,7 +95,7 @@ fun main() {
         when (event) {
             is TrayEvent.Activated         -> println("[smoke] event: Activated (left click)")
             is TrayEvent.MiddleActivated   -> println("[smoke] event: MiddleActivated")
-            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested (right click — host should show DBusMenu, not implemented yet)")
+            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested (right click — the host renders the menu itself)")
             is TrayEvent.MenuItemSelected  -> {
                 println("[smoke] event: MenuItemSelected id=${event.id}")
                 if (event.id == "exit") exitFlag.countDown()

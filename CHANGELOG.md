@@ -5,6 +5,93 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.1.3]
+
+### Added
+- `TrayBuilder.maxIconSize`: icons longer than this on either edge are
+  scaled to fit (aspect ratio preserved, re-encoded as PNG, logged at
+  WARN with the before/after sizes) before any backend sees them, on the
+  initial icon and on every `setIcon`. Defaults to 256, which is the
+  largest size the Win32 backend accepts and past which no tray host
+  renders more detail. Set it to null to send the original bytes. A
+  1024x1024 icon on Linux was 4 MiB re-marshalled into the `IconPixmap`
+  property on every host query; scaled, that is 256 KiB and
+  `Properties.GetAll` answers in 40-46 ms instead of 744-1816 ms.
+
+### Changed
+- `TrayEvent` documents per-backend coverage instead of promising that
+  every backend fires at least `Activated`. It does not: macOS routes the
+  primary button into the `NSStatusItem` menu and libtray installs no
+  target-action on the status button, so no click reaches the consumer
+  there. `MenuRequested` is Linux-only, and its description no longer
+  claims it can be used to rebuild a menu lazily -- the host renders from
+  the layout it already fetched, so the event arrives alongside the menu,
+  not before it. `MenuItemSelected` is the only event all three deliver.
+- Linux: clicking a submenu parent no longer fires `MenuItemSelected`.
+  Windows returns the submenu rather than a command from
+  `TrackPopupMenu`, and an AppKit submenu parent carries no action, so
+  the event only ever existed on Linux.
+
+### Fixed
+- Linux: replies to the tray host went out up to a full second late. The
+  backend drained its outgoing queue on a thread separate from the one
+  polling the socket, but libdbus serialises all socket work behind a
+  per-connection io-path lock that `dbus_connection_read_write` holds for
+  the whole of its blocking poll. Every `dbus_connection_flush` from the
+  sender thread therefore waited that poll out, so a property query took
+  ~1 s to answer and a right-click -- which costs the host an
+  `AboutToShow` plus a `GetLayout` -- took ~2 s to open the menu. Polling
+  and sending now share one thread that drains the queue between poll
+  iterations; measured against an isolated session bus, `GetLayout` and
+  `Properties.GetAll` drop from 1003-1017 ms to the 2-16 ms bus
+  round-trip. State changes pushed by the caller (`setTooltip`,
+  `setIcon`, `setMenu`) are sent within the poll interval, now 100 ms.
+- Linux: the `IconPixmap` property is marshalled with
+  `dbus_message_iter_append_fixed_array` instead of one
+  `append_basic` per byte. The old path cost one FFM downcall per
+  channel byte -- 16 thousand for a 64x64 icon, 4.2 million for a
+  1024x1024 one -- on every property query the host makes. A 1024x1024
+  icon's `Properties.GetAll` drops from 744-1816 ms to 549-594 ms; the
+  remainder is the 4 MiB itself crossing the bus, which is a reason to
+  hand the tray a small icon rather than a full-resolution one.
+- Linux: `Event(id, "clicked")` for a separator or a disabled entry no
+  longer reaches the consumer. Node ids are public over the bus and a
+  host can send any of them, and neither shape is selectable on Windows
+  or macOS. A separator previously arrived as `MenuItemSelected("---")`.
+- Linux: the `DBusError` used for the `NameOwnerChanged` match rule is
+  freed, and the bindings arena is released when `create()` fails after
+  loading libdbus (no session bus, or the well-known name is refused) --
+  each failed attempt previously leaked the library lookup plus a
+  downcall handle per bound symbol. The connection is also closed, not
+  just unrefed, on the name-request failure path.
+- macOS: `TrayMenuItem.enabled = false` now actually greys the item out.
+  `NSMenu.autoenablesItems` defaults to YES, which makes AppKit
+  recompute enablement from the responder chain at display time and
+  overwrite `setEnabled:NO` for every item whose action the menu target
+  implements -- so disabled entries rendered as normal clickable ones,
+  unlike on Linux and Windows.
+- macOS: an AppKit call marshalled onto the main queue re-checks the
+  open flag before running. `close()` tears down synchronously on the
+  caller thread and releases the `NSStatusItem`, so an action enqueued
+  just before it could message a deallocated object.
+- macOS: the Objective-C class and selector caches are concurrent maps.
+  `close()` resolves both from the caller's thread while queued actions
+  resolve them on the main queue; two threads growing a plain `HashMap`
+  can drop entries or spin inside a resize.
+- macOS: the per-call `applyIcon` diagnostics log at debug rather than
+  info -- a consumer animating the tray glyph got three info lines per
+  frame.
+- Windows: middle-click fires `TrayEvent.MiddleActivated`, which the
+  event's own documentation already promised. `WM_MBUTTONUP` was never
+  routed.
+- Windows: `close()` no longer posts `WM_CANCELMODE` / `WM_CLOSE` when
+  the message-only window was never created. `PostMessageW` with a NULL
+  `hWnd` posts to the *calling* thread's queue, so tearing down a
+  half-built instance pushed two stray window messages into whatever
+  thread called `close()` -- the EDT, for a UI consumer.
+- Windows: the bindings arena is released when `create()` fails, matching
+  the Linux fix above.
+
 ## [0.1.2]
 
 ### Fixed
@@ -121,8 +208,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`Standard` / `Submenu` / `Separator`).
 - `Tray.create(builder)` factory that detects the host OS and dispatches
   to the matching backend; returns null when no backend is available
-  rather than throwing, mirroring the `IKeyringStorage` pattern from
-  Aura — degrade gracefully so callers can fall back to a no-tray UX.
+  rather than throwing, so callers degrade gracefully to a no-tray UX
+  instead of guarding every construction with a try/catch.
 - Linux backend: StatusNotifierItem over D-Bus
   (`org.kde.StatusNotifierItem`) + DBusMenu (`com.canonical.dbusmenu`)
   for the right-click menu. Pure Panama bindings to libdbus; no GTK,

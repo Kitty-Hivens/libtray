@@ -47,6 +47,17 @@ read end-to-end in one sitting.
 
 Each backend lives in its own package so consumers can audit / patch the
 one that affects them without grokking the others.
+
+Event coverage is not uniform, because how much of the interaction the
+platform keeps to itself differs. `MenuItemSelected` is the only event
+all three deliver — put anything essential in the menu:
+
+| Event | Linux | Windows | macOS |
+|---|---|---|---|
+| `MenuItemSelected` | yes | yes | yes |
+| `Activated` (primary click) | yes | yes | no — the primary button opens the `NSStatusItem` menu |
+| `MiddleActivated` | yes | yes | no |
+| `MenuRequested` | yes | no | no |
 </details>
 
 <details>
@@ -56,7 +67,7 @@ Available on Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("dev.hivens:libtray:0.1.0")
+    implementation("dev.hivens:libtray:0.1.3")
 }
 ```
 
