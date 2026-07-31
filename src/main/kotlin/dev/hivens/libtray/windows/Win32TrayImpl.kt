@@ -1,5 +1,6 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -145,7 +146,7 @@ internal class Win32TrayImpl private constructor(
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        val newIcon = pngToHicon(iconBytes) ?: run {
+        val newIcon = pngToHicon(IconScaling.fit(iconBytes, initial.maxIconSize, log)) ?: run {
             log.warn("PNG → HICON conversion returned null; setIcon ignored")
             return false
         }
@@ -374,7 +375,7 @@ internal class Win32TrayImpl private constructor(
         HWND_INSTANCES[createdHwnd.address()] = this
         log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
 
-        val initialIcon = pngToHicon(initial.iconBytes)
+        val initialIcon = pngToHicon(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
         if (initialIcon == null) {
             log.warn("PNG → HICON conversion returned null; tray entry will register without an icon")
         } else {

@@ -1,5 +1,6 @@
 package dev.hivens.libtray.linux
 
+import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -99,8 +100,11 @@ internal class SniTrayImpl internal constructor(
     /** Returns the Title currently shown to hosts: tooltip override if any, else appTitle. */
     private fun currentTitle(): String = tooltip.ifBlank { appTitle }
 
-    @Volatile private var iconBytes: ByteArray = initial.iconBytes
-    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(initial.iconBytes)
+    /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
+    private val maxIconSize: Int? = initial.maxIconSize
+
+    @Volatile private var iconBytes: ByteArray = IconScaling.fit(initial.iconBytes, maxIconSize, log)
+    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(iconBytes)
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     @Volatile private var menu: TrayMenu? = initial.menu
     @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let(::DBusMenuLayout)
@@ -178,8 +182,9 @@ internal class SniTrayImpl internal constructor(
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        this.iconBytes = iconBytes
-        this.iconPixmap = pngToPixmaps(iconBytes)
+        val fitted = IconScaling.fit(iconBytes, maxIconSize, log)
+        this.iconBytes = fitted
+        this.iconPixmap = pngToPixmaps(fitted)
         emitSignal("NewIcon")
         return true
     }

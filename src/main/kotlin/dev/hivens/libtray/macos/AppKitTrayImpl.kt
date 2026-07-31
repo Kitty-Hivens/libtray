@@ -1,5 +1,6 @@
 package dev.hivens.libtray.macos
 
+import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -76,6 +77,9 @@ internal class AppKitTrayImpl private constructor(
 
     /** Currently-installed NSMenu* (retained), or NULL when no menu set. */
     @Volatile private var currentMenu: MemorySegment = MemorySegment.NULL
+
+    /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
+    private val maxIconSize: Int? = initial.maxIconSize
 
     init {
         INSTANCE_REGISTRY[instanceId] = this
@@ -170,7 +174,11 @@ internal class AppKitTrayImpl private constructor(
      * PNG is universally supported. Released to autorelease pool —
      * the button retains the image when set.
      */
-    private fun applyIcon(pngBytes: ByteArray) {
+    private fun applyIcon(rawPngBytes: ByteArray) {
+        // Scale on the calling thread, before the marshal: it is pure JVM
+        // image work with no AppKit involvement, and doing it here keeps
+        // the main queue free of a full-resolution decode + re-encode.
+        val pngBytes = IconScaling.fit(rawPngBytes, maxIconSize, log)
         runOnMainQueue {
             autoreleasepool {
                 val nsData = bindings.nsData(pngBytes)
