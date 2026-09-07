@@ -1,7 +1,7 @@
 [versions]
 # Pinned so Panama bindings stay binary-compatible across the projects
 # that share them. Bump deliberately, not on every Kotlin release.
-kotlin = "2.3.21"
+kotlin = "2.4.10"
 slf4j  = "2.0.16"
 
 # Java 22 is the floor: that's where `java.lang.foreign` (Project Panama)
