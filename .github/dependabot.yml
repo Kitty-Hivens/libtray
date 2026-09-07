@@ -1,0 +1,28 @@
+# What a bot can and cannot cover here.
+#
+# It reads gradle/libs.versions.toml and the workflows, which is the whole
+# declared dependency surface -- the library itself has almost none. The part it
+# cannot see is the part that actually breaks: this binds libdbus on Linux and
+# the Objective-C runtime with AppKit and Foundation on macOS, and no manifest
+# declares the ABI of any of them. That drift is caught by the suites that run
+# against a real bus and a real tray host, or it is not caught.
+version: 2
+
+updates:
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # The rows that go stale silently: an action pinned to a major that stops
+  # getting security fixes still runs green until it does not.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
