@@ -28,8 +28,10 @@ import javax.imageio.ImageIO
  *      (`dbus_bus_get_private`) -- we run our own pop_message loop, so a
  *      shared connection's single queue would let another libdbus user in
  *      the process steal our incoming property queries.
- *   2. Request our own well-known name `org.kde.StatusNotifierItem-PID-N`
- *      (PID + a per-process counter for the rare multi-tray case).
+ *   2. Request our own well-known name. By default this is
+ *      `org.kde.StatusNotifierItem-PID-N` (PID + a per-process counter for
+ *      the rare multi-tray case); callers can supply a Flatpak-compatible
+ *      name via [TrayBuilder.linuxBusName].
  *   3. The desktop's tray host (KDE plasmashell, GNOME's SNI extension,
  *      waybar on Hyprland, etc.) listens on
  *      `org.kde.StatusNotifierWatcher.RegisterStatusNotifierItem` —
@@ -1174,6 +1176,9 @@ internal class SniTrayImpl internal constructor(
             return slug.ifEmpty { "tray" }
         }
 
+        internal fun busNameFor(builder: TrayBuilder): String = builder.linuxBusName
+            ?: "org.kde.StatusNotifierItem-${ProcessHandle.current().pid()}-${itemCounter.incrementAndGet()}"
+
         // Properties exposed on the StatusNotifierItem object — used by
         // GetAll to enumerate, and by Get to dispatch.
         private val PROPERTY_NAMES = listOf(
@@ -1287,7 +1292,7 @@ internal class SniTrayImpl internal constructor(
                 bindings.handle("dbus_connection_set_exit_on_disconnect")
                     .invokeExact(conn, 0) as Unit
 
-                val itemId = "org.kde.StatusNotifierItem-${ProcessHandle.current().pid()}-${itemCounter.incrementAndGet()}"
+                val itemId = busNameFor(builder)
                 val nameSeg = setup.allocateUtf8(itemId)
                 val flags = DBusBindings.DBUS_NAME_FLAG_REPLACE_EXISTING or DBusBindings.DBUS_NAME_FLAG_DO_NOT_QUEUE
                 val nameResult = bindings.handle("dbus_bus_request_name").invokeExact(
@@ -1375,4 +1380,3 @@ internal class SniTrayImpl internal constructor(
 }
 
 // allocateUtf8 now lives in DBusBindings.kt (shared across the linux package).
-

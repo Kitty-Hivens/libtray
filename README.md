@@ -109,6 +109,28 @@ tray.onEvent { event ->
 // On app shutdown
 tray.close()
 ```
+
+For Flatpak on Linux, set `linuxBusName` to a unique name within your
+application ID's D-Bus namespace:
+
+```kotlin
+TrayBuilder(
+    title = "MyApp",
+    iconBytes = iconBytes,
+    linuxBusName = "com.example.MyApp.StatusNotifierItem",
+)
+```
+
+The Flatpak manifest still needs permission to talk to the tray watcher:
+
+```yaml
+finish-args:
+  - --talk-name=org.kde.StatusNotifierWatcher
+```
+
+No `--own-name=org.kde.*` permission is needed for this setup. Outside
+Flatpak, omitting `linuxBusName` preserves the generated
+`org.kde.StatusNotifierItem-PID-N` name.
 </details>
 
 <details>
