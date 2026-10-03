@@ -38,7 +38,8 @@ class NativeImageMetadataTest {
             file.writeText(expected)
         }
         check(file.exists()) { "$METADATA_PATH is missing, regenerate it (see the class KDoc)" }
-        file.readText() shouldBe expected
+        // A Windows checkout may turn the file's line endings into CRLF.
+        file.readText().replace("\r\n", "\n") shouldBe expected
     }
 
     @Test

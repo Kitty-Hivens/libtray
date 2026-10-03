@@ -250,21 +250,25 @@ val nativeCheckBuild = tasks.register<Exec>("nativeCheckBuild") {
     group = "verification"
     description = "Build this platform's check program as a GraalVM native image."
     dependsOn(tasks.testClasses)
+    // Locals, not script-level vals: the configuration cache cannot carry
+    // references to the build script object into a task action.
     val classpath = sourceSets.test.get().runtimeClasspath
     val image = nativeCheckImage
     val home = graalHome
+    val main = nativeCheckMain
+    val windows = osName.contains("windows")
     inputs.files(classpath)
     outputs.file(image)
-    onlyIf("a check program for this OS") { nativeCheckMain != null }
+    onlyIf("a check program for this OS") { main != null }
     doFirst {
-        val nativeImage = File(home.get(), if (osName.contains("windows")) "bin/native-image.cmd" else "bin/native-image")
+        val nativeImage = File(home.get(), if (windows) "bin/native-image.cmd" else "bin/native-image")
         check(nativeImage.exists()) { "no native-image at $nativeImage, set GRAALVM_HOME to a GraalVM" }
         (this as Exec).commandLine(
             nativeImage.absolutePath,
             "--enable-native-access=ALL-UNNAMED",
             "-cp", classpath.asPath,
             "-o", image.get().asFile.absolutePath.removeSuffix(".exe"),
-            checkNotNull(nativeCheckMain),
+            checkNotNull(main),
         )
     }
 }
@@ -273,7 +277,8 @@ val nativeCheck = tasks.register<Exec>("nativeCheck") {
     group = "verification"
     description = "Run this platform's check program as a GraalVM native image."
     dependsOn(nativeCheckBuild)
-    onlyIf("a check program for this OS") { nativeCheckMain != null }
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
     val image = nativeCheckImage
     usesService(privateSessionBus)
     val bus = privateSessionBus
@@ -283,6 +288,28 @@ val nativeCheck = tasks.register<Exec>("nativeCheck") {
         if (linux) {
             environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         }
+    }
+}
+
+// The same check program on the JVM under the GraalVM tracing agent, writing
+// what it observed to build/native-agent. The JDK entries for AWT and ImageIO
+// differ per platform, and this is how they are recorded on each one. CI
+// uploads the output. Run with a GraalVM as the Gradle JVM.
+tasks.register<JavaExec>("nativeAgentRun") {
+    group = "verification"
+    description = "Run this platform's check program on the JVM under the native-image agent."
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set(main ?: "none")
+    val output = layout.buildDirectory.dir("native-agent").get().asFile.absolutePath
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-agentlib:native-image-agent=config-output-dir=$output")
+    if (osName.contains("mac")) jvmArgs("-XstartOnFirstThread")
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    val linux = osName.contains("linux")
+    doFirst {
+        if (linux) (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
     }
 }
 
