@@ -74,6 +74,14 @@ places listed under Changed, and the README has a migration section.
   It never was: the backend derives only the SNI `Id` from it.
 
 ### Fixed
+- Linux: the I/O thread no longer flushes after each send.
+  `dbus_connection_flush` blocks until the socket takes the whole
+  message, so against a bus daemon that stopped reading it never
+  returned, and `close()` gave up after two seconds and leaked the
+  connection. `dbus_connection_send` only queues, and the poll at the
+  end of the same iteration writes what the socket accepts, so no call
+  on that thread outlasts the poll interval and `close()` joins it in
+  tens of milliseconds even then. Reply latency is unchanged.
 - macOS: `close()` runs its teardown on the Cocoa main queue and waits up
   to two seconds for it, then falls back to the calling thread.
   `NSStatusItem` is main-thread-only and `close()` is usually called from

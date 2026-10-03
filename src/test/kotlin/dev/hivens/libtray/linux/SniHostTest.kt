@@ -137,6 +137,29 @@ class SniHostTest {
         (activate < LATENCY_BUDGET_MS) shouldBe true
     }
 
+    @Test
+    fun `close stops the I O thread even while the bus is not reading`() {
+        val tray = open("org.libtray.HostTest.Wedged")
+        val pid = System.getenv("LIBTRAY_PRIVATE_BUS_PID") ?: error("no bus daemon pid")
+        signal("STOP", pid)
+        try {
+            // Each call queues two signals. With the daemon stopped nothing
+            // drains the socket, so its buffer fills well before this ends.
+            repeat(20_000) { tray.setTooltip("state $it") }
+            Thread.sleep(300)
+
+            val start = System.nanoTime()
+            tray.close()
+            val tookMs = (System.nanoTime() - start) / 1_000_000
+            val ioThread = SniTrayImpl::class.java.getDeclaredField("ioThread")
+                .apply { isAccessible = true }.get(tray) as Thread
+            println("[sni-host] close() with the bus stopped took $tookMs ms")
+            ioThread.isAlive shouldBe false
+        } finally {
+            signal("CONT", pid)
+        }
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     private fun open(linuxBusName: String?, title: String = "libtray host test"): Tray {
@@ -154,6 +177,11 @@ class SniHostTest {
         ) ?: error("Tray.create returned null on the private bus")
         trays += tray
         return tray
+    }
+
+    private fun signal(name: String, pid: String) {
+        val exit = ProcessBuilder("kill", "-$name", pid).inheritIO().start().waitFor()
+        check(exit == 0) { "kill -$name $pid failed" }
     }
 
     private fun clickMenu(name: String, id: Int) =

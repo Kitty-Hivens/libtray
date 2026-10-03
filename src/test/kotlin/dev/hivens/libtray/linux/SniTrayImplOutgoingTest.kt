@@ -25,16 +25,18 @@ import kotlin.concurrent.thread
  * What this pins:
  *  - close() with nothing queued exits the loop and unrefs the connection
  *    exactly once.
- *  - the loop drains in FIFO order, flushing + unrefing each message.
- *  - close() mid-flush lets the in-flight send/flush/unref triplet finish
- *    and then drains the still-queued messages by unref WITHOUT sending.
+ *  - the loop drains in FIFO order, sending + unrefing each message and
+ *    never calling dbus_connection_flush, which can block forever against a
+ *    bus that stopped reading.
+ *  - close() mid-send lets the in-flight send/unref pair finish and then
+ *    drains the still-queued messages by unref WITHOUT sending.
  *  - concurrent emit from many threads loses nothing and keeps each
  *    thread's messages in submission order on the wire.
  *  - a message queued during an iteration is sent before the loop blocks
- *    in the next poll, and poll + send + flush all run on one thread.
+ *    in the next poll, and poll + send all run on one thread.
  *    Those last two are the reply-latency fix: libdbus holds the
  *    connection's io path for the whole of `dbus_connection_read_write`,
- *    so a flush from any other thread had to wait out the poll interval.
+ *    so a write from any other thread had to wait out the poll interval.
  */
 class SniTrayImplOutgoingTest {
 
@@ -55,46 +57,46 @@ class SniTrayImplOutgoingTest {
     }
 
     @Test
-    fun `drains queued messages in FIFO order, flushing and unrefing each`() {
+    fun `drains queued messages in FIFO order, sending and unrefing each without flushing`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)
         val addrs = (1L..5L).toList()
 
         addrs.forEach { tray.outgoing.put(seg(it)) }
 
-        // Wait on the unref, not the send: unref is the last of the
-        // send/flush/unref triplet, so waiting on `sent` can observe the
-        // final message mid-triplet and read a short `unrefed` below.
+        // Wait on the unref, not the send: unref comes after the send, so
+        // waiting on `sent` can observe the final message between the two
+        // and read a short `unrefed` below.
         awaitUntil(2_000) { rec.unrefed.size == addrs.size } shouldBe true
         rec.sent.toList() shouldContainExactly addrs
         rec.unrefed.toList() shouldContainExactly addrs
-        rec.flushes.get() shouldBe addrs.size
+        rec.flushes.get() shouldBe 0
         tray.close()
     }
 
     @Test
-    fun `close mid-flush finishes the in-flight triplet then drains the rest without sending`() {
+    fun `close mid-send finishes the in-flight send then drains the rest without sending`() {
         val rec = RecordingDbus()
-        val flushEntered = CountDownLatch(1)
-        val flushGate = CountDownLatch(1)
-        // Block the first (and only) flush so the loop is provably mid-
-        // triplet on message 1 while 2 and 3 sit in the queue.
-        rec.onFlush = {
-            flushEntered.countDown()
-            flushGate.await()
+        val sendEntered = CountDownLatch(1)
+        val sendGate = CountDownLatch(1)
+        // Block the first send so the loop is provably mid-send on message 1
+        // while 2 and 3 sit in the queue.
+        rec.onSend = {
+            sendEntered.countDown()
+            sendGate.await()
         }
         val tray = newTray(rec)
 
         listOf(1L, 2L, 3L).forEach { tray.outgoing.put(seg(it)) }
-        flushEntered.await(2, TimeUnit.SECONDS) shouldBe true   // sent m1, now inside flush(m1)
+        sendEntered.await(2, TimeUnit.SECONDS) shouldBe true    // inside send(m1)
 
         val closer = thread { tray.close() }
         awaitUntil(2_000) { !tray.isOpen } shouldBe true         // close() flipped open=false
-        flushGate.countDown()                                    // release the in-flight flush
+        sendGate.countDown()                                     // release the in-flight send
         closer.join(3_000)
 
-        rec.sent.toList() shouldContainExactly listOf(1L)            // only m1 ever reached the wire
-        rec.flushes.get() shouldBe 1
+        rec.sent.toList() shouldContainExactly listOf(1L)            // only m1 was handed to libdbus
+        rec.flushes.get() shouldBe 0
         rec.unrefed.toList() shouldContainExactly listOf(1L, 2L, 3L) // m1 in-flight, m2/m3 final-drain
         rec.connUnrefs.get() shouldBe 1
     }
@@ -154,12 +156,12 @@ class SniTrayImplOutgoingTest {
         constructed.countDown()
 
         awaitUntil(2_000) { rec.events.contains("send:1") } shouldBe true
-        rec.events.toList().take(4) shouldContainExactly listOf("poll", "send:1", "flush", "poll")
+        rec.events.toList().take(3) shouldContainExactly listOf("poll", "send:1", "poll")
         tray.close()
     }
 
     @Test
-    fun `polling, sending and flushing all happen on the single I O thread`() {
+    fun `polling and sending both happen on the single I O thread`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)
 
@@ -227,8 +229,8 @@ class SniTrayImplOutgoingTest {
         /** Records "close"/"unref" so the test can pin their relative order. */
         val connLifecycle = ConcurrentLinkedQueue<String>()
 
-        /** Optional hook run at the start of each flush (mid-flush gating). */
-        @Volatile var onFlush: (() -> Unit)? = null
+        /** Optional hook run at the start of each send (mid-send gating). */
+        @Volatile var onSend: (() -> Unit)? = null
 
         /** Optional hook run inside each poll, standing in for an arriving call. */
         @Volatile var onReadWrite: (() -> Unit)? = null
@@ -245,14 +247,16 @@ class SniTrayImplOutgoingTest {
         fun popMessage(connection: MemorySegment): MemorySegment = MemorySegment.NULL
 
         fun send(connection: MemorySegment, msg: MemorySegment, serial: MemorySegment): Int {
+            onSend?.invoke()
             record("send:${msg.address()}")
             sent.add(msg.address())
             return 1
         }
 
+        // Still bound so a flush, if one came back, would be counted rather
+        // than fail the lookup.
         fun flush(connection: MemorySegment) {
             record("flush")
-            onFlush?.invoke()
             flushes.incrementAndGet()
         }
 

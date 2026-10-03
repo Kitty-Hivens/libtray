@@ -182,6 +182,9 @@ abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, Au
     val address: String = daemon.inputStream.bufferedReader().readLine()
         ?: error("dbus-daemon exited without printing an address")
 
+    /** For tests that stop the daemon to make it stop reading its sockets. */
+    val pid: Long get() = daemon.pid()
+
     override fun close() {
         daemon.destroy()
     }
@@ -206,6 +209,7 @@ val sniHostTest = tasks.register<Test>("sniHostTest") {
     doFirst {
         (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         environment("LIBTRAY_PRIVATE_BUS", "1")
+        environment("LIBTRAY_PRIVATE_BUS_PID", bus.get().pid.toString())
     }
     val linuxWithDbus = System.getProperty("os.name").lowercase().contains("linux") &&
         File("/usr/bin/dbus-daemon").exists()
