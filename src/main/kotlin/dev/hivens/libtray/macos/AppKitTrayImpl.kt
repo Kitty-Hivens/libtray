@@ -757,6 +757,17 @@ internal class AppKitTrayImpl private constructor(
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
 
+        /** GCD work function `void f(void *context)`, the shape of [dispatchTrampoline]. */
+        internal val TRAMPOLINE_DESCRIPTOR: FunctionDescriptor = FunctionDescriptor.ofVoid(ValueLayout.ADDRESS)
+
+        /**
+         * `void f(id self, SEL _cmd, id arg)`, the shape of every Objective-C
+         * method IMP libtray installs: [onMenuItemEntry],
+         * [onStatusItemClickEntry] and [onStatusViewMouseEntry].
+         */
+        internal val OBJC_METHOD_DESCRIPTOR: FunctionDescriptor =
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
+
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
@@ -795,9 +806,7 @@ internal class AppKitTrayImpl private constructor(
                 AppKitTrayImpl::class.java, "dispatchTrampoline",
                 MethodType.methodType(Void.TYPE, MemorySegment::class.java),
             )
-            val stub = Linker.nativeLinker().upcallStub(
-                handle, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS), arena,
-            )
+            val stub = Linker.nativeLinker().upcallStub(handle, TRAMPOLINE_DESCRIPTOR, arena)
             trampolineArena = arena
             trampolineStub = stub
             return stub
@@ -899,11 +908,7 @@ internal class AppKitTrayImpl private constructor(
                     MemorySegment::class.java,   // NSEvent*
                 ),
             )
-            val stub = Linker.nativeLinker().upcallStub(
-                handle,
-                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS),
-                arena,
-            )
+            val stub = Linker.nativeLinker().upcallStub(handle, OBJC_METHOD_DESCRIPTOR, arena)
             val className = "LibtrayStatusView_${ProcessHandle.current().pid()}"
             val newClass = bindings.handle("objc_allocateClassPair")
                 .invokeExact(bindings.cls("NSView"), arena.allocateFrom(className), 0L) as MemorySegment
@@ -1148,11 +1153,7 @@ internal class AppKitTrayImpl private constructor(
                     MemorySegment::class.java,   // sender (id)
                 ),
             )
-            val descriptor = FunctionDescriptor.ofVoid(
-                ValueLayout.ADDRESS,
-                ValueLayout.ADDRESS,
-                ValueLayout.ADDRESS,
-            )
+            val descriptor = OBJC_METHOD_DESCRIPTOR
             val stub = Linker.nativeLinker().upcallStub(handle, descriptor, arena)
             val clickHandle = MethodHandles.lookup().findStatic(
                 AppKitTrayImpl::class.java,

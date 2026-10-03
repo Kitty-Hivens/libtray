@@ -279,6 +279,27 @@ internal class Win32Bindings private constructor(
         const val PM_REMOVE:   Int = 0x0001
 
         /**
+         * `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)`, which is
+         * also the shape of `DefWindowProcW`. See [wndProcDescriptor].
+         */
+        internal val WNDPROC_DESCRIPTOR: FunctionDescriptor = FunctionDescriptor.of(
+            ValueLayout.JAVA_LONG,                                  // LRESULT
+            ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,           // HWND, UINT, WPARAM, LPARAM
+        )
+
+        /**
+         * Every downcall shape this backend binds: [LOAD_SET] plus the
+         * pre-instance `DefWindowProcW`. Also the source for the GraalVM
+         * native-image metadata shipped in the jar.
+         */
+        internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
+            LOAD_SET.map { (_, ret, args) -> descriptorOf(ret, args) } + WNDPROC_DESCRIPTOR
+
+        private fun descriptorOf(ret: MemoryLayout?, args: List<MemoryLayout>): FunctionDescriptor =
+            if (ret == null) FunctionDescriptor.ofVoid(*args.toTypedArray()) else FunctionDescriptor.of(ret, *args.toTypedArray())
+
+        /**
          * Load the Win32 DLLs into a fresh shared arena and bind every
          * symbol in [LOAD_SET]. Returns null when:
          *   * we're not on Windows (DLLs won't load)
@@ -299,11 +320,7 @@ internal class Win32Bindings private constructor(
             val linker = Linker.nativeLinker()
             val handles = HashMap<String, MethodHandle>(LOAD_SET.size * 2)
             for ((name, ret, args) in LOAD_SET) {
-                val descriptor = if (ret == null) {
-                    FunctionDescriptor.ofVoid(*args.toTypedArray())
-                } else {
-                    FunctionDescriptor.of(ret, *args.toTypedArray())
-                }
+                val descriptor = descriptorOf(ret, args)
                 // Walk the loaded DLL list — symbol could be in any of them
                 // (kernel32 has GetModuleHandle, user32 has the rest, etc).
                 val symbol = combined.firstNotNullOfOrNull { it.find(name).orElse(null) }
@@ -378,11 +395,7 @@ internal class Win32Bindings private constructor(
      * matches the C calling convention of `WNDPROC` in winuser.h. Used as
      * the function descriptor for [Linker.upcallStub].
      */
-    val wndProcDescriptor: FunctionDescriptor = FunctionDescriptor.of(
-        ValueLayout.JAVA_LONG,                                  // LRESULT
-        ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
-        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,           // HWND, UINT, WPARAM, LPARAM
-    )
+    val wndProcDescriptor: FunctionDescriptor = WNDPROC_DESCRIPTOR
 
     /**
      * `LRESULT DefWindowProcW(HWND, UINT, WPARAM, LPARAM)` — same shape as
@@ -390,11 +403,7 @@ internal class Win32Bindings private constructor(
      * pre-instance fallback in [Win32TrayImpl] can bind the symbol onto its
      * own process-lifetime arena instead of borrowing a per-Tray one.
      */
-    val defWindowProcDescriptor: FunctionDescriptor = FunctionDescriptor.of(
-        ValueLayout.JAVA_LONG,                                  // LRESULT
-        ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
-        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG,           // HWND, UINT, WPARAM, LPARAM
-    )
+    val defWindowProcDescriptor: FunctionDescriptor = WNDPROC_DESCRIPTOR
 
     /**
      * `NOTIFYICONDATAW` from shellapi.h — the parameter to

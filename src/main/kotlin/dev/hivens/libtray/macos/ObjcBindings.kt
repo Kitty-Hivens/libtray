@@ -249,6 +249,12 @@ internal class ObjcBindings private constructor(
         )
 
         /**
+         * Every downcall shape [load] binds. Also the source for the GraalVM
+         * native-image metadata shipped in the jar.
+         */
+        internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> = LOAD_SET.map { it.third }
+
+        /**
          * NSStatusItem length sentinel — `NSVariableStatusItemLength`
          * from `NSStatusBar.h`. Tells AppKit "size to fit the icon",
          * which is what every well-behaved menu-bar app picks.
