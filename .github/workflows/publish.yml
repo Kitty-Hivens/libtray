@@ -1,7 +1,8 @@
 name: Publish
 
 # A release is cut from a tag: tag vX.Y.Z, push it, and this signs the
-# artifacts and uploads them to Maven Central. The version comes from the tag,
+# artifacts, uploads them to Maven Central and creates the GitHub release page
+# from the version's CHANGELOG section. The version comes from the tag,
 # not from gradle.properties -- the appVersion there is a SNAPSHOT placeholder
 # for local builds and would publish nonsense coordinates. The job runs in the
 # maven-central environment, so the credentials sit behind that environment's
@@ -24,6 +25,9 @@ jobs:
     name: Publish to Maven Central
     runs-on: ubuntu-latest
     environment: maven-central
+    # contents: write is what lets the last step create the release page.
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-java@v6
@@ -85,3 +89,19 @@ jobs:
           ./gradlew publishToMavenCentral \
             -PappVersion="$VERSION" \
             --no-configuration-cache
+
+      # The GitHub release page for the tag, with that version's CHANGELOG
+      # section as its notes. Only for a pushed tag, since a dispatched run has
+      # no tag to hang a release on. It runs after the upload, so a page never
+      # announces an artifact that failed to publish.
+      - name: Release page
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.v }}
+        run: |
+          python3 .github/scripts/changelog_section.py CHANGELOG.md "$VERSION" > release-notes.md
+          gh release create "$GITHUB_REF_NAME" \
+            --title "libtray $VERSION" \
+            --notes-file release-notes.md \
+            --verify-tag
