@@ -85,6 +85,9 @@ internal class Win32TrayImpl private constructor(
      */
     @Volatile private var hwnd: MemorySegment = MemorySegment.NULL
 
+    /** The message window, for tests that post it the callbacks the shell would. */
+    internal val windowHandle: MemorySegment get() = hwnd
+
     /**
      * Signals "pump thread has either succeeded in creating the window
      * + registering the icon, or failed and is exiting". `await`'d in
