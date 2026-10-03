@@ -73,6 +73,16 @@ dependencies {
 Requires JDK 22+ (Project Panama). Caller must pass
 `--enable-native-access=ALL-UNNAMED` (or grant the library's module
 specifically) to permit the native calls.
+
+**GraalVM native image.** The jar ships its reachability metadata in
+`META-INF/native-image/dev.hivens/libtray/`, which `native-image` picks up
+from the classpath: every foreign call shape and upcall the three backends
+use, plus the AWT and ImageIO entries libtray's icon handling needs. Pass
+`--enable-native-access=ALL-UNNAMED` to `native-image` as well. Icon
+decoding goes through AWT, so the build writes `libawt` and its companion
+libraries next to the executable, and they have to ship with it. CI builds
+and runs a native check program on Linux, Windows and macOS with only that
+metadata.
 </details>
 
 <details>

@@ -87,6 +87,45 @@ class IconScalingTest {
     }
 
     @Test
+    fun `area averaging takes the mean of each covered block`() {
+        // 4x2 -> 2x1: each target pixel averages a 2x2 block.
+        val red = 0xFFFF0000.toInt()
+        val blue = 0xFF0000FF.toInt()
+        val black = 0xFF000000.toInt()
+        val white = 0xFFFFFFFF.toInt()
+        val source = intArrayOf(
+            red, blue, black, white,
+            red, blue, white, black,
+        )
+        IconScaling.areaAverage(source, 4, 2, 2, 1).toList() shouldBe listOf(
+            0xFF800080.toInt(),  // half red, half blue
+            0xFF808080.toInt(),  // half black, half white
+        )
+    }
+
+    @Test
+    fun `area averaging weights partly covered pixels by their coverage`() {
+        // 3x1 -> 2x1: the middle pixel is split between both targets.
+        val source = intArrayOf(0xFF000000.toInt(), 0xFF000000.toInt() or 0xC0, 0xFF0000FF.toInt())
+        // Left: 1.0 x 0 + 0.5 x 0xC0 over 1.5, right: 0.5 x 0xC0 + 1.0 x 0xFF over 1.5.
+        IconScaling.areaAverage(source, 3, 1, 2, 1).toList() shouldBe listOf(0xFF000040.toInt(), 0xFF0000EA.toInt())
+    }
+
+    @Test
+    fun `transparent pixels do not tint the edge`() {
+        // An opaque red pixel next to a fully transparent white one averages
+        // to half-transparent red. Averaging colour without the alpha weight
+        // would give pink, the halo premultiplied averaging avoids.
+        val source = intArrayOf(0xFFFF0000.toInt(), 0x00FFFFFF)
+        IconScaling.areaAverage(source, 2, 1, 1, 1).single() shouldBe 0x80FF0000.toInt()
+    }
+
+    @Test
+    fun `a fully transparent area stays fully transparent`() {
+        IconScaling.areaAverage(IntArray(4) { 0x00FFFFFF }, 2, 2, 1, 1).single() shouldBe 0
+    }
+
+    @Test
     fun `a null limit disables scaling`() {
         val bytes = png(1024, 1024)
         IconScaling.fit(bytes, null, log) shouldBe bytes

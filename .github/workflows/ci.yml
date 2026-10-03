@@ -12,6 +12,8 @@ concurrency:
 env:
   JAVA_VERSION: '22'
   JAVA_DISTRIBUTION: 'temurin'
+  GRAALVM_VERSION: '25'
+  GRAALVM_DISTRIBUTION: 'graalvm-community'
 
 jobs:
   build:
@@ -55,4 +57,49 @@ jobs:
         with:
           name: test-reports-${{ matrix.name }}
           path: build/reports/tests
+          retention-days: 7
+
+  native:
+    # The platform's check program built as a GraalVM native image with only
+    # the reachability metadata the jar ships, then run, which is what a
+    # consumer's native build sees. Catches a foreign call or upcall target
+    # added without metadata before it reaches a release.
+    name: Native image (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-latest
+          - name: Windows
+            os: windows-latest
+          - name: macOS
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: ${{ env.GRAALVM_VERSION }}
+          distribution: ${{ env.GRAALVM_DISTRIBUTION }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: gradle/actions/setup-gradle@v6
+      - name: Require dbus-daemon
+        if: runner.os == 'Linux'
+        run: command -v dbus-daemon
+      # The tracing agent's view of the same program on the JVM, for updating
+      # the platform-specific JDK entries in the shipped metadata.
+      - name: Record with the native-image agent
+        run: ./gradlew nativeAgentRun --stacktrace
+      - name: Build and run the native check
+        run: ./gradlew nativeCheck --stacktrace
+      - name: Upload the agent output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-agent-${{ matrix.name }}
+          path: build/native-agent
           retention-days: 7

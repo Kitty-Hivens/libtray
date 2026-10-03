@@ -5,12 +5,10 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
+import dev.hivens.libtray.solidPng
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
-import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
@@ -19,7 +17,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
-import javax.imageio.ImageIO
 import kotlin.system.exitProcess
 
 /**
@@ -44,7 +41,11 @@ import kotlin.system.exitProcess
  */
 fun main() {
     val watchdog = Thread {
-        Thread.sleep(90_000)
+        try {
+            Thread.sleep(90_000)
+        } catch (_: InterruptedException) {
+            return@Thread  // interrupted once every step has passed
+        }
         fail("timed out")
     }.apply { isDaemon = true; start() }
 
@@ -58,6 +59,8 @@ fun main() {
 
     check(tray.setTooltip("updated")) { "setTooltip" }
     check(tray.setIcon(icon(22))) { "setIcon" }
+    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    check(tray.setIcon(icon(300))) { "setIcon with an icon that needs scaling" }
     check(tray.setMenu(menu())) { "setMenu" }
     step("updated")
 
@@ -75,7 +78,7 @@ fun main() {
     clicks.send(overlay, "mouseUp:", NS_LEFT_MOUSE_UP)
     expect(events, TrayEvent.Activated, "primary click")
 
-    clicks.sendMiddleUp(overlay)
+    clicks.send(overlay, "otherMouseUp:", NS_OTHER_MOUSE_UP, button = 2)
     expect(events, TrayEvent.MiddleActivated, "middle click")
 
     // Button actions this soon after overlay activity are dropped on purpose.
@@ -98,7 +101,7 @@ fun main() {
             closed.countDown()
         }
     }
-    clicks.send(overlay, "rightMouseDown:", NS_RIGHT_MOUSE_DOWN)
+    clicks.send(overlay, "rightMouseDown:", NS_RIGHT_MOUSE_DOWN, button = 1)
     if (!closed.await(10, TimeUnit.SECONDS)) fail("close() from the MenuRequested listener did not return")
     if (tray.isOpen) fail("still open after close() during menu tracking")
     if (closeTookMs.get() >= 2_000) fail("close() during menu tracking fell back to the timeout (${closeTookMs.get()} ms)")
@@ -127,72 +130,44 @@ fun main() {
 }
 
 /**
- * Builds mouse `NSEvent`s and sends them to a view. Needs one `objc_msgSend`
- * shape the backend has no use for, the class method
- * `mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:`,
- * which takes an `NSPoint` by value. That method has no button argument and
- * reports button 0 for every other-button event, so the middle click is
- * built as a `CGEvent` with the centre button and wrapped by
- * `[NSEvent eventWithCGEvent:]`. Creating a `CGEvent` does not post it, so
- * no permission is involved.
+ * Builds mouse `NSEvent`s and sends them to a view. Each event starts as a
+ * `CGEvent` that is given a type, a button number and modifier flags, then
+ * is wrapped by `[NSEvent eventWithCGEvent:]`. Creating a `CGEvent` does not
+ * post it, so no permission is involved, and none of these calls passes a
+ * struct by value, so the check also builds as a GraalVM native image
+ * without extra foreign metadata.
  */
 private class SyntheticClicks(private val bindings: ObjcBindings) {
     private val arena = Arena.ofShared()
-    private val point = MemoryLayout.structLayout(ValueLayout.JAVA_DOUBLE, ValueLayout.JAVA_DOUBLE)
-    private val mouseEvent: MethodHandle = Linker.nativeLinker().downcallHandle(
-        SymbolLookup.libraryLookup("libobjc.A.dylib", arena).find("objc_msgSend").orElseThrow(),
-        FunctionDescriptor.of(
-            ValueLayout.ADDRESS,
-            ValueLayout.ADDRESS, ValueLayout.ADDRESS,  // NSEvent class, SEL
-            ValueLayout.JAVA_LONG,                     // NSEventType
-            point,                                     // NSPoint location
-            ValueLayout.JAVA_LONG,                     // NSEventModifierFlags
-            ValueLayout.JAVA_DOUBLE,                   // NSTimeInterval timestamp
-            ValueLayout.JAVA_LONG,                     // NSInteger windowNumber
-            ValueLayout.ADDRESS,                       // NSGraphicsContext *context
-            ValueLayout.JAVA_LONG,                     // NSInteger eventNumber
-            ValueLayout.JAVA_LONG,                     // NSInteger clickCount
-            ValueLayout.JAVA_FLOAT,                    // float pressure
-        ),
+    private val coreGraphics = SymbolLookup.libraryLookup("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", arena)
+    private val linker = Linker.nativeLinker()
+
+    private fun bind(name: String, descriptor: FunctionDescriptor): MethodHandle =
+        linker.downcallHandle(coreGraphics.find(name).orElseThrow(), descriptor)
+
+    // CGEventRef CGEventCreate(CGEventSourceRef)
+    private val create = bind("CGEventCreate", FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS))
+    // void CGEventSetType(CGEventRef, CGEventType)
+    private val setType = bind("CGEventSetType", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_INT))
+    // void CGEventSetIntegerValueField(CGEventRef, CGEventField, int64_t)
+    private val setField = bind(
+        "CGEventSetIntegerValueField",
+        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG),
     )
+    // void CGEventSetFlags(CGEventRef, CGEventFlags)
+    private val setFlags = bind("CGEventSetFlags", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
 
-    fun event(type: Long): MemorySegment {
-        val location = arena.allocate(point)
-        return mouseEvent.invokeExact(
-            bindings.cls("NSEvent"),
-            bindings.sel("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
-            type, location, 0L, 0.0, 0L, MemorySegment.NULL, 0L, 1L, 1.0f,
-        ) as MemorySegment
-    }
-
-    private val cgMouseEvent: MethodHandle = Linker.nativeLinker().downcallHandle(
-        SymbolLookup.libraryLookup("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", arena)
-            .find("CGEventCreateMouseEvent").orElseThrow(),
-        FunctionDescriptor.of(
-            ValueLayout.ADDRESS,     // CGEventRef
-            ValueLayout.ADDRESS,     // CGEventSourceRef, NULL
-            ValueLayout.JAVA_INT,    // CGEventType
-            point,                   // CGPoint
-            ValueLayout.JAVA_INT,    // CGMouseButton
-        ),
-    )
-
-    fun sendMiddleUp(view: MemorySegment) {
-        val cgEvent = cgMouseEvent.invokeExact(
-            MemorySegment.NULL, NS_OTHER_MOUSE_UP.toInt(), arena.allocate(point), CG_MOUSE_BUTTON_CENTER,
-        ) as MemorySegment
-        if (cgEvent.address() == 0L) fail("CGEventCreateMouseEvent returned NULL")
+    fun send(view: MemorySegment, selector: String, type: Long, button: Long = 0, flags: Long = 0) {
+        val cgEvent = create.invokeExact(MemorySegment.NULL) as MemorySegment
+        if (cgEvent.address() == 0L) fail("CGEventCreate returned NULL")
+        setType.invokeExact(cgEvent, type.toInt()) as Unit
+        setField.invokeExact(cgEvent, CG_MOUSE_EVENT_BUTTON_NUMBER, button) as Unit
+        setFlags.invokeExact(cgEvent, flags) as Unit
         val event = bindings.handle("objc_msgSend_id_id")
             .invokeExact(bindings.cls("NSEvent"), bindings.sel("eventWithCGEvent:"), cgEvent) as MemorySegment
-        if (event.address() == 0L) fail("eventWithCGEvent: returned nil")
-        val button = bindings.handle("objc_msgSend_long").invokeExact(event, bindings.sel("buttonNumber")) as Long
-        if (button != 2L) fail("the wrapped middle-button event reports buttonNumber $button")
-        bindings.handle("objc_msgSend_void_id").invokeExact(view, bindings.sel("otherMouseUp:"), event) as Unit
-    }
-
-    fun send(view: MemorySegment, selector: String, type: Long) {
-        val event = event(type)
-        if (event.address() == 0L) fail("could not build an NSEvent of type $type")
+        if (event.address() == 0L) fail("eventWithCGEvent: returned nil for type $type")
+        val reported = bindings.handle("objc_msgSend_long").invokeExact(event, bindings.sel("buttonNumber")) as Long
+        if (reported != button) fail("event of type $type reports button $reported, built with $button")
         bindings.handle("objc_msgSend_void_id").invokeExact(view, bindings.sel(selector), event) as Unit
     }
 }
@@ -200,8 +175,10 @@ private class SyntheticClicks(private val bindings: ObjcBindings) {
 private const val NS_LEFT_MOUSE_DOWN = 1L
 private const val NS_LEFT_MOUSE_UP = 2L
 private const val NS_RIGHT_MOUSE_DOWN = 3L
-private const val NS_OTHER_MOUSE_UP = 26L  // also kCGEventOtherMouseUp
-private const val CG_MOUSE_BUTTON_CENTER = 2  // kCGMouseButtonCenter
+private const val NS_OTHER_MOUSE_UP = 26L
+
+// CGEventType values match NSEventType for mouse events. kCGMouseEventButtonNumber.
+private const val CG_MOUSE_EVENT_BUTTON_NUMBER = 3
 
 private fun openTray(menuOnPrimaryClick: Boolean): Tray = Tray.create(
     TrayBuilder(
@@ -231,7 +208,4 @@ private fun fail(why: String): Nothing {
     exitProcess(1)
 }
 
-private fun icon(size: Int): ByteArray {
-    val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
-    return ByteArrayOutputStream().also { ImageIO.write(image, "PNG", it) }.toByteArray()
-}
+private fun icon(size: Int): ByteArray = solidPng(size)

@@ -270,6 +270,16 @@ internal class DBusBindings internal constructor(
         )
 
         /**
+         * Every downcall shape [load] binds, in [LOAD_SET] order. Also the
+         * source for the GraalVM native-image metadata shipped in the jar.
+         */
+        internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
+            LOAD_SET.map { (_, ret, args) -> descriptorOf(ret, args) }
+
+        private fun descriptorOf(ret: MemoryLayout?, args: List<MemoryLayout>): FunctionDescriptor =
+            if (ret == null) FunctionDescriptor.ofVoid(*args.toTypedArray()) else FunctionDescriptor.of(ret, *args.toTypedArray())
+
+        /**
          * Load libdbus into a fresh shared arena and bind every symbol in
          * [LOAD_SET]. Returns null if the library can't be found OR any
          * required symbol is missing — in either case the SNI backend
@@ -286,11 +296,7 @@ internal class DBusBindings internal constructor(
             val linker = Linker.nativeLinker()
             val handles = HashMap<String, MethodHandle>(LOAD_SET.size * 2)
             for ((name, ret, args) in LOAD_SET) {
-                val descriptor = if (ret == null) {
-                    FunctionDescriptor.ofVoid(*args.toTypedArray())
-                } else {
-                    FunctionDescriptor.of(ret, *args.toTypedArray())
-                }
+                val descriptor = descriptorOf(ret, args)
                 val symbol = lookup.find(name).orElse(null) ?: run {
                     arena.close()
                     return null

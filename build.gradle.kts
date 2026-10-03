@@ -229,6 +229,90 @@ val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     onlyIf("macOS") { isMac }
 }
 
+// GraalVM native-image check: the platform's check program built as a native
+// image with only the reachability metadata the jar ships, then run. This is
+// what a consumer's native build sees, so a missing foreign call or upcall
+// target fails here instead. Needs GraalVM: GRAALVM_HOME, or a GraalVM
+// JAVA_HOME. Not part of check, since an image takes a few minutes to build.
+val osName = System.getProperty("os.name").lowercase()
+val nativeCheckMain = when {
+    osName.contains("linux") -> "dev.hivens.libtray.linux.LinuxNativeCheckKt"
+    osName.contains("mac") -> "dev.hivens.libtray.macos.MacSmokeCheckKt"
+    osName.contains("windows") -> "dev.hivens.libtray.windows.WindowsNativeCheckKt"
+    else -> null
+}
+val graalHome = providers.environmentVariable("GRAALVM_HOME").orElse(providers.environmentVariable("JAVA_HOME"))
+val nativeCheckImage = layout.buildDirectory.file(
+    if (osName.contains("windows")) "native-check/libtray-check.exe" else "native-check/libtray-check",
+)
+
+val nativeCheckBuild = tasks.register<Exec>("nativeCheckBuild") {
+    group = "verification"
+    description = "Build this platform's check program as a GraalVM native image."
+    dependsOn(tasks.testClasses)
+    // Locals, not script-level vals: the configuration cache cannot carry
+    // references to the build script object into a task action.
+    val classpath = sourceSets.test.get().runtimeClasspath
+    val image = nativeCheckImage
+    val home = graalHome
+    val main = nativeCheckMain
+    val windows = osName.contains("windows")
+    inputs.files(classpath)
+    outputs.file(image)
+    onlyIf("a check program for this OS") { main != null }
+    doFirst {
+        val nativeImage = File(home.get(), if (windows) "bin/native-image.cmd" else "bin/native-image")
+        check(nativeImage.exists()) { "no native-image at $nativeImage, set GRAALVM_HOME to a GraalVM" }
+        (this as Exec).commandLine(
+            nativeImage.absolutePath,
+            "--enable-native-access=ALL-UNNAMED",
+            "-cp", classpath.asPath,
+            "-o", image.get().asFile.absolutePath.removeSuffix(".exe"),
+            checkNotNull(main),
+        )
+    }
+}
+
+val nativeCheck = tasks.register<Exec>("nativeCheck") {
+    group = "verification"
+    description = "Run this platform's check program as a GraalVM native image."
+    dependsOn(nativeCheckBuild)
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
+    val image = nativeCheckImage
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    val linux = osName.contains("linux")
+    doFirst {
+        (this as Exec).commandLine(image.get().asFile.absolutePath)
+        if (linux) {
+            environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
+    }
+}
+
+// The same check program on the JVM under the GraalVM tracing agent, writing
+// what it observed to build/native-agent. The JDK entries for AWT and ImageIO
+// differ per platform, and this is how they are recorded on each one. CI
+// uploads the output. Run with a GraalVM as the Gradle JVM.
+tasks.register<JavaExec>("nativeAgentRun") {
+    group = "verification"
+    description = "Run this platform's check program on the JVM under the native-image agent."
+    val main = nativeCheckMain
+    onlyIf("a check program for this OS") { main != null }
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set(main ?: "none")
+    val output = layout.buildDirectory.dir("native-agent").get().asFile.absolutePath
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-agentlib:native-image-agent=config-output-dir=$output")
+    if (osName.contains("mac")) jvmArgs("-XstartOnFirstThread")
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    val linux = osName.contains("linux")
+    doFirst {
+        if (linux) (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+    }
+}
+
 tasks.check {
     dependsOn(sniHostTest, macSmokeCheck)
 }
