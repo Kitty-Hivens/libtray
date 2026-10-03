@@ -24,9 +24,12 @@ import javax.imageio.ImageIO
  *      icon should appear with a black "i"-shaped glyph.
  *   3. Hover the icon. Tooltip should read "libtray smoke test".
  *   4. Left-click the icon. Stdout should print
- *      `[smoke] event: Activated (left click)`.
- *   5. Right-click the icon (LEFT-click on macOS, where NSStatusItem
- *      opens its menu on the primary button). A two-item menu should
+ *      `[smoke] event: Activated (left click)`. On macOS a left click opens
+ *      the menu instead, unless the harness runs with
+ *      `LIBTRAY_SMOKE_MAC_ACTIVATE=1`, which sets
+ *      `macosMenuOnPrimaryClick = false`.
+ *   5. Right-click the icon (also Control-click or, by default, left-click
+ *      on macOS). A two-item menu should
  *      appear: "Click me (noop)" + "Exit", separated by a horizontal line.
  *   6. Click "Click me (noop)". Stdout should print
  *      `[smoke] event: MenuItemSelected id=noop`.
@@ -64,6 +67,7 @@ fun main() {
                 TrayMenuItem.Separator,
                 TrayMenuItem.Standard(id = "exit", label = "Exit"),
             )),
+            macosMenuOnPrimaryClick = System.getenv("LIBTRAY_SMOKE_MAC_ACTIVATE") != "1",
         ),
     ) ?: run {
         val os = System.getProperty("os.name", "").lowercase()

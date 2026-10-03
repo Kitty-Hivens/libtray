@@ -30,14 +30,15 @@ places listed under Changed, and the README has a migration section.
   `@JvmOverloads`, and `TrayMenu` has a varargs constructor.
 - Windows fires `TrayEvent.MenuRequested` when the user asks for the
   menu.
-- macOS delivers clicks on the status item. The status button gets its
-  own target-action, so a middle click fires `MiddleActivated` and a right
-  click or Control-click opens the menu and fires `MenuRequested`.
-  `TrayBuilder.macosMenuOnPrimaryClick` decides the primary click: true,
-  the default, keeps opening the menu as Mac users expect, and false
-  fires `Activated` instead. The menu is attached to the status item only
-  while it is shown, and it now opens when the button is released rather
-  than when it is pressed.
+- macOS delivers clicks on the status item. A transparent view over the
+  status button receives the mouse events with the event itself, so a
+  middle click fires `MiddleActivated` and a right click or Control-click
+  opens the menu and fires `MenuRequested`. It does not rely on
+  `[NSApp currentEvent]`, which a control's action can no longer trust on
+  macOS 27. `TrayBuilder.macosMenuOnPrimaryClick` decides the primary
+  click: true, the default, keeps opening the menu as Mac users expect,
+  and false fires `Activated` instead. The menu is attached to the status
+  item only while it is shown and still opens on press.
 
 ### Changed
 - **Breaking:** events are delivered on one libtray-owned event thread

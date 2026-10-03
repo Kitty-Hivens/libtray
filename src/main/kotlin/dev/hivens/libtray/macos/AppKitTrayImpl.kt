@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLong
  *
  *   1. Bind [ObjcBindings] (libobjc + AppKit + Foundation).
  *   2. Lazily register one custom Objective-C target class per JVM —
- *      `LibtrayMenuTarget` — with one method `-onMenuItem:` whose IMP
- *      is a Panama upcall stub. Cocoa target-action requires an
+ *      `LibtrayMenuTarget` — with `-onMenuItem:` and `-onStatusItemClick:`,
+ *      each IMP a Panama upcall stub. Cocoa target-action requires an
  *      object, not a function pointer; this is the canonical bridge.
  *   3. Build the `NSStatusItem` via `[[NSStatusBar systemStatusBar]
  *      statusItemWithLength:NSVariableStatusItemLength]`. Retain it
@@ -49,19 +49,23 @@ import java.util.concurrent.atomic.AtomicLong
  *      shared LibtrayMenuTarget instance + `onMenuItem:` selector.
  *      Per-item NSInteger tag indexes the libtray id slot for reverse
  *      lookup in the upcall handler.
- *   6. The status button's own target-action points at the same shared
- *      instance (`onStatusItemClick:`), so clicks reach Kotlin. The menu
- *      is not left attached to the status item, since an attached menu
- *      makes AppKit swallow the click: [popUpMenu] attaches it only for
- *      the duration of one `performClick:`.
+ *   6. A transparent `LibtrayStatusView` is laid over the status button
+ *      and receives its mouse events, each with the `NSEvent` as an
+ *      argument, so the button and modifiers are read from the click
+ *      itself (see [handleStatusViewMouse]). The menu is not left attached
+ *      to the status item, since an attached menu makes AppKit take the
+ *      click: [popUpMenu] attaches it only for one `performClick:`. The
+ *      button's own target-action stays for presses that do not come from
+ *      the mouse, such as VoiceOver.
  *
  * **Threading.** Mutating calls (setIcon / setTooltip / setMenu) marshal
  * onto the Cocoa main queue via libdispatch (`dispatch_async_f`, see
  * [runOnMainQueue]): a call already on the main thread runs inline, any other
  * thread enqueues. AppKit therefore always runs where it wants regardless of
  * which thread the consumer calls from, and the public setters still return as
- * soon as the enqueue succeeds. The `onMenuItem:` upcall already arrives on
- * the main thread by AppKit's contract. [close] queues its teardown on the
+ * soon as the enqueue succeeds. The `onMenuItem:`, `onStatusItemClick:` and
+ * status view mouse upcalls already arrive on the main thread by AppKit's
+ * contract. [close] queues its teardown on the
  * main queue too, but waits for it, so the icon is gone when close()
  * returns (see [tearDownOnMainThread]).
  */
@@ -107,6 +111,12 @@ internal class AppKitTrayImpl private constructor(
 
     /** The menu [popUpMenu] has on screen, for [tearDown] to cancel. Main thread only. */
     private var shownMenu: MemorySegment = MemorySegment.NULL
+
+    /** The click overlay over [statusButton] (alloc +1, ours), or NULL. Main thread only. */
+    private var statusView: MemorySegment = MemorySegment.NULL
+
+    /** A primary press that did not open the menu, so its release fires Activated. Main thread only. */
+    private var primaryPressPending = false
 
     init {
         INSTANCE_REGISTRY[instanceId] = this
@@ -225,6 +235,13 @@ internal class AppKitTrayImpl private constructor(
                 runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
             }
             tagToId.clear()
+            if (statusView.address() != 0L) {
+                runCatching {
+                    bindings.handle("objc_msgSend_void").invokeExact(statusView, bindings.sel("removeFromSuperview")) as Unit
+                }
+                runCatching { bindings.handle("objc_release").invokeExact(statusView) as Unit }
+                statusView = MemorySegment.NULL
+            }
             // [[NSStatusBar systemStatusBar] removeStatusItem:item]
             runCatching {
                 val nsStatusBarCls = bindings.cls("NSStatusBar")
@@ -480,9 +497,18 @@ internal class AppKitTrayImpl private constructor(
     // ── Status item clicks ───────────────────────────────────────────────
 
     /**
-     * Point the status button's target-action at the shared target and ask
-     * for an action on every button release, as Qt's Cocoa tray does. Runs
-     * from the constructor, which [create] only reaches on the main thread.
+     * Lay a [LibtrayStatusView][ensureStatusViewClass] over the status button
+     * and point the button's target-action at the shared target. Runs from
+     * the constructor, which [create] only reaches on the main thread.
+     *
+     * The overlay is what sees mouse clicks. Its handlers get the `NSEvent`
+     * as an argument, unlike a target-action, which has to read
+     * `[NSApp currentEvent]`, and on macOS 27 that is no longer reliably the
+     * click: controls are driven by gesture recognizers there and the action
+     * arrives after the event. The overlay is sized to the button with
+     * constraints, which avoids passing an `NSRect` by value. The
+     * target-action only fires for presses that do not reach the overlay,
+     * such as VoiceOver.
      */
     private fun installClickHandler() {
         runCatching {
@@ -492,38 +518,83 @@ internal class AppKitTrayImpl private constructor(
             bindings.handle("objc_msgSend_void_sel").invokeExact(
                 statusButton, bindings.sel("setAction:"), bindings.sel("onStatusItemClick:"),
             ) as Unit
-            // sendActionOn: returns the previous mask, which nothing here needs.
+
+            val allocated = bindings.handle("objc_msgSend_id")
+                .invokeExact(statusViewClass, bindings.sel("alloc")) as MemorySegment
+            // -[NSView init] is initWithFrame: with a zero rect.
+            val view = bindings.handle("objc_msgSend_id")
+                .invokeExact(allocated, bindings.sel("init")) as MemorySegment
+            require(view.address() != 0L) { "status view init returned nil" }
+            statusView = view
             bindings.handle("objc_msgSend_void_long").invokeExact(
-                statusButton, bindings.sel("sendActionOn:"), CLICK_EVENT_MASK,
+                view, bindings.sel("setTranslatesAutoresizingMaskIntoConstraints:"), 0L,
             ) as Unit
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                statusButton, bindings.sel("addSubview:"), view,
+            ) as Unit
+            for (anchor in listOf("leadingAnchor", "trailingAnchor", "topAnchor", "bottomAnchor")) {
+                val own = bindings.handle("objc_msgSend_id").invokeExact(view, bindings.sel(anchor)) as MemorySegment
+                val button = bindings.handle("objc_msgSend_id")
+                    .invokeExact(statusButton, bindings.sel(anchor)) as MemorySegment
+                val constraint = bindings.handle("objc_msgSend_id_id")
+                    .invokeExact(own, bindings.sel("constraintEqualToAnchor:"), button) as MemorySegment
+                bindings.handle("objc_msgSend_void_long").invokeExact(
+                    constraint, bindings.sel("setActive:"), 1L,
+                ) as Unit
+            }
         }.onFailure {
-            log.warn("Installing the status item click action failed, clicks will not reach the app: {}", it.message)
+            log.warn("Installing the status item click handling failed, clicks will not reach the app: {}", it.message)
         }
     }
 
     /**
-     * Turn the click AppKit just reported into an event, reading the button
-     * and modifiers from `[NSApp currentEvent]`. Main thread, from the
-     * `onStatusItemClick:` upcall. An action without a mouse event behind it
-     * (VoiceOver, keyboard) counts as a primary click.
+     * One mouse event on the overlay, [selector] naming which. Main thread,
+     * from the status view upcall.
+     *
+     * A primary press opens the menu right away when it should, the way a
+     * status item menu opens on press, and otherwise only highlights the
+     * button so the release can fire Activated. A secondary press always
+     * asks for the menu. The middle button reports on release, like the
+     * other backends.
      */
-    private fun handleStatusItemClick() {
+    private fun handleStatusViewMouse(selector: MemorySegment, event: MemorySegment) {
         if (menuOpen) return
-        val app = bindings.handle("objc_msgSend_id")
-            .invokeExact(bindings.cls("NSApplication"), bindings.sel("sharedApplication")) as MemorySegment
-        val event = bindings.handle("objc_msgSend_id")
-            .invokeExact(app, bindings.sel("currentEvent")) as MemorySegment
-        val type = if (event.address() == 0L) NS_EVENT_TYPE_LEFT_MOUSE_UP else msgSendLong(event, "type")
-        val control = event.address() != 0L &&
-            (msgSendLong(event, "modifierFlags") and NS_EVENT_MODIFIER_FLAG_CONTROL) != 0L
-        when (type) {
-            NS_EVENT_TYPE_RIGHT_MOUSE_UP -> openMenu()
-            NS_EVENT_TYPE_OTHER_MOUSE_UP ->
-                if (msgSendLong(event, "buttonNumber") == MIDDLE_BUTTON_NUMBER) fire(TrayEvent.MiddleActivated)
-            else -> {
-                val menuOnThisClick = control || (menuOnPrimaryClick && currentMenu.address() != 0L)
-                if (menuOnThisClick) openMenu() else fire(TrayEvent.Activated)
+        when (selector.address()) {
+            bindings.sel("mouseDown:").address() -> {
+                val control = (msgSendLong(event, "modifierFlags") and NS_EVENT_MODIFIER_FLAG_CONTROL) != 0L
+                if (control || (menuOnPrimaryClick && currentMenu.address() != 0L)) {
+                    primaryPressPending = false
+                    openMenu()
+                } else {
+                    primaryPressPending = true
+                    setHighlighted(true)
+                }
             }
+            bindings.sel("mouseUp:").address() -> {
+                setHighlighted(false)
+                if (primaryPressPending) {
+                    primaryPressPending = false
+                    fire(TrayEvent.Activated)
+                }
+            }
+            bindings.sel("rightMouseDown:").address() -> openMenu()
+            bindings.sel("otherMouseUp:").address() ->
+                if (msgSendLong(event, "buttonNumber") == MIDDLE_BUTTON_NUMBER) fire(TrayEvent.MiddleActivated)
+        }
+    }
+
+    /** A press that did not come through the overlay, such as VoiceOver. Counts as a primary click. */
+    private fun handleStatusItemAction() {
+        if (menuOpen) return
+        if (menuOnPrimaryClick && currentMenu.address() != 0L) openMenu() else fire(TrayEvent.Activated)
+    }
+
+    /** The overlay takes the mouse, so the button no longer highlights on its own. */
+    private fun setHighlighted(highlighted: Boolean) {
+        runCatching {
+            bindings.handle("objc_msgSend_void_long").invokeExact(
+                statusButton, bindings.sel("highlight:"), if (highlighted) 1L else 0L,
+            ) as Unit
         }
     }
 
@@ -536,8 +607,8 @@ internal class AppKitTrayImpl private constructor(
      * Show [currentMenu] anchored to the status item. Attaching the menu and
      * sending `performClick:` lets AppKit place, track and dismiss it like
      * any status item menu, keyboard navigation included. `performClick:`
-     * returns once the menu closes, and detaching it then hands clicks back
-     * to [handleStatusItemClick]. The extra retains cover a [setMenu] that
+     * returns once the menu closes, and detaching it then leaves the next
+     * click to the overlay again. The extra retains cover a [setMenu] that
      * releases our reference to the menu while it is open, and a close()
      * that tears the status item down from inside the tracking loop, after
      * which the item must not be messaged again.
@@ -644,15 +715,7 @@ internal class AppKitTrayImpl private constructor(
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
-        // NSEventType values and the matching NSEventMask bits (1 << type),
-        // plus NSEventModifierFlagControl, from NSEvent.h.
-        private const val NS_EVENT_TYPE_LEFT_MOUSE_UP: Long = 2
-        private const val NS_EVENT_TYPE_RIGHT_MOUSE_UP: Long = 4
-        private const val NS_EVENT_TYPE_OTHER_MOUSE_UP: Long = 26
-        private const val CLICK_EVENT_MASK: Long =
-            (1L shl NS_EVENT_TYPE_LEFT_MOUSE_UP.toInt()) or
-                (1L shl NS_EVENT_TYPE_RIGHT_MOUSE_UP.toInt()) or
-                (1L shl NS_EVENT_TYPE_OTHER_MOUSE_UP.toInt())
+        /** `NSEventModifierFlagControl` from NSEvent.h. */
         private const val NS_EVENT_MODIFIER_FLAG_CONTROL: Long = 1L shl 18
 
         /** `[NSEvent buttonNumber]` of the middle button. 0 is left, 1 right. */
@@ -741,8 +804,72 @@ internal class AppKitTrayImpl private constructor(
         @Suppress("unused", "UNUSED_PARAMETER")
         fun onStatusItemClickEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
             val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusButton.address() == sender.address() } ?: return
-            runCatching { inst.handleStatusItemClick() }
+            runCatching { inst.handleStatusItemAction() }
                 .onFailure { log.warn("onStatusItemClick: handling threw: {}", it.message) }
+        }
+
+        /**
+         * The IMP behind every mouse override of `LibtrayStatusView`:
+         * `void f(id self, SEL _cmd, NSEvent *event)`. `self` is the overlay,
+         * which identifies the tray, and `_cmd` says which override ran.
+         */
+        @JvmStatic
+        fun onStatusViewMouseEntry(self: MemorySegment, cmd: MemorySegment, event: MemorySegment) {
+            val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusView.address() == self.address() } ?: return
+            runCatching { inst.handleStatusViewMouse(cmd, event) }
+                .onFailure { log.warn("status view mouse handling threw: {}", it.message) }
+        }
+
+        /** The `LibtrayStatusView_<pid>` class, built once per JVM. */
+        @Volatile private var statusViewClass: MemorySegment = MemorySegment.NULL
+        @Volatile private var statusViewStub: MemorySegment? = null
+
+        // The press and release of every button, so none of them falls through
+        // to the button underneath. Only some of them do anything.
+        private val STATUS_VIEW_SELECTORS = listOf(
+            "mouseDown:", "mouseUp:", "rightMouseDown:", "rightMouseUp:", "otherMouseDown:", "otherMouseUp:",
+        )
+
+        /**
+         * Build the runtime `LibtrayStatusView_<pid>` class once per JVM: an
+         * NSView subclass whose [STATUS_VIEW_SELECTORS] overrides all go to
+         * one upcall, [onStatusViewMouseEntry], which tells them apart by
+         * `_cmd`. Not calling super keeps the button underneath from
+         * tracking the click itself.
+         */
+        @Synchronized
+        private fun ensureStatusViewClass(bindings: ObjcBindings) {
+            if (statusViewClass.address() != 0L) return
+            val arena = Arena.ofShared()
+            val handle = MethodHandles.lookup().findStatic(
+                AppKitTrayImpl::class.java,
+                "onStatusViewMouseEntry",
+                MethodType.methodType(
+                    Void.TYPE,
+                    MemorySegment::class.java,   // self (the overlay)
+                    MemorySegment::class.java,   // _cmd (SEL)
+                    MemorySegment::class.java,   // NSEvent*
+                ),
+            )
+            val stub = Linker.nativeLinker().upcallStub(
+                handle,
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS),
+                arena,
+            )
+            val className = "LibtrayStatusView_${ProcessHandle.current().pid()}"
+            val newClass = bindings.handle("objc_allocateClassPair")
+                .invokeExact(bindings.cls("NSView"), arena.allocateFrom(className), 0L) as MemorySegment
+            require(newClass.address() != 0L) { "objc_allocateClassPair failed for $className" }
+            val typesSeg = arena.allocateFrom("v@:@")
+            for (selector in STATUS_VIEW_SELECTORS) {
+                val ok = bindings.handle("class_addMethod")
+                    .invokeExact(newClass, bindings.sel(selector), stub, typesSeg) as Boolean
+                require(ok) { "class_addMethod failed for $selector" }
+            }
+            bindings.handle("objc_registerClassPair").invokeExact(newClass) as Unit
+            statusViewStub = stub
+            statusViewClass = newClass
+            log.info("Registered runtime ObjC class {} for status item clicks", className)
         }
 
         /** Last-loaded bindings, used by the static upcall handler. */
@@ -778,8 +905,9 @@ internal class AppKitTrayImpl private constructor(
                 log.info("[create] step 1/5: ensure NSApplication is initialised")
                 ensureNSApplicationInitialised(bindings)
 
-                log.info("[create] step 2/5: register LibtrayMenuTarget class")
+                log.info("[create] step 2/5: register LibtrayMenuTarget and LibtrayStatusView classes")
                 ensureMenuTargetClass(bindings)
+                ensureStatusViewClass(bindings)
 
                 log.info("[create] step 3/5: get [NSStatusBar systemStatusBar]")
                 val nsStatusBarCls = bindings.cls("NSStatusBar")
