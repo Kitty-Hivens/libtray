@@ -536,8 +536,13 @@ internal class Win32TrayImpl private constructor(
      * No menu set → no popup. Standard behaviour: an empty right-click
      * surface is less surprising than an empty popup that opens and
      * immediately closes.
+     *
+     * [TrayEvent.MenuRequested] fires first, menu or not: it reports that
+     * the user asked for the menu. Listeners get it on the event thread, so
+     * nothing guarantees it lands before the popup opens.
      */
     private fun showContextMenu(x: Int, y: Int) {
+        fire(TrayEvent.MenuRequested)
         val menu = currentMenu ?: return
         if (menu.items.isEmpty()) return
 

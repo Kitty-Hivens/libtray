@@ -57,7 +57,7 @@ all three deliver — put anything essential in the menu:
 | `MenuItemSelected`          | yes   | yes     | yes                                                   |
 | `Activated` (primary click) | yes   | yes     | no — the primary button opens the `NSStatusItem` menu |
 | `MiddleActivated`           | yes   | yes     | no                                                    |
-| `MenuRequested`             | yes   | no      | no                                                    |
+| `MenuRequested`             | yes   | yes     | no                                                    |
 </details>
 
 <details>

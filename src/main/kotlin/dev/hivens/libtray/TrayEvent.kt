@@ -30,15 +30,17 @@ public sealed interface TrayEvent {
     public data object MiddleActivated : TrayEvent
 
     /**
-     * Right-click on the icon. Fired on Linux only, from the SNI host's
-     * `ContextMenu` call.
+     * The user asked for the menu, typically with a right click. Fired on
+     * Linux, from the SNI host's `ContextMenu` call, and on Windows, as the
+     * popup is built. Not fired on macOS yet: AppKit opens the status item
+     * menu itself and routes nothing back.
      *
-     * Informational, and it does NOT give you a chance to rebuild the menu
-     * first: the host renders from the layout it already fetched, so this
-     * arrives alongside the menu rather than before it. To change the menu,
-     * call [Tray.setMenu] when the underlying state changes — every backend
-     * picks the new layout up before the next open. Windows and macOS build
-     * their popup without routing anything back to the consumer.
+     * Best effort on timing. Linux sends it alongside a menu the host has
+     * already rendered, and on Windows it reaches the listener on the event
+     * thread while the popup opens, so it never gives you a chance to
+     * rebuild the menu first. To change the menu, call [Tray.setMenu] when
+     * the underlying state changes. Every backend picks the new layout up
+     * before the next open.
      */
     public data object MenuRequested : TrayEvent
 
