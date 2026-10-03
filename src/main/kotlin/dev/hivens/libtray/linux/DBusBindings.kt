@@ -340,8 +340,13 @@ internal class DBusBindings internal constructor(
      * `pad3` (offset 64..71) past the allocation -- silent arena corruption on
      * every `dbus_message_iter_*` call. Reserve 80 for headroom; over-allocating
      * an opaque cursor is harmless.
+     *
+     * Declared as longs, not bytes: a sequence layout takes its alignment from
+     * its element, and libdbus stores pointers in this struct, so the scratch
+     * has to be 8-byte aligned. A byte sequence only promised alignment 1 and
+     * worked because malloc happens to hand back 16-aligned blocks.
      */
-    val messageIterLayout: MemoryLayout = MemoryLayout.sequenceLayout(80, ValueLayout.JAVA_BYTE)
+    val messageIterLayout: MemoryLayout = MemoryLayout.sequenceLayout(10, ValueLayout.JAVA_LONG)
 }
 
 /**
