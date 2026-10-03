@@ -46,8 +46,9 @@ package dev.hivens.libtray
  *   menu bar. Default true. Set it to false to get [TrayEvent.Activated]
  *   for a primary click instead, with the menu on a right click or a
  *   Control-click, the way Linux and Windows behave. With no menu set,
- *   a primary click fires [TrayEvent.Activated] either way. Ignored on
- *   Linux and Windows.
+ *   a primary click fires [TrayEvent.Activated] either way. A VoiceOver
+ *   press on the status item counts as a primary click, so with false
+ *   VoiceOver has no way to open the menu. Ignored on Linux and Windows.
  */
 public data class TrayBuilder(
     val title: String,

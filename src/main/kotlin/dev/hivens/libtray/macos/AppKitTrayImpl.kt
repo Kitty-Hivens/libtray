@@ -35,12 +35,12 @@ import java.util.concurrent.atomic.AtomicLong
  * [dev.hivens.libtray.windows.Win32TrayImpl]:
  *
  *   1. Bind [ObjcBindings] (libobjc + AppKit + Foundation).
- *   2. Lazily register one custom Objective-C target class per JVM —
- *      `LibtrayMenuTarget` — with `-onMenuItem:` and `-onStatusItemClick:`,
+ *   2. Lazily register one custom Objective-C target class per JVM,
+ *      `LibtrayMenuTarget`, with `-onMenuItem:` and `-onStatusItemClick:`,
  *      each IMP a Panama upcall stub. Cocoa target-action requires an
  *      object, not a function pointer; this is the canonical bridge.
  *   3. Build the `NSStatusItem` via `[[NSStatusBar systemStatusBar]
- *      statusItemWithLength:NSVariableStatusItemLength]`. Retain it
+ *      statusItemWithLength:NSSquareStatusItemLength]`. Retain it
  *      so it lives past the autorelease pool.
  *   4. Install initial icon (PNG → NSData → NSImage → button.image)
  *      and tooltip (button.toolTip).
@@ -117,6 +117,12 @@ internal class AppKitTrayImpl private constructor(
 
     /** A primary press that did not open the menu, so its release fires Activated. Main thread only. */
     private var primaryPressPending = false
+
+    /**
+     * [System.nanoTime] of the last mouse event the overlay handled, or of
+     * the menu closing. Main thread only. See [handleStatusItemAction].
+     */
+    private var lastOverlayActivityNanos = 0L
 
     init {
         INSTANCE_REGISTRY[instanceId] = this
@@ -239,8 +245,12 @@ internal class AppKitTrayImpl private constructor(
                 runCatching {
                     bindings.handle("objc_msgSend_void").invokeExact(statusView, bindings.sel("removeFromSuperview")) as Unit
                 }
-                runCatching { bindings.handle("objc_release").invokeExact(statusView) as Unit }
-                statusView = MemorySegment.NULL
+                // With the menu open, the overlay's own mouse handler is on the
+                // stack. popUpMenu drops our reference once it has returned.
+                if (!menuOpen) {
+                    runCatching { bindings.handle("objc_release").invokeExact(statusView) as Unit }
+                    statusView = MemorySegment.NULL
+                }
             }
             // [[NSStatusBar systemStatusBar] removeStatusItem:item]
             runCatching {
@@ -506,11 +516,12 @@ internal class AppKitTrayImpl private constructor(
      * `[NSApp currentEvent]`, and on macOS 27 that is no longer reliably the
      * click: controls are driven by gesture recognizers there and the action
      * arrives after the event. The overlay is sized to the button with
-     * constraints, which avoids passing an `NSRect` by value. The
-     * target-action only fires for presses that do not reach the overlay,
-     * such as VoiceOver.
+     * constraints, which spares reading the button's `frame` back, a struct
+     * return that needs `objc_msgSend_stret` on x86_64. The target-action
+     * only fires for presses that do not reach the overlay, such as
+     * VoiceOver.
      */
-    private fun installClickHandler() {
+    private fun installClickHandler() = autoreleasepool {
         runCatching {
             bindings.handle("objc_msgSend_void_id").invokeExact(
                 statusButton, bindings.sel("setTarget:"), menuTargetInstance,
@@ -559,6 +570,7 @@ internal class AppKitTrayImpl private constructor(
      */
     private fun handleStatusViewMouse(selector: MemorySegment, event: MemorySegment) {
         if (menuOpen) return
+        lastOverlayActivityNanos = System.nanoTime()
         when (selector.address()) {
             bindings.sel("mouseDown:").address() -> {
                 val control = (msgSendLong(event, "modifierFlags") and NS_EVENT_MODIFIER_FLAG_CONTROL) != 0L
@@ -583,9 +595,19 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
-    /** A press that did not come through the overlay, such as VoiceOver. Counts as a primary click. */
+    /**
+     * A press that did not come through the overlay, such as VoiceOver.
+     * Counts as a primary click.
+     *
+     * An action shortly after overlay activity is dropped. On macOS 27 the
+     * button is driven by gesture recognizers, which may still recognize a
+     * click the overlay already handled and deliver the action late, after
+     * the menu it opened has closed. Handling that would fire the click a
+     * second time or reopen the menu.
+     */
     private fun handleStatusItemAction() {
         if (menuOpen) return
+        if (System.nanoTime() - lastOverlayActivityNanos < OVERLAY_ACTION_SUPPRESS_NANOS) return
         if (menuOnPrimaryClick && currentMenu.address() != 0L) openMenu() else fire(TrayEvent.Activated)
     }
 
@@ -599,6 +621,9 @@ internal class AppKitTrayImpl private constructor(
     }
 
     private fun openMenu() {
+        // Menu tracking eats the release of a primary press still held down,
+        // so a pending one would otherwise fire on some later stray release.
+        primaryPressPending = false
         fire(TrayEvent.MenuRequested)
         popUpMenu()
     }
@@ -612,6 +637,12 @@ internal class AppKitTrayImpl private constructor(
      * releases our reference to the menu while it is open, and a close()
      * that tears the status item down from inside the tracking loop, after
      * which the item must not be messaged again.
+     *
+     * This always runs inside the overlay's own mouse handler, under
+     * `-[NSWindow sendEvent:]` for the status bar window. When a close()
+     * landed during tracking, the last references to the overlay, the menu
+     * and the status item (which owns the button and its window) are dropped
+     * on a later main-queue turn, once that event dispatch has unwound.
      */
     private fun popUpMenu() {
         val menu = currentMenu
@@ -630,16 +661,30 @@ internal class AppKitTrayImpl private constructor(
         } finally {
             menuOpen = false
             shownMenu = MemorySegment.NULL
+            lastOverlayActivityNanos = System.nanoTime()
             if (!tornDown.get()) {
                 runCatching {
                     bindings.handle("objc_msgSend_void_id").invokeExact(
                         statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
                     ) as Unit
                 }
+                release(menu)
+                release(statusItem)
+            } else {
+                val view = statusView
+                statusView = MemorySegment.NULL
+                val releaseLater = {
+                    release(menu)
+                    release(statusItem)
+                    if (view.address() != 0L) release(view)
+                }
+                if (!enqueueOnMainQueue(releaseLater)) releaseLater()
             }
-            runCatching { bindings.handle("objc_release").invokeExact(menu) as Unit }
-            runCatching { bindings.handle("objc_release").invokeExact(statusItem) as Unit }
         }
+    }
+
+    private fun release(obj: MemorySegment) {
+        runCatching { bindings.handle("objc_release").invokeExact(obj) as Unit }
     }
 
     private fun msgSendLong(receiver: MemorySegment, selector: String): Long =
@@ -717,6 +762,9 @@ internal class AppKitTrayImpl private constructor(
 
         /** `NSEventModifierFlagControl` from NSEvent.h. */
         private const val NS_EVENT_MODIFIER_FLAG_CONTROL: Long = 1L shl 18
+
+        /** How long after overlay activity a button action is taken for the same click. */
+        private const val OVERLAY_ACTION_SUPPRESS_NANOS: Long = 500_000_000
 
         /** `[NSEvent buttonNumber]` of the middle button. 0 is left, 1 right. */
         private const val MIDDLE_BUTTON_NUMBER: Long = 2
@@ -974,7 +1022,9 @@ internal class AppKitTrayImpl private constructor(
                 // since we declared the variant that way).
                 val ret = bindings.handle("objc_msgSend_long")
                     .invokeExact(nsThreadCls, bindings.sel("isMainThread")) as Long
-                ret != 0L
+                // BOOL comes back in the low byte. The rest of the register
+                // is unspecified, as in isNSAppRunning.
+                (ret and 0xffL) != 0L
             }.getOrElse {
                 log.warn("[NSThread isMainThread] threw: {} — assuming non-main", it.message)
                 false

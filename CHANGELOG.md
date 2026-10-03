@@ -62,10 +62,10 @@ places listed under Changed, and the README has a migration section.
   Positional calls that passed `enabled` third have to move it.
 - **Binary-incompatible:** `TrayBuilder` gained two properties,
   `linuxBusName` and `macosMenuOnPrimaryClick`, so its constructor and
-  generated `copy` changed shape. Kotlin source is unaffected, but a jar compiled against 0.1.3 that relies on the
-  default arguments or calls `copy` hits `NoSuchMethodError`, and Java
-  callers of the five-argument constructor stop compiling. Java should
-  move to `TrayBuilder.of`.
+  generated `copy` changed shape. Kotlin source is unaffected, but a jar
+  compiled against 0.1.3 that relies on the default arguments or calls
+  `copy` hits `NoSuchMethodError`, and Java callers of the five-argument
+  constructor stop compiling. Java should move to `TrayBuilder.of`.
 - `TrayEvent.MenuRequested` means that the user asked for the menu, with
   timing explicitly best effort, instead of being a Linux-only echo of
   the SNI `ContextMenu` call. On Linux it stays host-dependent: a host

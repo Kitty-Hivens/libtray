@@ -31,9 +31,11 @@ import javax.imageio.ImageIO
  *   5. Right-click the icon (also Control-click or, by default, left-click
  *      on macOS). A two-item menu should
  *      appear: "Click me (noop)" + "Exit", separated by a horizontal line.
- *   6. Click "Click me (noop)". Stdout should print
+ *   6. Middle-click the icon. Stdout should print
+ *      `[smoke] event: MiddleActivated`.
+ *   7. Open the menu again and click "Click me (noop)". Stdout should print
  *      `[smoke] event: MenuItemSelected id=noop`.
- *   7. Right-click again, click "Exit". Stdout should print
+ *   8. Open the menu again, click "Exit". Stdout should print
  *      `id=exit` and the program should terminate cleanly.
  *
  * Per-OS prerequisites covered in the failure message below.
@@ -99,7 +101,7 @@ fun main() {
         when (event) {
             is TrayEvent.Activated         -> println("[smoke] event: Activated (left click)")
             is TrayEvent.MiddleActivated   -> println("[smoke] event: MiddleActivated")
-            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested (right click — the host renders the menu itself)")
+            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested")
             is TrayEvent.MenuItemSelected  -> {
                 println("[smoke] event: MenuItemSelected id=${event.id}")
                 if (event.id == "exit") exitFlag.countDown()
