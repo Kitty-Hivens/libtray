@@ -1,11 +1,14 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.EventDispatcher
 import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.TraySubscription
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
@@ -19,8 +22,8 @@ import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -65,7 +68,7 @@ internal class Win32TrayImpl private constructor(
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
     @Volatile private var open = AtomicBoolean(true)
-    private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+    private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
      * The HWND for the message-only window. Set by the pump thread once
@@ -92,6 +95,9 @@ internal class Win32TrayImpl private constructor(
 
     /** Set true by the pump thread after a successful NIM_ADD. */
     @Volatile private var creationSucceeded: Boolean = false
+
+    /** Whether NIM_SETVERSION took, which decides how a right click arrives. Pump thread only. */
+    private var version4: Boolean = false
 
     /**
      * Reusable NOTIFYICONDATAW struct. Allocated once on the bindings
@@ -177,13 +183,14 @@ internal class Win32TrayImpl private constructor(
         return true
     }
 
-    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
-        handlers.add(handler)
-        return { handlers.remove(handler) }
-    }
+    override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
+
+    override fun onEvent(executor: Executor, listener: TrayEventListener): TraySubscription =
+        events.subscribe(listener, executor)
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        events.close()
         // Remove the tray icon BEFORE tearing down the window — once the
         // HWND is destroyed the shell may still hold an entry pointed at
         // a stale handle, which can leave a ghost icon until the next
@@ -406,7 +413,8 @@ internal class Win32TrayImpl private constructor(
         }
         // NIM_SETVERSION must come AFTER NIM_ADD per MSDN; it switches
         // the icon entry to NOTIFYICON_VERSION_4 mouse-message format.
-        if (!shellNotifyIcon(Win32Bindings.NIM_SETVERSION)) {
+        version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
+        if (!version4) {
             log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
         }
 
@@ -505,7 +513,11 @@ internal class Win32TrayImpl private constructor(
             when (event) {
                 Win32Bindings.WM_LBUTTONUP -> fire(TrayEvent.Activated)
                 Win32Bindings.WM_MBUTTONUP -> fire(TrayEvent.MiddleActivated)
-                Win32Bindings.WM_RBUTTONUP, Win32Bindings.WM_CONTEXTMENU -> showContextMenu(x, y)
+                // A version 4 shell sends WM_RBUTTONUP and then WM_CONTEXTMENU
+                // for one right click, and WM_CONTEXTMENU alone for Shift+F10
+                // or the menu key. Opening on both would track the popup twice.
+                Win32Bindings.WM_CONTEXTMENU -> if (version4) showContextMenu(x, y)
+                Win32Bindings.WM_RBUTTONUP -> if (!version4) showContextMenu(x, y)
             }
             0L
         }
@@ -532,8 +544,13 @@ internal class Win32TrayImpl private constructor(
      * No menu set → no popup. Standard behaviour: an empty right-click
      * surface is less surprising than an empty popup that opens and
      * immediately closes.
+     *
+     * [TrayEvent.MenuRequested] fires first, menu or not: it reports that
+     * the user asked for the menu. Listeners get it on the event thread, so
+     * nothing guarantees it lands before the popup opens.
      */
     private fun showContextMenu(x: Int, y: Int) {
+        fire(TrayEvent.MenuRequested)
         val menu = currentMenu ?: return
         if (menu.items.isEmpty()) return
 
@@ -640,11 +657,7 @@ internal class Win32TrayImpl private constructor(
     private fun defWindowProc(uMsg: Int, wParam: Long, lParam: Long): Long =
         bindings.handle("DefWindowProcW").invokeExact(hwnd, uMsg, wParam, lParam) as Long
 
-    private fun fire(event: TrayEvent) {
-        for (h in handlers) {
-            runCatching { h(event) }.onFailure { log.warn("event handler threw", it) }
-        }
-    }
+    private fun fire(event: TrayEvent) = events.fire(event)
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.Win32Tray")

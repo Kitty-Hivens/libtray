@@ -5,6 +5,13 @@ package dev.hivens.libtray
  * for its lifetime so subsequent setter calls can layer over a known
  * baseline.
  *
+ * Kotlin builds one with named arguments. Java uses [TrayBuilder.of], which
+ * keeps compiling when a field is added:
+ *
+ * ```java
+ * TrayBuilder spec = TrayBuilder.of("MyApp", iconBytes).menu(menu).build();
+ * ```
+ *
  * @property title The application identifier the tray host uses to
  *   distinguish this icon from other apps' icons. Linux derives the SNI
  *   `Id` from it; Windows uses it for the notification-area uniqueness key;
@@ -78,7 +85,44 @@ public data class TrayBuilder(
         return result
     }
 
-    private companion object {
+    /**
+     * Fluent construction for Java, which has no named or default
+     * arguments. Start it with [TrayBuilder.of]. Every optional field has a
+     * setter and starts at the same default the constructor uses, so a
+     * field added later is one more setter and existing call sites keep
+     * compiling. Validation runs in [build].
+     */
+    public class Builder internal constructor(
+        private val title: String,
+        private val iconBytes: ByteArray,
+    ) {
+        private var tooltip: String? = null
+        private var menu: TrayMenu? = null
+        private var maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE
+        private var linuxBusName: String? = null
+
+        /** See [TrayBuilder.tooltip]. */
+        public fun tooltip(tooltip: String?): Builder = apply { this.tooltip = tooltip }
+
+        /** See [TrayBuilder.menu]. */
+        public fun menu(menu: TrayMenu?): Builder = apply { this.menu = menu }
+
+        /** See [TrayBuilder.maxIconSize]. */
+        public fun maxIconSize(maxIconSize: Int?): Builder = apply { this.maxIconSize = maxIconSize }
+
+        /** See [TrayBuilder.linuxBusName]. */
+        public fun linuxBusName(linuxBusName: String?): Builder = apply { this.linuxBusName = linuxBusName }
+
+        /** @throws IllegalArgumentException on the same invalid input the constructor rejects. */
+        public fun build(): TrayBuilder =
+            TrayBuilder(title, iconBytes, tooltip, menu, maxIconSize, linuxBusName)
+    }
+
+    public companion object {
         private val WELL_KNOWN_BUS_NAME = Regex("[A-Za-z_-][A-Za-z0-9_-]*(\\.[A-Za-z_-][A-Za-z0-9_-]*)+")
+
+        /** Start a [Builder] from the two required fields. */
+        @JvmStatic
+        public fun of(title: String, iconBytes: ByteArray): Builder = Builder(title, iconBytes)
     }
 }

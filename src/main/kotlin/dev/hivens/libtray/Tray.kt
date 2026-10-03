@@ -1,6 +1,7 @@
 package dev.hivens.libtray
 
 import org.slf4j.LoggerFactory
+import java.util.concurrent.Executor
 
 /**
  * A live system-tray icon owned by this process.
@@ -12,11 +13,13 @@ import org.slf4j.LoggerFactory
  * crash the application.
  *
  * Threading: implementations don't pin the caller to a specific thread.
- * Backend-side event dispatch happens on a thread the backend chooses
- * (D-Bus reader thread on Linux, Win32 message pump thread on Windows,
- * Cocoa main thread on macOS); the registered [onEvent] handler runs on
- * that thread. Consumers wanting to touch UI state should hop themselves
- * (e.g. via `withContext(Dispatchers.Main)`).
+ * Events are delivered on one event thread per tray that libtray owns, in
+ * the order they happened, never on the thread that talks to the platform.
+ * A listener that blocks delays later events for that tray but cannot stall
+ * the tray host or [close]. To land on a UI thread, register with
+ * `onEvent(executor, listener)` and pass the toolkit's executor
+ * (`Platform::runLater`, `SwingUtilities::invokeLater`,
+ * `Dispatchers.Main.asExecutor()`).
  *
  * No-throw philosophy: the tray is a non-essential UX surface. Every
  * mutating call (`setTooltip` / `setIcon` / `setMenu`) returns boolean
@@ -53,11 +56,18 @@ public interface Tray : AutoCloseable {
     public fun setMenu(menu: TrayMenu?): Boolean
 
     /**
-     * Subscribe to tray events. The handler is invoked on the backend's
-     * dispatch thread (see class KDoc). The returned function unsubscribes
-     * the handler when called; idempotent.
+     * Subscribe to tray events. [listener] runs on this tray's event thread
+     * (see class KDoc). Closing the returned [TraySubscription] stops
+     * delivery to it.
      */
-    public fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit
+    public fun onEvent(listener: TrayEventListener): TraySubscription
+
+    /**
+     * Subscribe to tray events, each one handed to [executor] instead of run
+     * on the event thread. Use it to receive events straight on a UI thread.
+     * An executor that rejects a task drops that event with a warning.
+     */
+    public fun onEvent(executor: Executor, listener: TrayEventListener): TraySubscription
 
     /**
      * Hide the icon and release backend resources. Idempotent — calling
@@ -76,6 +86,7 @@ public interface Tray : AutoCloseable {
          * Callers should treat null as "tray UX not available, degrade
          * gracefully" (hide the menu item, don't crash).
          */
+        @JvmStatic
         public fun create(builder: TrayBuilder): Tray? {
             val osName = System.getProperty("os.name", "").lowercase()
             val backend: Tray? = runCatching {

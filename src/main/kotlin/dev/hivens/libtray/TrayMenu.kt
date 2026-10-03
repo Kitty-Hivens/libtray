@@ -11,6 +11,9 @@ package dev.hivens.libtray
 public data class TrayMenu(
     val items: List<TrayMenuItem>,
 ) {
+    /** Varargs convenience, mostly for Java: `new TrayMenu(show, TrayMenuItem.Separator.INSTANCE, exit)`. */
+    public constructor(vararg items: TrayMenuItem) : this(items.toList())
+
     init {
         // Don't enforce uniqueness on item ids — some platforms (Win32)
         // index by HMENU position rather than id, and a duplicate id is
@@ -38,7 +41,7 @@ public sealed interface TrayMenuItem {
     /**
      * A regular click-to-fire menu entry. Most common shape.
      */
-    public data class Standard(
+    public data class Standard @JvmOverloads constructor(
         public override val id: String,
         public override val label: String,
         public override val enabled: Boolean = true,
@@ -48,11 +51,11 @@ public sealed interface TrayMenuItem {
      * A nested submenu. Backends render this as a parent item with an
      * arrow that opens the [items] children on hover/click.
      */
-    public data class Submenu(
+    public data class Submenu @JvmOverloads constructor(
         public override val id: String,
         public override val label: String,
-        public override val enabled: Boolean = true,
         val items: List<TrayMenuItem>,
+        public override val enabled: Boolean = true,
     ) : TrayMenuItem {
         init {
             require(items.isNotEmpty()) { "submenu '$id' must have at least one item" }

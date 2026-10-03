@@ -5,6 +5,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+This release reworks the public API for Java callers and the threading
+of event delivery. It breaks source and binary compatibility in the
+places listed under Changed, and the README has a migration section.
+
 ### Added
 - `TrayBuilder.linuxBusName`: the well-known D-Bus name the Linux
   backend requests for its StatusNotifierItem. Null keeps the generated
@@ -13,16 +17,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   needs only `--talk-name=org.kde.StatusNotifierWatcher` instead of
   `--own-name=org.kde.*`. The name must be free on the session bus, so a
   second instance asking for the same one gets no tray.
+- `Tray.onEvent(executor, listener)`: each event is handed to the
+  executor instead of run on the event thread, so a consumer can receive
+  events straight on its UI thread (`Platform::runLater`,
+  `SwingUtilities::invokeLater`, `Dispatchers.Main.asExecutor()`).
+- `TrayBuilder.of(title, iconBytes)` returns a fluent `TrayBuilder.Builder`
+  for Java, with one setter per optional field and the constructor's
+  defaults. A field added later becomes another setter, so Java call
+  sites stop breaking whenever `TrayBuilder` grows.
+- Java conveniences that change nothing for Kotlin: `Tray.create` is
+  `@JvmStatic`, `TrayMenuItem.Standard` and `Submenu` have
+  `@JvmOverloads`, and `TrayMenu` has a varargs constructor.
+- Windows fires `TrayEvent.MenuRequested` when the user asks for the
+  menu.
 
 ### Changed
+- **Breaking:** events are delivered on one libtray-owned event thread
+  per tray, in firing order, instead of on the thread the backend
+  received them on (the D-Bus I/O thread, the Win32 message pump, the
+  Cocoa main thread). A listener that blocks now delays later events for
+  its tray and nothing else: it can no longer hold up replies to the tray
+  host or keep `close()` from releasing the D-Bus connection. A macOS
+  listener that touched AppKit relying on being on the main thread has
+  to register with an executor now.
+- **Breaking:** `Tray.onEvent` takes a `TrayEventListener` (a
+  `fun interface`) and returns a `TraySubscription` instead of a
+  `() -> Unit`. Kotlin lambdas and function-typed values still convert,
+  so only code that stores or invokes the returned handle changes:
+  `unsubscribe()` becomes `subscription.close()`. Java no longer returns
+  `Unit.INSTANCE` from the listener, and `TraySubscription.close()`
+  declares no checked exception. A class that implements `Tray` itself,
+  such as a test double, has to implement both `onEvent` overloads.
+- **Breaking:** `TrayMenuItem.Submenu` takes `items` before `enabled`,
+  matching `Standard`, where `enabled` is the trailing default.
+  Positional calls that passed `enabled` third have to move it.
 - **Binary-incompatible:** `TrayBuilder` gained a sixth property, so its
   constructor and generated `copy` changed shape. Kotlin source is
   unaffected, but a jar compiled against 0.1.3 that relies on the
   default arguments or calls `copy` hits `NoSuchMethodError`, and Java
-  callers of the five-argument constructor stop compiling until they
-  pass `null` as the sixth. The README has a migration section.
+  callers of the five-argument constructor stop compiling. Java should
+  move to `TrayBuilder.of`.
+- `TrayEvent.MenuRequested` means that the user asked for the menu, with
+  timing explicitly best effort, instead of being a Linux-only echo of
+  the SNI `ContextMenu` call. On Linux it stays host-dependent: a host
+  that renders the dbusmenu itself may never call `ContextMenu`. macOS
+  does not fire it yet.
 - `TrayBuilder.title` no longer claims to be the Linux bus name suffix.
   It never was: the backend derives only the SNI `Id` from it.
+
+### Fixed
+- macOS: `close()` runs its teardown on the Cocoa main queue and waits up
+  to two seconds for it, then falls back to the calling thread.
+  `NSStatusItem` is main-thread-only and `close()` is usually called from
+  a listener, which now runs on the event thread. Queued behind the main
+  queue, the teardown also no longer races a `setIcon` or `setMenu` that
+  is already executing there.
+- Windows opens the context menu on `WM_CONTEXTMENU` when the shell
+  accepted `NOTIFYICON_VERSION_4`, and on `WM_RBUTTONUP` only otherwise.
+  A version 4 shell sends both for one right click, and both were routed
+  to the popup.
+- Linux: the `DBusMessageIter` scratch is declared as ten longs instead
+  of eighty bytes. A byte sequence carries alignment 1 while libdbus
+  stores pointers in the struct, and it only worked because malloc hands
+  back 16-aligned blocks.
 
 ## [0.1.3]
 
