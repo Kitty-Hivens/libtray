@@ -6,11 +6,10 @@ package dev.hivens.libtray
  * baseline.
  *
  * @property title The application identifier the tray host uses to
- *   distinguish this icon from other apps' icons. Linux's StatusNotifierItem
- *   uses it as the well-known D-Bus name suffix; Windows uses it for the
- *   notification-area uniqueness key; macOS shows it as the AppleScript
- *   identifier. Pick something stable across releases (typically your
- *   reverse-DNS app id or program name).
+ *   distinguish this icon from other apps' icons. Linux derives the SNI
+ *   `Id` from it; Windows uses it for the notification-area uniqueness key;
+ *   macOS shows it as the AppleScript identifier. Pick something stable
+ *   across releases (typically your reverse-DNS app id or program name).
  * @property iconBytes Initial icon bytes. PNG is the universally-supported
  *   format. The library doesn't decode — backends pass the bytes straight
  *   to the OS surface.
@@ -26,6 +25,15 @@ package dev.hivens.libtray
  *   on every query the host makes. Default 256, which is also the largest
  *   size the Win32 backend accepts. Set to null to send the original
  *   bytes untouched.
+ * @property linuxBusName Optional well-known D-Bus name for the Linux
+ *   StatusNotifierItem. Defaults to the existing
+ *   `org.kde.StatusNotifierItem-PID-N` name. Flatpak apps can set a name
+ *   within their own app-id namespace (for example,
+ *   `com.example.MyApp.StatusNotifierItem`) instead of requesting
+ *   ownership of `org.kde.*`. The name must be unique on the session
+ *   bus: a second tray asking for a name already taken, from this
+ *   process or from another running instance of the app, gets no icon
+ *   and [Tray.create] returns null. Ignored on Windows and macOS.
  */
 public data class TrayBuilder(
     val title: String,
@@ -33,12 +41,17 @@ public data class TrayBuilder(
     val tooltip: String? = null,
     val menu: TrayMenu? = null,
     val maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE,
+    val linuxBusName: String? = null,
 ) {
     init {
         require(title.isNotBlank()) { "title must be non-blank" }
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
         require(maxIconSize == null || maxIconSize > 0) {
             "maxIconSize must be positive, or null to disable scaling"
+        }
+        require(linuxBusName == null ||
+            (linuxBusName.length <= 255 && WELL_KNOWN_BUS_NAME.matches(linuxBusName))) {
+            "linuxBusName must be a valid well-known D-Bus name"
         }
     }
 
@@ -51,6 +64,7 @@ public data class TrayBuilder(
             tooltip == other.tooltip &&
             menu == other.menu &&
             maxIconSize == other.maxIconSize &&
+            linuxBusName == other.linuxBusName &&
             iconBytes.contentEquals(other.iconBytes)
     }
 
@@ -60,6 +74,11 @@ public data class TrayBuilder(
         result = 31 * result + (tooltip?.hashCode() ?: 0)
         result = 31 * result + (menu?.hashCode() ?: 0)
         result = 31 * result + (maxIconSize ?: 0)
+        result = 31 * result + (linuxBusName?.hashCode() ?: 0)
         return result
+    }
+
+    private companion object {
+        private val WELL_KNOWN_BUS_NAME = Regex("[A-Za-z_-][A-Za-z0-9_-]*(\\.[A-Za-z_-][A-Za-z0-9_-]*)+")
     }
 }

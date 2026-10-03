@@ -39,11 +39,11 @@ read end-to-end in one sitting.
 <details>
   <summary>Platform backends</summary>
 
-| Platform | Backend | Notes |
-|---|---|---|
-| Linux   | `org.kde.StatusNotifierItem` over D-Bus + `com.canonical.dbusmenu` for the menu | Talks to the desktop's tray host directly via libdbus. No GTK / GLib runtime dependency. Works on KDE, GNOME with the SNI extension, Hyprland (via waybar / similar), Cinnamon, Budgie. |
-| Windows | `Shell_NotifyIcon` via `shell32` | Win32 message-pump driven. The classic "balloon notification" surface. |
-| macOS   | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend` | Menu-bar item top-right. Requires the JVM to be running with a Cocoa main thread (most JVM desktop apps already do). |
+| Platform | Backend                                                                         | Notes                                                                                                                                                                                   |
+|----------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Linux    | `org.kde.StatusNotifierItem` over D-Bus + `com.canonical.dbusmenu` for the menu | Talks to the desktop's tray host directly via libdbus. No GTK / GLib runtime dependency. Works on KDE, GNOME with the SNI extension, Hyprland (via waybar / similar), Cinnamon, Budgie. |
+| Windows  | `Shell_NotifyIcon` via `shell32`                                                | Win32 message-pump driven. The classic "balloon notification" surface.                                                                                                                  |
+| macOS    | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend`                      | Menu-bar item top-right. Requires the JVM to be running with a Cocoa main thread (most JVM desktop apps already do).                                                                    |
 
 Each backend lives in its own package so consumers can audit / patch the
 one that affects them without grokking the others.
@@ -52,12 +52,12 @@ Event coverage is not uniform, because how much of the interaction the
 platform keeps to itself differs. `MenuItemSelected` is the only event
 all three deliver — put anything essential in the menu:
 
-| Event | Linux | Windows | macOS |
-|---|---|---|---|
-| `MenuItemSelected` | yes | yes | yes |
-| `Activated` (primary click) | yes | yes | no — the primary button opens the `NSStatusItem` menu |
-| `MiddleActivated` | yes | yes | no |
-| `MenuRequested` | yes | no | no |
+| Event                       | Linux | Windows | macOS                                                 |
+|-----------------------------|-------|---------|-------------------------------------------------------|
+| `MenuItemSelected`          | yes   | yes     | yes                                                   |
+| `Activated` (primary click) | yes   | yes     | no — the primary button opens the `NSStatusItem` menu |
+| `MiddleActivated`           | yes   | yes     | no                                                    |
+| `MenuRequested`             | yes   | no      | no                                                    |
 </details>
 
 <details>
@@ -109,6 +109,60 @@ tray.onEvent { event ->
 // On app shutdown
 tray.close()
 ```
+
+For Flatpak on Linux, set `linuxBusName` to a unique name within your
+application ID's D-Bus namespace:
+
+```kotlin
+TrayBuilder(
+    title = "MyApp",
+    iconBytes = iconBytes,
+    linuxBusName = "com.example.MyApp.StatusNotifierItem",
+)
+```
+
+The Flatpak manifest still needs permission to talk to the tray watcher:
+
+```yaml
+finish-args:
+  - --talk-name=org.kde.StatusNotifierWatcher
+```
+
+No `--own-name=org.kde.*` permission is needed for this setup. Outside
+Flatpak, omitting `linuxBusName` preserves the generated
+`org.kde.StatusNotifierItem-PID-N` name.
+
+The name is held for the whole session bus, so a second running instance
+of the app that asks for the same one gets no icon (`Tray.create` returns
+null). Single-instance apps can use a fixed name as shown.
+</details>
+
+<details>
+  <summary>Migrating</summary>
+
+### From 0.1.3
+
+`TrayBuilder` gained `linuxBusName`, which changes its constructor and
+`copy` on the JVM.
+
+| Caller  | What to do                                                                                                                                                               |
+|---------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Kotlin  | Nothing in the source. Recompile against the new version: a jar built against 0.1.3 throws `NoSuchMethodError` wherever it relied on default arguments or called `copy`. |
+| Java    | Pass `null` as the new last constructor argument to keep the generated bus name.                                                                                         |
+| Flatpak | Set `linuxBusName` to a name under your app ID and drop `--own-name=org.kde.*` from `finish-args`.                                                                       |
+
+```java
+// 0.1.3
+new TrayBuilder("MyApp", iconBytes, "MyApp", menu, 256);
+// now
+new TrayBuilder("MyApp", iconBytes, "MyApp", menu, 256, null);
+```
+
+### From 0.1.2
+
+`TrayBuilder` gained `maxIconSize`. Recompile Kotlin callers. Java
+callers of the four-argument constructor pass the size (`256` keeps the
+default, `null` turns scaling off) as the fifth argument.
 </details>
 
 <details>
