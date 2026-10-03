@@ -44,16 +44,6 @@ class TrayBuilderTest {
     }
 
     @Test
-    fun `keeps the five-argument constructor for Java callers`() {
-        val constructor = TrayBuilder::class.java.getConstructor(
-            String::class.java, ByteArray::class.java, String::class.java,
-            TrayMenu::class.java, Int::class.javaObjectType,
-        )
-        val builder = constructor.newInstance("MyApp", sampleIcon, null, null, 256)
-        builder.linuxBusName shouldBe null
-    }
-
-    @Test
     fun `equals compares iconBytes by content`() {
         // Generated equals on a data class with ByteArray uses identity
         // equality, which is wrong for bytes. The override on TrayBuilder

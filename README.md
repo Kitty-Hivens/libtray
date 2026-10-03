@@ -131,6 +131,38 @@ finish-args:
 No `--own-name=org.kde.*` permission is needed for this setup. Outside
 Flatpak, omitting `linuxBusName` preserves the generated
 `org.kde.StatusNotifierItem-PID-N` name.
+
+The name is held for the whole session bus, so a second running instance
+of the app that asks for the same one gets no icon (`Tray.create` returns
+null). Single-instance apps can use a fixed name as shown.
+</details>
+
+<details>
+  <summary>Migrating</summary>
+
+### From 0.1.3
+
+`TrayBuilder` gained `linuxBusName`, which changes its constructor and
+`copy` on the JVM.
+
+| Caller | What to do |
+|---|---|
+| Kotlin | Nothing in the source. Recompile against the new version: a jar built against 0.1.3 throws `NoSuchMethodError` wherever it relied on default arguments or called `copy`. |
+| Java | Pass `null` as the new last constructor argument to keep the generated bus name. |
+| Flatpak | Set `linuxBusName` to a name under your app ID and drop `--own-name=org.kde.*` from `finish-args`. |
+
+```java
+// 0.1.3
+new TrayBuilder("MyApp", iconBytes, "MyApp", menu, 256);
+// now
+new TrayBuilder("MyApp", iconBytes, "MyApp", menu, 256, null);
+```
+
+### From 0.1.2
+
+`TrayBuilder` gained `maxIconSize`. Recompile Kotlin callers. Java
+callers of the four-argument constructor pass the size (`256` keeps the
+default, `null` turns scaling off) as the fifth argument.
 </details>
 
 <details>

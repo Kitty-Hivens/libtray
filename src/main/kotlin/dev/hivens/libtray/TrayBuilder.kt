@@ -30,8 +30,10 @@ package dev.hivens.libtray
  *   `org.kde.StatusNotifierItem-PID-N` name. Flatpak apps can set a name
  *   within their own app-id namespace (for example,
  *   `com.example.MyApp.StatusNotifierItem`) instead of requesting
- *   ownership of `org.kde.*`. The name must be unique if the process
- *   creates multiple tray icons. Ignored on Windows and macOS.
+ *   ownership of `org.kde.*`. The name must be unique on the session
+ *   bus: a second tray asking for a name already taken, from this
+ *   process or from another running instance of the app, gets no icon
+ *   and [Tray.create] returns null. Ignored on Windows and macOS.
  */
 public data class TrayBuilder(
     val title: String,
@@ -41,15 +43,6 @@ public data class TrayBuilder(
     val maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE,
     val linuxBusName: String? = null,
 ) {
-    // Keep the five-argument JVM constructor used by existing Java callers.
-    public constructor(
-        title: String,
-        iconBytes: ByteArray,
-        tooltip: String?,
-        menu: TrayMenu?,
-        maxIconSize: Int?,
-    ) : this(title, iconBytes, tooltip, menu, maxIconSize, null)
-
     init {
         require(title.isNotBlank()) { "title must be non-blank" }
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }

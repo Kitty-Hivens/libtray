@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- `TrayBuilder.linuxBusName`: the well-known D-Bus name the Linux
+  backend requests for its StatusNotifierItem. Null keeps the generated
+  `org.kde.StatusNotifierItem-PID-N`. A Flatpak app can set a name under
+  its own app ID, which the sandbox lets it own by default, and then
+  needs only `--talk-name=org.kde.StatusNotifierWatcher` instead of
+  `--own-name=org.kde.*`. The name must be free on the session bus, so a
+  second instance asking for the same one gets no tray.
+
+### Changed
+- **Binary-incompatible:** `TrayBuilder` gained a sixth property, so its
+  constructor and generated `copy` changed shape. Kotlin source is
+  unaffected, but a jar compiled against 0.1.3 that relies on the
+  default arguments or calls `copy` hits `NoSuchMethodError`, and Java
+  callers of the five-argument constructor stop compiling until they
+  pass `null` as the sixth. The README has a migration section.
+- `TrayBuilder.title` no longer claims to be the Linux bus name suffix.
+  It never was: the backend derives only the SNI `Id` from it.
+
 ## [0.1.3]
 
 ### Added
