@@ -105,6 +105,9 @@ internal class AppKitTrayImpl private constructor(
      */
     private var menuOpen = false
 
+    /** The menu [popUpMenu] has on screen, for [tearDown] to cancel. Main thread only. */
+    private var shownMenu: MemorySegment = MemorySegment.NULL
+
     init {
         INSTANCE_REGISTRY[instanceId] = this
         installClickHandler()
@@ -203,6 +206,14 @@ internal class AppKitTrayImpl private constructor(
     private fun tearDown() {
         if (!tornDown.compareAndSet(false, true)) return
         autoreleasepool {
+            // close() from inside the open menu's tracking loop (a listener, or
+            // the main queue draining while the menu is up): end the tracking
+            // first so AppKit is not left showing a menu of a removed item.
+            if (menuOpen && shownMenu.address() != 0L) {
+                runCatching {
+                    bindings.handle("objc_msgSend_void").invokeExact(shownMenu, bindings.sel("cancelTracking")) as Unit
+                }
+            }
             val prev = currentMenu
             currentMenu = MemorySegment.NULL
             if (prev.address() != 0L) {
@@ -526,14 +537,18 @@ internal class AppKitTrayImpl private constructor(
      * sending `performClick:` lets AppKit place, track and dismiss it like
      * any status item menu, keyboard navigation included. `performClick:`
      * returns once the menu closes, and detaching it then hands clicks back
-     * to [handleStatusItemClick]. The extra retain covers a [setMenu] that
-     * lands while the menu is open and releases our reference to it.
+     * to [handleStatusItemClick]. The extra retains cover a [setMenu] that
+     * releases our reference to the menu while it is open, and a close()
+     * that tears the status item down from inside the tracking loop, after
+     * which the item must not be messaged again.
      */
     private fun popUpMenu() {
         val menu = currentMenu
         if (menu.address() == 0L) return
         bindings.handle("objc_retain").invokeExact(menu) as MemorySegment
+        bindings.handle("objc_retain").invokeExact(statusItem) as MemorySegment
         menuOpen = true
+        shownMenu = menu
         try {
             bindings.handle("objc_msgSend_void_id").invokeExact(
                 statusItem, bindings.sel("setMenu:"), menu,
@@ -543,12 +558,16 @@ internal class AppKitTrayImpl private constructor(
             ) as Unit
         } finally {
             menuOpen = false
-            runCatching {
-                bindings.handle("objc_msgSend_void_id").invokeExact(
-                    statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
-                ) as Unit
+            shownMenu = MemorySegment.NULL
+            if (!tornDown.get()) {
+                runCatching {
+                    bindings.handle("objc_msgSend_void_id").invokeExact(
+                        statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
+                    ) as Unit
+                }
             }
             runCatching { bindings.handle("objc_release").invokeExact(menu) as Unit }
+            runCatching { bindings.handle("objc_release").invokeExact(statusItem) as Unit }
         }
     }
 

@@ -32,10 +32,10 @@ public sealed interface TrayEvent {
      * Windows and macOS as the popup is opened, also when no menu is set.
      * On macOS that includes a Control-click, and a primary click while
      * [TrayBuilder.macosMenuOnPrimaryClick] is true and a menu is set. On
-     * Linux it depends on
-     * the tray host: the event comes from the SNI `ContextMenu` call, and a
-     * host that renders the dbusmenu itself, which is the common case, may
-     * open the menu without ever making that call.
+     * Linux it depends on the tray host: the event comes from the SNI
+     * `ContextMenu` call, and a host that renders the dbusmenu itself,
+     * which is the common case, may open the menu without ever making that
+     * call.
      *
      * Best effort on timing. Linux sends it alongside a menu the host has
      * already rendered, and elsewhere it reaches the listener on the event
