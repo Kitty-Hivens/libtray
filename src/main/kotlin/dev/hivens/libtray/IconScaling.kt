@@ -1,13 +1,12 @@
 package dev.hivens.libtray
 
 import org.slf4j.Logger
-import java.awt.Image
-import java.awt.RenderingHints
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import javax.imageio.ImageIO
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -61,30 +60,11 @@ internal object IconScaling {
         val targetHeight = max(1, (height * scale).roundToInt())
 
         return runCatching {
-            // SCALE_SMOOTH (area averaging) rather than a bilinear draw:
-            // reductions here are typically 4x or more, where bilinear
-            // samples too sparsely and aliases the glyph into noise.
-            val scaled = image.getScaledInstance(targetWidth, targetHeight, Image.SCALE_SMOOTH)
+            val source = IntArray(width * height)
+            image.getRGB(0, 0, width, height, source, 0, width)
+            val scaled = areaAverage(source, width, height, targetWidth, targetHeight)
             val out = BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB)
-            val g = out.createGraphics()
-            try {
-                // getScaledInstance hands back an Image that is produced
-                // asynchronously, and drawImage with a null observer draws
-                // only what happens to be ready. It returns false when that
-                // was not everything -- in which case redo the reduction
-                // straight from the BufferedImage, which is synchronous.
-                // Bilinear is the weaker filter, but a slightly soft icon
-                // beats a blank one.
-                if (!g.drawImage(scaled, 0, 0, null)) {
-                    g.setRenderingHint(
-                        RenderingHints.KEY_INTERPOLATION,
-                        RenderingHints.VALUE_INTERPOLATION_BILINEAR,
-                    )
-                    g.drawImage(image, 0, 0, targetWidth, targetHeight, null)
-                }
-            } finally {
-                g.dispose()
-            }
+            out.setRGB(0, 0, targetWidth, targetHeight, scaled, 0, targetWidth)
             val encoded = ByteArrayOutputStream()
             if (!ImageIO.write(out, "PNG", encoded)) return bytes
             val result = encoded.toByteArray()
@@ -100,4 +80,75 @@ internal object IconScaling {
             bytes
         }
     }
+
+    /**
+     * Shrink [source], `sourceWidth` x `sourceHeight` ARGB pixels, to
+     * `targetWidth` x `targetHeight` by area averaging: each target pixel is
+     * the mean of the source area it covers, with partly covered source
+     * pixels weighted by how much of them it covers. Reductions here are
+     * typically 4x or more, where a bilinear draw samples too sparsely and
+     * aliases the glyph into noise.
+     *
+     * Colour is averaged premultiplied by alpha, so the colour a fully
+     * transparent pixel happens to carry cannot bleed into the icon's edge
+     * as a halo.
+     *
+     * It is the same reduction as `Image.getScaledInstance(SCALE_SMOOTH)`,
+     * done in plain array arithmetic because that call goes through the AWT
+     * Toolkit image pipeline and Java2D. Those start the platform toolkit
+     * (X11 on Linux) and need a large, per-platform set of GraalVM
+     * native-image metadata. Against its output, alpha matches exactly and
+     * colour within one level.
+     */
+    internal fun areaAverage(
+        source: IntArray,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+    ): IntArray {
+        val out = IntArray(targetWidth * targetHeight)
+        val stepX = sourceWidth.toDouble() / targetWidth
+        val stepY = sourceHeight.toDouble() / targetHeight
+        for (ty in 0 until targetHeight) {
+            val top = ty * stepY
+            val bottom = (ty + 1) * stepY
+            for (tx in 0 until targetWidth) {
+                val left = tx * stepX
+                val right = (tx + 1) * stepX
+                var area = 0.0
+                var alpha = 0.0
+                var red = 0.0
+                var green = 0.0
+                var blue = 0.0
+                var y = top.toInt()
+                while (y < bottom && y < sourceHeight) {
+                    val coverY = min(y + 1.0, bottom) - max(y.toDouble(), top)
+                    var x = left.toInt()
+                    while (x < right && x < sourceWidth) {
+                        val cover = (min(x + 1.0, right) - max(x.toDouble(), left)) * coverY
+                        val pixel = source[y * sourceWidth + x]
+                        val a = (pixel ushr 24 and 0xFF).toDouble()
+                        val weight = cover * a
+                        area += cover
+                        alpha += weight
+                        red += weight * (pixel ushr 16 and 0xFF)
+                        green += weight * (pixel ushr 8 and 0xFF)
+                        blue += weight * (pixel and 0xFF)
+                        x++
+                    }
+                    y++
+                }
+                out[ty * targetWidth + tx] = if (alpha <= 0.0) {
+                    0
+                } else {
+                    (channel(alpha / area) shl 24) or (channel(red / alpha) shl 16) or
+                        (channel(green / alpha) shl 8) or channel(blue / alpha)
+                }
+            }
+        }
+        return out
+    }
+
+    private fun channel(value: Double): Int = (value + 0.5).toInt().coerceIn(0, 255)
 }
