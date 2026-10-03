@@ -6,15 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [Unreleased]
 
 ### Added
-- GraalVM native-image metadata in the jar, under `META-INF/native-
-  image/dev.hivens/libtray/reachability-metadata.json`: every downcall and
-  upcall shape the Linux, Windows and macOS backends bind, the static
-  methods they turn into upcall stubs, and the AWT and ImageIO entries
-  icon handling needs, the latter only once a tray is created. Consumers
-  no longer maintain their own copy. A test regenerates the file from the
-  backends' descriptor lists and fails when the committed one drifts, and
-  CI builds and runs a native check program on each platform with only
-  that metadata.
+- GraalVM native-image metadata in the jar, under
+  `META-INF/native-image/dev.hivens/libtray/reachability-metadata.json`:
+  every downcall and upcall shape the Linux, Windows and macOS backends
+  bind, the static methods they turn into upcall stubs, and the AWT and
+  ImageIO entries icon handling needs, the latter only once a tray is
+  created. Consumers no longer maintain their own copy. A test regenerates
+  the file from the backends' descriptor lists and fails when the
+  committed one drifts, and CI builds and runs a native check program on
+  each platform with only that metadata.
+- The jar's `native-image.properties` enables `SharedArenaSupport`,
+  unlocking experimental options for that option alone. A native image
+  only supports closing a shared arena with it, and `close()` releases the
+  arenas the backends bind their native calls in, which otherwise failed
+  quietly and leaked.
+
+### Changed
+- Oversized icons are scaled by area averaging on the pixel array instead
+  of through `Image.getScaledInstance(SCALE_SMOOTH)` and a `Graphics2D`
+  draw. The old path went through the AWT Toolkit image pipeline and
+  Java2D, which start the platform toolkit (X11 on Linux) and need a large
+  per-platform set of native-image metadata, and it fell back to a
+  bilinear draw when the asynchronous image producer had not finished.
+  Colour is averaged premultiplied by alpha. Against the previous output,
+  alpha matches exactly and colour within one level.
 
 ## [0.2.0]
 
