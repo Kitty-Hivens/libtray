@@ -56,6 +56,7 @@ class TrayBuilderTest {
             .menu(menu)
             .maxIconSize(null)
             .linuxBusName("com.example.App.Tray")
+            .macosMenuOnPrimaryClick(false)
             .build()
 
         built shouldBe TrayBuilder(
@@ -65,6 +66,7 @@ class TrayBuilderTest {
             menu = menu,
             maxIconSize = null,
             linuxBusName = "com.example.App.Tray",
+            macosMenuOnPrimaryClick = false,
         )
     }
 
@@ -90,6 +92,14 @@ class TrayBuilderTest {
         val a = TrayBuilder(title = "MyApp", iconBytes = byteArrayOf(1, 2, 3))
         val c = TrayBuilder(title = "MyApp", iconBytes = byteArrayOf(1, 2, 4))
         (a == c) shouldBe false
+    }
+
+    @Test
+    fun `equals distinguishes the macOS primary click setting`() {
+        val a = TrayBuilder(title = "MyApp", iconBytes = sampleIcon)
+        val b = TrayBuilder(title = "MyApp", iconBytes = sampleIcon, macosMenuOnPrimaryClick = false)
+        a.macosMenuOnPrimaryClick shouldBe true
+        (a == b) shouldBe false
     }
 
     @Test

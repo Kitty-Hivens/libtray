@@ -49,15 +49,14 @@ Each backend lives in its own package so consumers can audit / patch the
 one that affects them without grokking the others.
 
 Event coverage is not uniform, because how much of the interaction the
-platform keeps to itself differs. `MenuItemSelected` is the only event
-all three deliver — put anything essential in the menu:
+platform keeps to itself differs. Put anything essential in the menu:
 
-| Event                       | Linux                    | Windows | macOS                                                 |
-|-----------------------------|--------------------------|---------|-------------------------------------------------------|
-| `MenuItemSelected`          | yes                      | yes     | yes                                                   |
-| `Activated` (primary click) | yes                      | yes     | no — the primary button opens the `NSStatusItem` menu |
-| `MiddleActivated`           | yes                      | yes     | no                                                    |
-| `MenuRequested`             | depends on the tray host | yes     | no                                                    |
+| Event                       | Linux                    | Windows | macOS                                                                                         |
+|-----------------------------|--------------------------|---------|-----------------------------------------------------------------------------------------------|
+| `MenuItemSelected`          | yes                      | yes     | yes                                                                                           |
+| `Activated` (primary click) | yes                      | yes     | when `macosMenuOnPrimaryClick` is false or no menu is set, otherwise the click opens the menu |
+| `MiddleActivated`           | yes                      | yes     | yes                                                                                           |
+| `MenuRequested`             | depends on the tray host | yes     | yes                                                                                           |
 </details>
 
 <details>
@@ -178,15 +177,15 @@ The event API, the threading of events and `TrayBuilder` all changed.
 Recompile against the new version in any case: a jar built against
 0.1.3 throws `NoSuchMethodError`.
 
-| Change                                   | Kotlin                                                                                                                            | Java                                                                                |
-|------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| `onEvent` returns a `TraySubscription`   | Lambdas compile as before. Where the handle is stored as `() -> Unit`, change the type and call `close()` instead of invoking it. | Drop `return Unit.INSTANCE` and call `close()` on the subscription.                 |
-| Events arrive on a libtray event thread  | Code that touches UI from a listener registers with `onEvent(executor) { }`. On macOS this replaces relying on the main thread.   | Same, with `tray.onEvent(Platform::runLater, listener)` or your toolkit's executor. |
-| `TrayBuilder` gained `linuxBusName`      | Nothing in the source.                                                                                                            | Replace the constructor with `TrayBuilder.of(title, icon)...build()`.               |
-| `Submenu` takes `items` before `enabled` | Only positional calls that passed `enabled` third change.                                                                         | Pass `items` third and `enabled` last, or leave `enabled` out.                      |
-| `Tray` has two `onEvent` overloads       | A class implementing `Tray`, such as a test double, implements both.                                                              | Same.                                                                               |
-| `Tray.create` is static                  | Nothing.                                                                                                                          | `Tray.Companion.create` becomes `Tray.create`.                                      |
-| Flatpak can avoid `org.kde.*`            | Set `linuxBusName` to a name under your app ID and drop `--own-name=org.kde.*` from `finish-args`.                                | Same, via `.linuxBusName(...)`.                                                     |
+| Change                                                            | Kotlin                                                                                                                            | Java                                                                                |
+|-------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
+| `onEvent` returns a `TraySubscription`                            | Lambdas compile as before. Where the handle is stored as `() -> Unit`, change the type and call `close()` instead of invoking it. | Drop `return Unit.INSTANCE` and call `close()` on the subscription.                 |
+| Events arrive on a libtray event thread                           | Code that touches UI from a listener registers with `onEvent(executor) { }`. On macOS this replaces relying on the main thread.   | Same, with `tray.onEvent(Platform::runLater, listener)` or your toolkit's executor. |
+| `TrayBuilder` gained `linuxBusName` and `macosMenuOnPrimaryClick` | Nothing in the source.                                                                                                            | Replace the constructor with `TrayBuilder.of(title, icon)...build()`.               |
+| `Submenu` takes `items` before `enabled`                          | Only positional calls that passed `enabled` third change.                                                                         | Pass `items` third and `enabled` last, or leave `enabled` out.                      |
+| `Tray` has two `onEvent` overloads                                | A class implementing `Tray`, such as a test double, implements both.                                                              | Same.                                                                               |
+| `Tray.create` is static                                           | Nothing.                                                                                                                          | `Tray.Companion.create` becomes `Tray.create`.                                      |
+| Flatpak can avoid `org.kde.*`                                     | Set `linuxBusName` to a name under your app ID and drop `--own-name=org.kde.*` from `finish-args`.                                | Same, via `.linuxBusName(...)`.                                                     |
 
 ```kotlin
 // 0.1.3

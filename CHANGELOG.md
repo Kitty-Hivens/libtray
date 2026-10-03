@@ -30,6 +30,15 @@ places listed under Changed, and the README has a migration section.
   `@JvmOverloads`, and `TrayMenu` has a varargs constructor.
 - Windows fires `TrayEvent.MenuRequested` when the user asks for the
   menu.
+- macOS delivers clicks on the status item. A transparent view over the
+  status button receives the mouse events with the event itself, so a
+  middle click fires `MiddleActivated` and a right click or Control-click
+  opens the menu and fires `MenuRequested`. It does not rely on
+  `[NSApp currentEvent]`, which a control's action can no longer trust on
+  macOS 27. `TrayBuilder.macosMenuOnPrimaryClick` decides the primary
+  click: true, the default, keeps opening the menu as Mac users expect,
+  and false fires `Activated` instead. The menu is attached to the status
+  item only while it is shown and still opens on press.
 
 ### Changed
 - **Breaking:** events are delivered on one libtray-owned event thread
@@ -51,17 +60,16 @@ places listed under Changed, and the README has a migration section.
 - **Breaking:** `TrayMenuItem.Submenu` takes `items` before `enabled`,
   matching `Standard`, where `enabled` is the trailing default.
   Positional calls that passed `enabled` third have to move it.
-- **Binary-incompatible:** `TrayBuilder` gained a sixth property, so its
-  constructor and generated `copy` changed shape. Kotlin source is
-  unaffected, but a jar compiled against 0.1.3 that relies on the
-  default arguments or calls `copy` hits `NoSuchMethodError`, and Java
-  callers of the five-argument constructor stop compiling. Java should
-  move to `TrayBuilder.of`.
+- **Binary-incompatible:** `TrayBuilder` gained two properties,
+  `linuxBusName` and `macosMenuOnPrimaryClick`, so its constructor and
+  generated `copy` changed shape. Kotlin source is unaffected, but a jar
+  compiled against 0.1.3 that relies on the default arguments or calls
+  `copy` hits `NoSuchMethodError`, and Java callers of the five-argument
+  constructor stop compiling. Java should move to `TrayBuilder.of`.
 - `TrayEvent.MenuRequested` means that the user asked for the menu, with
   timing explicitly best effort, instead of being a Linux-only echo of
   the SNI `ContextMenu` call. On Linux it stays host-dependent: a host
-  that renders the dbusmenu itself may never call `ContextMenu`. macOS
-  does not fire it yet.
+  that renders the dbusmenu itself may never call `ContextMenu`.
 - `TrayBuilder.title` no longer claims to be the Linux bus name suffix.
   It never was: the backend derives only the SNI `Id` from it.
 

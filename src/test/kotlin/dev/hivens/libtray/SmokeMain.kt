@@ -24,13 +24,18 @@ import javax.imageio.ImageIO
  *      icon should appear with a black "i"-shaped glyph.
  *   3. Hover the icon. Tooltip should read "libtray smoke test".
  *   4. Left-click the icon. Stdout should print
- *      `[smoke] event: Activated (left click)`.
- *   5. Right-click the icon (LEFT-click on macOS, where NSStatusItem
- *      opens its menu on the primary button). A two-item menu should
+ *      `[smoke] event: Activated (left click)`. On macOS a left click opens
+ *      the menu instead, unless the harness runs with
+ *      `LIBTRAY_SMOKE_MAC_ACTIVATE=1`, which sets
+ *      `macosMenuOnPrimaryClick = false`.
+ *   5. Right-click the icon (also Control-click or, by default, left-click
+ *      on macOS). A two-item menu should
  *      appear: "Click me (noop)" + "Exit", separated by a horizontal line.
- *   6. Click "Click me (noop)". Stdout should print
+ *   6. Middle-click the icon. Stdout should print
+ *      `[smoke] event: MiddleActivated`.
+ *   7. Open the menu again and click "Click me (noop)". Stdout should print
  *      `[smoke] event: MenuItemSelected id=noop`.
- *   7. Right-click again, click "Exit". Stdout should print
+ *   8. Open the menu again, click "Exit". Stdout should print
  *      `id=exit` and the program should terminate cleanly.
  *
  * Per-OS prerequisites covered in the failure message below.
@@ -64,6 +69,7 @@ fun main() {
                 TrayMenuItem.Separator,
                 TrayMenuItem.Standard(id = "exit", label = "Exit"),
             )),
+            macosMenuOnPrimaryClick = System.getenv("LIBTRAY_SMOKE_MAC_ACTIVATE") != "1",
         ),
     ) ?: run {
         val os = System.getProperty("os.name", "").lowercase()
@@ -95,7 +101,7 @@ fun main() {
         when (event) {
             is TrayEvent.Activated         -> println("[smoke] event: Activated (left click)")
             is TrayEvent.MiddleActivated   -> println("[smoke] event: MiddleActivated")
-            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested (right click — the host renders the menu itself)")
+            is TrayEvent.MenuRequested     -> println("[smoke] event: MenuRequested")
             is TrayEvent.MenuItemSelected  -> {
                 println("[smoke] event: MenuItemSelected id=${event.id}")
                 if (event.id == "exit") exitFlag.countDown()

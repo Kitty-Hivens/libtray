@@ -41,6 +41,14 @@ package dev.hivens.libtray
  *   bus: a second tray asking for a name already taken, from this
  *   process or from another running instance of the app, gets no icon
  *   and [Tray.create] returns null. Ignored on Windows and macOS.
+ * @property macosMenuOnPrimaryClick Whether a primary click on the macOS
+ *   status item opens the menu, which is what Mac users expect from the
+ *   menu bar. Default true. Set it to false to get [TrayEvent.Activated]
+ *   for a primary click instead, with the menu on a right click or a
+ *   Control-click, the way Linux and Windows behave. With no menu set,
+ *   a primary click fires [TrayEvent.Activated] either way. A VoiceOver
+ *   press on the status item counts as a primary click, so with false
+ *   VoiceOver has no way to open the menu. Ignored on Linux and Windows.
  */
 public data class TrayBuilder(
     val title: String,
@@ -49,6 +57,7 @@ public data class TrayBuilder(
     val menu: TrayMenu? = null,
     val maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE,
     val linuxBusName: String? = null,
+    val macosMenuOnPrimaryClick: Boolean = true,
 ) {
     init {
         require(title.isNotBlank()) { "title must be non-blank" }
@@ -72,6 +81,7 @@ public data class TrayBuilder(
             menu == other.menu &&
             maxIconSize == other.maxIconSize &&
             linuxBusName == other.linuxBusName &&
+            macosMenuOnPrimaryClick == other.macosMenuOnPrimaryClick &&
             iconBytes.contentEquals(other.iconBytes)
     }
 
@@ -82,6 +92,7 @@ public data class TrayBuilder(
         result = 31 * result + (menu?.hashCode() ?: 0)
         result = 31 * result + (maxIconSize ?: 0)
         result = 31 * result + (linuxBusName?.hashCode() ?: 0)
+        result = 31 * result + macosMenuOnPrimaryClick.hashCode()
         return result
     }
 
@@ -100,6 +111,7 @@ public data class TrayBuilder(
         private var menu: TrayMenu? = null
         private var maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE
         private var linuxBusName: String? = null
+        private var macosMenuOnPrimaryClick: Boolean = true
 
         /** See [TrayBuilder.tooltip]. */
         public fun tooltip(tooltip: String?): Builder = apply { this.tooltip = tooltip }
@@ -113,9 +125,13 @@ public data class TrayBuilder(
         /** See [TrayBuilder.linuxBusName]. */
         public fun linuxBusName(linuxBusName: String?): Builder = apply { this.linuxBusName = linuxBusName }
 
+        /** See [TrayBuilder.macosMenuOnPrimaryClick]. */
+        public fun macosMenuOnPrimaryClick(macosMenuOnPrimaryClick: Boolean): Builder =
+            apply { this.macosMenuOnPrimaryClick = macosMenuOnPrimaryClick }
+
         /** @throws IllegalArgumentException on the same invalid input the constructor rejects. */
         public fun build(): TrayBuilder =
-            TrayBuilder(title, iconBytes, tooltip, menu, maxIconSize, linuxBusName)
+            TrayBuilder(title, iconBytes, tooltip, menu, maxIconSize, linuxBusName, macosMenuOnPrimaryClick)
     }
 
     public companion object {
