@@ -28,6 +28,7 @@
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "javax.imageio.spi.ImageReaderSpi"},
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "javax.imageio.spi.ImageWriterSpi"},
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.awt.image.ByteComponentRaster", "jniAccessible": true, "fields": [{"name": "data"}, {"name": "dataOffsets"}, {"name": "pixelStride"}, {"name": "scanlineStride"}, {"name": "type"}]},
+    {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.awt.image.IntegerComponentRaster", "jniAccessible": true, "fields": [{"name": "data"}, {"name": "dataOffsets"}, {"name": "pixelStride"}, {"name": "scanlineStride"}, {"name": "type"}]},
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.java2d.Disposer", "jniAccessible": true, "methods": [{"name": "addRecord", "parameterTypes": ["java.lang.Object", "long", "long"]}]}
   ],
   "resources": [
