@@ -2,7 +2,7 @@
 # Pinned so Panama bindings stay binary-compatible across the projects
 # that share them. Bump deliberately, not on every Kotlin release.
 kotlin = "2.4.20"
-slf4j  = "2.0.16"
+slf4j  = "2.0.20"
 
 # Java 22 is the floor: that's where `java.lang.foreign` (Project Panama)
 # was finalized as JEP 454. Earlier LTSes (17, 21) still have FFM in
