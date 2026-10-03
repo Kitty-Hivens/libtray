@@ -120,6 +120,10 @@ internal class EventDispatcher(threadNamePrefix: String) {
         if (!registration.active.get()) return
         try {
             registration.listener.onEvent(event)
+        } catch (e: VirtualMachineError) {
+            // Rethrowing would only end event delivery for this tray, the
+            // process has a bigger problem either way. Say so loudly.
+            log.error("onEvent listener hit {} on {}", e.javaClass.simpleName, event, e)
         } catch (t: Throwable) {
             log.warn("onEvent listener threw on {}", event, t)
         }
