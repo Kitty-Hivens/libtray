@@ -5,6 +5,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+- GraalVM native-image metadata in the jar, under `META-INF/native-
+  image/dev.hivens/libtray/reachability-metadata.json`: every downcall and
+  upcall shape the Linux, Windows and macOS backends bind, the static
+  methods they turn into upcall stubs, and the AWT and ImageIO entries
+  icon handling needs, the latter only once a tray is created. Consumers
+  no longer maintain their own copy. A test regenerates the file from the
+  backends' descriptor lists and fails when the committed one drifts, and
+  CI builds and runs a native check program on each platform with only
+  that metadata.
+
 ## [0.2.0]
 
 This release reworks the public API for Java callers and the threading
