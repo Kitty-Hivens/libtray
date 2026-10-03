@@ -44,6 +44,37 @@ class TrayBuilderTest {
     }
 
     @Test
+    fun `fluent builder applies the same defaults as the constructor`() {
+        TrayBuilder.of("MyApp", sampleIcon).build() shouldBe TrayBuilder(title = "MyApp", iconBytes = sampleIcon)
+    }
+
+    @Test
+    fun `fluent builder sets every optional field`() {
+        val menu = TrayMenu(TrayMenuItem.Standard("exit", "Exit"))
+        val built = TrayBuilder.of("MyApp", sampleIcon)
+            .tooltip("tip")
+            .menu(menu)
+            .maxIconSize(null)
+            .linuxBusName("com.example.App.Tray")
+            .build()
+
+        built shouldBe TrayBuilder(
+            title = "MyApp",
+            iconBytes = sampleIcon,
+            tooltip = "tip",
+            menu = menu,
+            maxIconSize = null,
+            linuxBusName = "com.example.App.Tray",
+        )
+    }
+
+    @Test
+    fun `fluent builder validates on build`() {
+        val builder = TrayBuilder.of("MyApp", sampleIcon).linuxBusName("single")
+        shouldThrow<IllegalArgumentException> { builder.build() }
+    }
+
+    @Test
     fun `equals compares iconBytes by content`() {
         // Generated equals on a data class with ByteArray uses identity
         // equality, which is wrong for bytes. The override on TrayBuilder
