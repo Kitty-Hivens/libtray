@@ -65,7 +65,7 @@ val javafxClassifier: String = run {
     }
 }
 
-val javafxSmoke: SourceSet by sourceSets.creating {
+val javafxSmoke: SourceSet = sourceSets.create("javafxSmoke") {
     compileClasspath += sourceSets.main.get().output
     runtimeClasspath += sourceSets.main.get().output
 }
@@ -157,10 +157,71 @@ dependencies {
 }
 
 tasks.test {
-    useJUnitPlatform()
+    useJUnitPlatform {
+        excludeTags("sni-host")
+    }
     // Native code under test will eventually want this; harmless on tests
     // that don't reach Panama.
     jvmArgs("--enable-native-access=ALL-UNNAMED")
+}
+
+// End-to-end Linux tests in which the test plays the tray host. They run on
+// a private session bus from PrivateSessionBus below, so a desktop's real
+// tray host neither sees the test items nor holds the watcher name the tests
+// take. Skipped where dbus-daemon is not available.
+abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, AutoCloseable {
+    private val daemon: Process = ProcessBuilder("dbus-daemon", "--session", "--nofork", "--print-address=1")
+        .redirectError(ProcessBuilder.Redirect.INHERIT)
+        .start()
+
+    val address: String = daemon.inputStream.bufferedReader().readLine()
+        ?: error("dbus-daemon exited without printing an address")
+
+    override fun close() {
+        daemon.destroy()
+    }
+}
+
+val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {}
+
+val sniHostTest = tasks.register<Test>("sniHostTest") {
+    group = "verification"
+    description = "Run the SNI backend against a private session bus, with the test as tray host."
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform {
+        includeTags("sni-host")
+    }
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    testLogging {
+        showStandardStreams = true
+    }
+    usesService(privateSessionBus)
+    val bus = privateSessionBus
+    doFirst {
+        (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        environment("LIBTRAY_PRIVATE_BUS", "1")
+    }
+    val linuxWithDbus = System.getProperty("os.name").lowercase().contains("linux") &&
+        File("/usr/bin/dbus-daemon").exists()
+    onlyIf("Linux with dbus-daemon") { linuxWithDbus }
+}
+
+// Non-interactive macOS check: create, update, fire a menu item, close from
+// another thread. A program rather than a test because the status item has
+// to be created on the Cocoa main thread. Skipped off macOS.
+val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
+    group = "verification"
+    description = "Create, drive and close a macOS status item without user input."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacSmokeCheckKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED", "-XstartOnFirstThread")
+    val isMac = System.getProperty("os.name").lowercase().contains("mac")
+    onlyIf("macOS") { isMac }
+}
+
+tasks.check {
+    dependsOn(sniHostTest, macSmokeCheck)
 }
 
 tasks.withType<Jar>().configureEach {
