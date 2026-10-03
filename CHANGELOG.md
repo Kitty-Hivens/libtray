@@ -30,6 +30,14 @@ places listed under Changed, and the README has a migration section.
   `@JvmOverloads`, and `TrayMenu` has a varargs constructor.
 - Windows fires `TrayEvent.MenuRequested` when the user asks for the
   menu.
+- macOS delivers clicks on the status item. The status button gets its
+  own target-action, so a middle click fires `MiddleActivated` and a right
+  click or Control-click opens the menu and fires `MenuRequested`.
+  `TrayBuilder.macosMenuOnPrimaryClick` decides the primary click: true,
+  the default, keeps opening the menu as Mac users expect, and false
+  fires `Activated` instead. The menu is attached to the status item only
+  while it is shown, and it now opens when the button is released rather
+  than when it is pressed.
 
 ### Changed
 - **Breaking:** events are delivered on one libtray-owned event thread
@@ -51,8 +59,9 @@ places listed under Changed, and the README has a migration section.
 - **Breaking:** `TrayMenuItem.Submenu` takes `items` before `enabled`,
   matching `Standard`, where `enabled` is the trailing default.
   Positional calls that passed `enabled` third have to move it.
-- **Binary-incompatible:** `TrayBuilder` gained a sixth property, so its
-  constructor and generated `copy` changed shape. Kotlin source is
+- **Binary-incompatible:** `TrayBuilder` gained two properties,
+  `linuxBusName` and `macosMenuOnPrimaryClick`, so its constructor and
+  generated `copy` changed shape. Kotlin source is
   unaffected, but a jar compiled against 0.1.3 that relies on the
   default arguments or calls `copy` hits `NoSuchMethodError`, and Java
   callers of the five-argument constructor stop compiling. Java should

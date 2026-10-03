@@ -49,6 +49,11 @@ import java.util.concurrent.atomic.AtomicLong
  *      shared LibtrayMenuTarget instance + `onMenuItem:` selector.
  *      Per-item NSInteger tag indexes the libtray id slot for reverse
  *      lookup in the upcall handler.
+ *   6. The status button's own target-action points at the same shared
+ *      instance (`onStatusItemClick:`), so clicks reach Kotlin. The menu
+ *      is not left attached to the status item, since an attached menu
+ *      makes AppKit swallow the click: [popUpMenu] attaches it only for
+ *      the duration of one `performClick:`.
  *
  * **Threading.** Mutating calls (setIcon / setTooltip / setMenu) marshal
  * onto the Cocoa main queue via libdispatch (`dispatch_async_f`, see
@@ -90,8 +95,19 @@ internal class AppKitTrayImpl private constructor(
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 
+    /** See [dev.hivens.libtray.TrayBuilder.macosMenuOnPrimaryClick]. */
+    private val menuOnPrimaryClick: Boolean = initial.macosMenuOnPrimaryClick
+
+    /**
+     * True while [popUpMenu] is inside `performClick:`. Main thread only. A
+     * click action arriving then is the simulated click itself, and handling
+     * it would open the menu again from inside its own tracking loop.
+     */
+    private var menuOpen = false
+
     init {
         INSTANCE_REGISTRY[instanceId] = this
+        installClickHandler()
         // Belt-and-suspenders: set a short text title FIRST so even if
         // the image pipeline silently fails (NSImage decoded fine but
         // SystemUIServer drops it), the menu bar shows SOMETHING. The
@@ -302,9 +318,10 @@ internal class AppKitTrayImpl private constructor(
 
     /**
      * Build a fresh NSMenu, wire each item's target-action to
-     * [menuTargetInstance] + onMenuItem: selector, attach via
-     * `setMenu:`. Old menu released — NSStatusItem retains the new
-     * one when [setMenu:] lands, so we drop our previous strong ref.
+     * [menuTargetInstance] + onMenuItem: selector, and keep it in
+     * [currentMenu] for [popUpMenu]. The previous menu is released. If it
+     * is on screen right now, the status item still holds its own
+     * reference for as long as [popUpMenu] keeps it attached.
      */
     private fun applyMenu(menu: TrayMenu) {
         runOnMainQueue {
@@ -320,14 +337,7 @@ internal class AppKitTrayImpl private constructor(
 
                 appendItems(newMenu, menu.items)
 
-                // The alloc +1 IS our strong ref -- park it in currentMenu.
-                // setMenu: takes its own retain. (The old code added an extra
-                // objc_retain on top of the alloc +1 but released only one of
-                // them on swap: that was the per-setMenu NSMenu leak.)
-                bindings.handle("objc_msgSend_void_id").invokeExact(
-                    statusItem, bindings.sel("setMenu:"), newMenu,
-                ) as Unit
-
+                // The alloc +1 IS our strong ref, parked in currentMenu.
                 val prev = currentMenu
                 currentMenu = newMenu
                 if (prev.address() != 0L) {
@@ -340,9 +350,6 @@ internal class AppKitTrayImpl private constructor(
     private fun clearMenu() {
         runOnMainQueue {
             autoreleasepool {
-                bindings.handle("objc_msgSend_void_id").invokeExact(
-                    statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
-                ) as Unit
                 val prev = currentMenu
                 currentMenu = MemorySegment.NULL
                 if (prev.address() != 0L) {
@@ -459,6 +466,95 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
+    // ── Status item clicks ───────────────────────────────────────────────
+
+    /**
+     * Point the status button's target-action at the shared target and ask
+     * for an action on every button release, as Qt's Cocoa tray does. Runs
+     * from the constructor, which [create] only reaches on the main thread.
+     */
+    private fun installClickHandler() {
+        runCatching {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                statusButton, bindings.sel("setTarget:"), menuTargetInstance,
+            ) as Unit
+            bindings.handle("objc_msgSend_void_sel").invokeExact(
+                statusButton, bindings.sel("setAction:"), bindings.sel("onStatusItemClick:"),
+            ) as Unit
+            // sendActionOn: returns the previous mask, which nothing here needs.
+            bindings.handle("objc_msgSend_void_long").invokeExact(
+                statusButton, bindings.sel("sendActionOn:"), CLICK_EVENT_MASK,
+            ) as Unit
+        }.onFailure {
+            log.warn("Installing the status item click action failed, clicks will not reach the app: {}", it.message)
+        }
+    }
+
+    /**
+     * Turn the click AppKit just reported into an event, reading the button
+     * and modifiers from `[NSApp currentEvent]`. Main thread, from the
+     * `onStatusItemClick:` upcall. An action without a mouse event behind it
+     * (VoiceOver, keyboard) counts as a primary click.
+     */
+    private fun handleStatusItemClick() {
+        if (menuOpen) return
+        val app = bindings.handle("objc_msgSend_id")
+            .invokeExact(bindings.cls("NSApplication"), bindings.sel("sharedApplication")) as MemorySegment
+        val event = bindings.handle("objc_msgSend_id")
+            .invokeExact(app, bindings.sel("currentEvent")) as MemorySegment
+        val type = if (event.address() == 0L) NS_EVENT_TYPE_LEFT_MOUSE_UP else msgSendLong(event, "type")
+        val control = event.address() != 0L &&
+            (msgSendLong(event, "modifierFlags") and NS_EVENT_MODIFIER_FLAG_CONTROL) != 0L
+        when (type) {
+            NS_EVENT_TYPE_RIGHT_MOUSE_UP -> openMenu()
+            NS_EVENT_TYPE_OTHER_MOUSE_UP ->
+                if (msgSendLong(event, "buttonNumber") == MIDDLE_BUTTON_NUMBER) fire(TrayEvent.MiddleActivated)
+            else -> {
+                val menuOnThisClick = control || (menuOnPrimaryClick && currentMenu.address() != 0L)
+                if (menuOnThisClick) openMenu() else fire(TrayEvent.Activated)
+            }
+        }
+    }
+
+    private fun openMenu() {
+        fire(TrayEvent.MenuRequested)
+        popUpMenu()
+    }
+
+    /**
+     * Show [currentMenu] anchored to the status item. Attaching the menu and
+     * sending `performClick:` lets AppKit place, track and dismiss it like
+     * any status item menu, keyboard navigation included. `performClick:`
+     * returns once the menu closes, and detaching it then hands clicks back
+     * to [handleStatusItemClick]. The extra retain covers a [setMenu] that
+     * lands while the menu is open and releases our reference to it.
+     */
+    private fun popUpMenu() {
+        val menu = currentMenu
+        if (menu.address() == 0L) return
+        bindings.handle("objc_retain").invokeExact(menu) as MemorySegment
+        menuOpen = true
+        try {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                statusItem, bindings.sel("setMenu:"), menu,
+            ) as Unit
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                statusButton, bindings.sel("performClick:"), MemorySegment.NULL,
+            ) as Unit
+        } finally {
+            menuOpen = false
+            runCatching {
+                bindings.handle("objc_msgSend_void_id").invokeExact(
+                    statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
+                ) as Unit
+            }
+            runCatching { bindings.handle("objc_release").invokeExact(menu) as Unit }
+        }
+    }
+
+    private fun msgSendLong(receiver: MemorySegment, selector: String): Long =
+        bindings.handle("objc_msgSend_long").invokeExact(receiver, bindings.sel(selector)) as Long
+
     /**
      * Each AppKit operation gets its own short-lived autorelease pool.
      * Cocoa convenience constructors return autoreleased objects
@@ -529,6 +625,20 @@ internal class AppKitTrayImpl private constructor(
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
+        // NSEventType values and the matching NSEventMask bits (1 << type),
+        // plus NSEventModifierFlagControl, from NSEvent.h.
+        private const val NS_EVENT_TYPE_LEFT_MOUSE_UP: Long = 2
+        private const val NS_EVENT_TYPE_RIGHT_MOUSE_UP: Long = 4
+        private const val NS_EVENT_TYPE_OTHER_MOUSE_UP: Long = 26
+        private const val CLICK_EVENT_MASK: Long =
+            (1L shl NS_EVENT_TYPE_LEFT_MOUSE_UP.toInt()) or
+                (1L shl NS_EVENT_TYPE_RIGHT_MOUSE_UP.toInt()) or
+                (1L shl NS_EVENT_TYPE_OTHER_MOUSE_UP.toInt())
+        private const val NS_EVENT_MODIFIER_FLAG_CONTROL: Long = 1L shl 18
+
+        /** `[NSEvent buttonNumber]` of the middle button. 0 is left, 1 right. */
+        private const val MIDDLE_BUTTON_NUMBER: Long = 2
+
         // ── Main-queue marshaling (issue #3) ──────────────────────────────
         // Pending runOnMainQueue actions, keyed by a monotonic id handed to
         // dispatch_async_f as the opaque context pointer. The trampoline looks
@@ -565,12 +675,15 @@ internal class AppKitTrayImpl private constructor(
 
         /**
          * The shared `LibtrayMenuTarget_<pid>` Objective-C class built
-         * once per JVM. Single method `-onMenuItem:(id)sender` routes
-         * NSMenuItem clicks back into Java via [onMenuItemEntry].
+         * once per JVM. `-onMenuItem:(id)sender` routes NSMenuItem clicks
+         * back into Java via [onMenuItemEntry], and
+         * `-onStatusItemClick:(id)sender` routes status button clicks via
+         * [onStatusItemClickEntry].
          */
         @Volatile private var menuTargetClass: MemorySegment? = null
         @Volatile private var menuTargetInstance: MemorySegment = MemorySegment.NULL
         @Volatile private var menuActionStub: MemorySegment? = null
+        @Volatile private var statusClickStub: MemorySegment? = null
         @Volatile private var stubArena: Arena? = null
 
         /**
@@ -599,6 +712,18 @@ internal class AppKitTrayImpl private constructor(
             // menu was rebuilt between Cocoa's mouse-down and our
             // handler running (race on rapid setMenu calls). Drop
             // silently; no event but no crash either.
+        }
+
+        /**
+         * The `void onStatusItemClick:(id sender)` IMP. `sender` is the
+         * status button, which identifies the tray it belongs to.
+         */
+        @JvmStatic
+        @Suppress("unused", "UNUSED_PARAMETER")
+        fun onStatusItemClickEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
+            val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusButton.address() == sender.address() } ?: return
+            runCatching { inst.handleStatusItemClick() }
+                .onFailure { log.warn("onStatusItemClick: handling threw: {}", it.message) }
         }
 
         /** Last-loaded bindings, used by the static upcall handler. */
@@ -802,8 +927,9 @@ internal class AppKitTrayImpl private constructor(
 
         /**
          * Build the runtime `LibtrayMenuTarget_<pid>` class once per
-         * JVM: subclass NSObject, add one method `-onMenuItem:(id)`
-         * mapped to our Panama upcall stub, register, instantiate.
+         * JVM: subclass NSObject, add `-onMenuItem:(id)` and
+         * `-onStatusItemClick:(id)`, each mapped to a Panama upcall stub,
+         * register, instantiate.
          *
          * Class name is suffixed with PID so re-loading libtray (e.g.
          * test harnesses, isolated classloaders) doesn't trip
@@ -831,7 +957,14 @@ internal class AppKitTrayImpl private constructor(
                 ValueLayout.ADDRESS,
             )
             val stub = Linker.nativeLinker().upcallStub(handle, descriptor, arena)
+            val clickHandle = MethodHandles.lookup().findStatic(
+                AppKitTrayImpl::class.java,
+                "onStatusItemClickEntry",
+                handle.type(),
+            )
+            val clickStub = Linker.nativeLinker().upcallStub(clickHandle, descriptor, arena)
             menuActionStub = stub
+            statusClickStub = clickStub
             stubArena = arena
 
             val nsObjectCls = bindings.cls("NSObject")
@@ -847,6 +980,9 @@ internal class AppKitTrayImpl private constructor(
             val ok = bindings.handle("class_addMethod")
                 .invokeExact(newClass, sel, stub, typesSeg) as Boolean
             require(ok) { "class_addMethod failed for onMenuItem:" }
+            val clickOk = bindings.handle("class_addMethod")
+                .invokeExact(newClass, bindings.sel("onStatusItemClick:"), clickStub, typesSeg) as Boolean
+            require(clickOk) { "class_addMethod failed for onStatusItemClick:" }
 
             bindings.handle("objc_registerClassPair").invokeExact(newClass) as Unit
 
