@@ -66,6 +66,12 @@ places listed under Changed, and the README has a migration section.
   It never was: the backend derives only the SNI `Id` from it.
 
 ### Fixed
+- macOS: `close()` runs its teardown on the Cocoa main queue and waits up
+  to two seconds for it, then falls back to the calling thread.
+  `NSStatusItem` is main-thread-only and `close()` is usually called from
+  a listener, which now runs on the event thread. Queued behind the main
+  queue, the teardown also no longer races a `setIcon` or `setMenu` that
+  is already executing there.
 - Windows opens the context menu on `WM_CONTEXTMENU` when the shell
   accepted `NOTIFYICON_VERSION_4`, and on `WM_RBUTTONUP` only otherwise.
   A version 4 shell sends both for one right click, and both were routed

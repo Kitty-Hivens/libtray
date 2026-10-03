@@ -18,7 +18,9 @@ import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -54,8 +56,9 @@ import java.util.concurrent.atomic.AtomicLong
  * thread enqueues. AppKit therefore always runs where it wants regardless of
  * which thread the consumer calls from, and the public setters still return as
  * soon as the enqueue succeeds. The `onMenuItem:` upcall already arrives on
- * the main thread by AppKit's contract. [close] tears down synchronously on
- * the caller thread.
+ * the main thread by AppKit's contract. [close] queues its teardown on the
+ * main queue too, but waits for it, so the icon is gone when close()
+ * returns (see [tearDownOnMainThread]).
  */
 internal class AppKitTrayImpl private constructor(
     private val bindings: ObjcBindings,
@@ -68,6 +71,9 @@ internal class AppKitTrayImpl private constructor(
     private val log = LoggerFactory.getLogger("libtray.AppKitTray")
 
     @Volatile private var open = AtomicBoolean(true)
+
+    /** Set by the one [tearDown] that runs, wherever close() ended up running it. */
+    private val tornDown = AtomicBoolean(false)
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
@@ -133,10 +139,53 @@ internal class AppKitTrayImpl private constructor(
         if (!open.compareAndSet(true, false)) return
         events.close()
         INSTANCE_REGISTRY.remove(instanceId)
-        // Tear down SYNCHRONOUSLY on the caller thread, not via the async
-        // runOnMainQueue path: close() flips `open` first, which would make a
-        // marshaled clearMenu a no-op (ghost icon), and a queued teardown could
-        // run after we return.
+        tearDownOnMainThread()
+        // The ObjcBindings arena is deliberately NOT closed here (unlike the
+        // Linux / Win32 backends). runOnMainQueue can leave actions queued on
+        // the GCD main queue that still reference this instance's msgSend
+        // handles, and the menu-target class + its upcall stub are already
+        // process-lifetime; closing the arena would risk a use-after-free for a
+        // deferred action. The cost is a one-time set of downcall handles,
+        // reclaimed at process exit.
+    }
+
+    /**
+     * Run [tearDown] on the Cocoa main thread and wait for it, bounded.
+     *
+     * `NSStatusItem` is main-thread-only, and close() is routinely called
+     * from a listener, which runs on the libtray event thread. Queuing the
+     * teardown also puts it behind any apply* the main queue is already
+     * running or holding, so none of them can message a released status
+     * item. Waiting keeps close() synchronous: the icon is gone when it
+     * returns. The wait is bounded because a main thread that is blocked,
+     * or a process that never runs a Cocoa loop, would otherwise hang the
+     * caller. On timeout the teardown runs on the calling thread instead,
+     * since leaving the icon up is worse, and [tornDown] keeps the queued
+     * copy from running it a second time.
+     */
+    private fun tearDownOnMainThread() {
+        if (isCocoaMainThread(bindings) || bindings.mainQueue.address() == 0L) {
+            tearDown()
+            return
+        }
+        val done = CountDownLatch(1)
+        val enqueued = enqueueOnMainQueue {
+            try {
+                tearDown()
+            } finally {
+                done.countDown()
+            }
+        }
+        if (enqueued && done.await(CLOSE_ON_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) return
+        log.warn(
+            "Cocoa main queue did not run the tray teardown within {} ms; tearing down on {} instead",
+            CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
+        )
+        tearDown()
+    }
+
+    private fun tearDown() {
+        if (!tornDown.compareAndSet(false, true)) return
         autoreleasepool {
             val prev = currentMenu
             currentMenu = MemorySegment.NULL
@@ -161,13 +210,6 @@ internal class AppKitTrayImpl private constructor(
             // Release our retained reference to the status item itself.
             runCatching { bindings.handle("objc_release").invokeExact(statusItem) as Unit }
         }
-        // The ObjcBindings arena is deliberately NOT closed here (unlike the
-        // Linux / Win32 backends). runOnMainQueue can leave actions queued on
-        // the GCD main queue that still reference this instance's msgSend
-        // handles, and the menu-target class + its upcall stub are already
-        // process-lifetime; closing the arena would risk a use-after-free for a
-        // deferred action. The cost is a one-time set of downcall handles,
-        // reclaimed at process exit.
     }
 
     // ── Internals: AppKit operations ─────────────────────────────────────
@@ -444,11 +486,11 @@ internal class AppKitTrayImpl private constructor(
      * ([ObjcBindings.mainQueue] is NULL) fall back to running inline.
      *
      * The queued body re-checks [open] on the main thread rather than
-     * trusting the check made here at enqueue time. [close] runs
-     * synchronously on the caller thread and releases the NSStatusItem; an
-     * action enqueued just before that would otherwise message a
-     * deallocated object — `setImage:` / `setMenu:` on a freed
-     * NSStatusItem, which is a use-after-free, not a no-op.
+     * trusting the check made here at enqueue time. close() flips [open]
+     * before it queues the teardown, so an action that had not started by
+     * then turns into a no-op instead of messaging the released
+     * NSStatusItem, and one that had started finishes before the teardown
+     * runs behind it.
      */
     private fun runOnMainQueue(action: () -> Unit) {
         if (!open.get()) return
@@ -456,22 +498,26 @@ internal class AppKitTrayImpl private constructor(
             runCatching { action() }
             return
         }
-        val queue = bindings.mainQueue
-        if (queue.address() == 0L) {
+        if (bindings.mainQueue.address() == 0L) {
             runCatching { action() }
             return
         }
+        enqueueOnMainQueue { if (open.get()) action() }
+    }
+
+    /** `dispatch_async_f` [action] onto the main queue. False when the enqueue itself failed. */
+    private fun enqueueOnMainQueue(action: () -> Unit): Boolean {
         val id = dispatchCounter.getAndIncrement()
-        PENDING[id] = { if (open.get()) action() }
+        PENDING[id] = action
         val enqueued = runCatching {
             bindings.handle("dispatch_async_f").invokeExact(
-                queue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
+                bindings.mainQueue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
             ) as Unit
             true
         }.getOrDefault(false)
         if (!enqueued) PENDING.remove(id)  // never came back; don't strand the entry
+        return enqueued
     }
-
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
@@ -479,6 +525,9 @@ internal class AppKitTrayImpl private constructor(
 
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
+
+        /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
+        private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
         // ── Main-queue marshaling (issue #3) ──────────────────────────────
         // Pending runOnMainQueue actions, keyed by a monotonic id handed to
