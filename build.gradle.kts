@@ -160,6 +160,11 @@ tasks.test {
     useJUnitPlatform {
         excludeTags("sni-host")
     }
+    // List every test with its outcome, so a CI log shows which platform
+    // tests ran and which skipped themselves on that runner.
+    testLogging {
+        events("passed", "skipped", "failed")
+    }
     // Native code under test will eventually want this; harmless on tests
     // that don't reach Panama.
     jvmArgs("--enable-native-access=ALL-UNNAMED")
