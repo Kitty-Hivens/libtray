@@ -12,6 +12,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The threading contract every backend relies on: the backend thread only
@@ -45,7 +46,7 @@ class EventDispatcherTest {
         seen.toList() shouldContainExactly listOf(
             TrayEvent.Activated, TrayEvent.MenuItemSelected("a"), TrayEvent.MiddleActivated,
         )
-        threads.toSet() shouldBe setOf("libtray-events-test")
+        threads.toSet().single() shouldStartWith "libtray-events-test-"
     }
 
     @Test
@@ -57,18 +58,20 @@ class EventDispatcherTest {
             release.await()
         })
 
-        dispatcher.fire(TrayEvent.Activated)
-        entered.await(2, TimeUnit.SECONDS) shouldBe true
+        try {
+            dispatcher.fire(TrayEvent.Activated)
+            entered.await(2, TimeUnit.SECONDS) shouldBe true
 
-        // The listener is parked. Firing more and closing must both return
-        // promptly instead of waiting on it.
-        val start = System.nanoTime()
-        repeat(100) { dispatcher.fire(TrayEvent.Activated) }
-        dispatcher.close()
-        val elapsedMs = (System.nanoTime() - start) / 1_000_000
-        (elapsedMs < 500) shouldBe true
-
-        release.countDown()
+            // The listener is parked. Firing more and closing must both return
+            // promptly instead of waiting on it.
+            val start = System.nanoTime()
+            repeat(100) { dispatcher.fire(TrayEvent.Activated) }
+            dispatcher.close()
+            val elapsedMs = (System.nanoTime() - start) / 1_000_000
+            (elapsedMs < 500) shouldBe true
+        } finally {
+            release.countDown()
+        }
     }
 
     @Test
@@ -158,6 +161,35 @@ class EventDispatcherTest {
     }
 
     @Test
+    fun `an executor that throws drops that event and keeps the thread alive`() {
+        // Platform::runLater before the toolkit starts throws IllegalStateException.
+        val broken = Executor { throw IllegalStateException("Toolkit not initialized") }
+        val received = CountDownLatch(2)
+        dispatcher.subscribe({ error("must not run") }, broken)
+        dispatcher.subscribe({ received.countDown() })
+
+        dispatcher.fire(TrayEvent.Activated)
+        dispatcher.fire(TrayEvent.Activated)
+
+        received.await(2, TimeUnit.SECONDS) shouldBe true
+    }
+
+    @Test
+    fun `an interrupt flag left by a listener does not end delivery`() {
+        val received = CountDownLatch(2)
+        dispatcher.subscribe({
+            // The usual idiom after catching InterruptedException.
+            Thread.currentThread().interrupt()
+            received.countDown()
+        })
+
+        dispatcher.fire(TrayEvent.Activated)
+        dispatcher.fire(TrayEvent.Activated)
+
+        received.await(2, TimeUnit.SECONDS) shouldBe true
+    }
+
+    @Test
     fun `nothing is delivered after close`() {
         val count = AtomicInteger()
         dispatcher.subscribe({ count.incrementAndGet() })
@@ -170,25 +202,73 @@ class EventDispatcherTest {
     }
 
     @Test
+    fun `events still queued at close are dropped`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val count = AtomicInteger()
+        dispatcher.subscribe({
+            if (count.incrementAndGet() == 1) {
+                entered.countDown()
+                release.await()
+            }
+        })
+        try {
+            dispatcher.fire(TrayEvent.Activated)
+            entered.await(2, TimeUnit.SECONDS) shouldBe true
+            repeat(5) { dispatcher.fire(TrayEvent.Activated) }
+            dispatcher.close()
+        } finally {
+            release.countDown()
+        }
+
+        Thread.sleep(100)
+        count.get() shouldBe 1
+    }
+
+    @Test
+    fun `executor tasks that have not started by close are dropped`() {
+        val pending = ConcurrentLinkedQueue<Runnable>()
+        val queued = CountDownLatch(1)
+        val count = AtomicInteger()
+        dispatcher.subscribe({ count.incrementAndGet() }, Executor { task ->
+            pending.add(task)
+            queued.countDown()
+        })
+
+        dispatcher.fire(TrayEvent.Activated)
+        queued.await(2, TimeUnit.SECONDS) shouldBe true
+        dispatcher.close()
+        pending.forEach { it.run() }
+
+        count.get() shouldBe 0
+    }
+
+    @Test
+    fun `no thread is started until the first event`() {
+        val fresh = EventDispatcher("libtray-events-lazy")
+        try {
+            fresh.subscribe({ })
+            Thread.getAllStackTraces().keys.none { it.name.startsWith("libtray-events-lazy") } shouldBe true
+        } finally {
+            fresh.close()
+        }
+    }
+
+    @Test
     fun `event thread exits on close`() {
-        val name = ConcurrentLinkedQueue<String>()
+        val thread = AtomicReference<Thread>()
         val seen = CountDownLatch(1)
         dispatcher.subscribe({
-            name.add(Thread.currentThread().name)
+            thread.set(Thread.currentThread())
             seen.countDown()
         })
         dispatcher.fire(TrayEvent.Activated)
         seen.await(2, TimeUnit.SECONDS) shouldBe true
-        name.single() shouldStartWith "libtray-events"
+        thread.get().name shouldStartWith "libtray-events-test-"
 
         dispatcher.close()
 
-        val deadline = System.nanoTime() + 2_000_000_000L
-        while (System.nanoTime() < deadline &&
-            Thread.getAllStackTraces().keys.any { it.name == "libtray-events-test" && it.isAlive }
-        ) {
-            Thread.sleep(10)
-        }
-        Thread.getAllStackTraces().keys.any { it.name == "libtray-events-test" && it.isAlive } shouldBe false
+        thread.get().join(2_000)
+        thread.get().isAlive shouldBe false
     }
 }

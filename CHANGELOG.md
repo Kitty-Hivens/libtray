@@ -46,7 +46,8 @@ places listed under Changed, and the README has a migration section.
   so only code that stores or invokes the returned handle changes:
   `unsubscribe()` becomes `subscription.close()`. Java no longer returns
   `Unit.INSTANCE` from the listener, and `TraySubscription.close()`
-  declares no checked exception.
+  declares no checked exception. A class that implements `Tray` itself,
+  such as a test double, has to implement both `onEvent` overloads.
 - **Breaking:** `TrayMenuItem.Submenu` takes `items` before `enabled`,
   matching `Standard`, where `enabled` is the trailing default.
   Positional calls that passed `enabled` third have to move it.
@@ -58,11 +59,17 @@ places listed under Changed, and the README has a migration section.
   move to `TrayBuilder.of`.
 - `TrayEvent.MenuRequested` means that the user asked for the menu, with
   timing explicitly best effort, instead of being a Linux-only echo of
-  the SNI `ContextMenu` call. macOS does not fire it yet.
+  the SNI `ContextMenu` call. On Linux it stays host-dependent: a host
+  that renders the dbusmenu itself may never call `ContextMenu`. macOS
+  does not fire it yet.
 - `TrayBuilder.title` no longer claims to be the Linux bus name suffix.
   It never was: the backend derives only the SNI `Id` from it.
 
 ### Fixed
+- Windows opens the context menu on `WM_CONTEXTMENU` when the shell
+  accepted `NOTIFYICON_VERSION_4`, and on `WM_RBUTTONUP` only otherwise.
+  A version 4 shell sends both for one right click, and both were routed
+  to the popup.
 - Linux: the `DBusMessageIter` scratch is declared as ten longs instead
   of eighty bytes. A byte sequence carries alignment 1 while libdbus
   stores pointers in the struct, and it only worked because malloc hands

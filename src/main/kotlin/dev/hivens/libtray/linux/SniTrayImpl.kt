@@ -228,8 +228,8 @@ internal class SniTrayImpl internal constructor(
         // Everything below frees memory the I/O thread may still be reading.
         // If it did not stop in time (a flush against a socket nobody is
         // draining), unreffing the connection out from under a live
-        // `dbus_*` call is a segfault inside libdbus. Leaking one connection at shutdown is the better
-        // trade, so bail out and say why.
+        // `dbus_*` call is a segfault inside libdbus. Leaking one connection
+        // at shutdown is the better trade, so bail out and say why.
         if (ioThread.isAlive) {
             log.warn(
                 "libtray-sni did not stop within {} ms; leaving the D-Bus connection open rather " +
@@ -265,8 +265,8 @@ internal class SniTrayImpl internal constructor(
      * bus round-trip, not the poll interval.
      *
      * Consequence of owning both directions here: a flush against a wedged
-     * socket stalls incoming dispatch. That is bounded by the same libdbus
-     * lock either way, a second thread could only queue behind it. Consumer
+     * socket stalls incoming dispatch. A second thread would not help: it
+     * could only queue behind the same libdbus lock. Consumer
      * listeners never run here: [fire] hands events to [EventDispatcher].
      */
     private fun dispatchLoop() {

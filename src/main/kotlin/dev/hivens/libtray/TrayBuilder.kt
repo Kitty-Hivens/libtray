@@ -113,6 +113,7 @@ public data class TrayBuilder(
         /** See [TrayBuilder.linuxBusName]. */
         public fun linuxBusName(linuxBusName: String?): Builder = apply { this.linuxBusName = linuxBusName }
 
+        /** @throws IllegalArgumentException on the same invalid input the constructor rejects. */
         public fun build(): TrayBuilder =
             TrayBuilder(title, iconBytes, tooltip, menu, maxIconSize, linuxBusName)
     }

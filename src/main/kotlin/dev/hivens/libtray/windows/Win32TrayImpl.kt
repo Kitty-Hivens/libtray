@@ -96,6 +96,9 @@ internal class Win32TrayImpl private constructor(
     /** Set true by the pump thread after a successful NIM_ADD. */
     @Volatile private var creationSucceeded: Boolean = false
 
+    /** Whether NIM_SETVERSION took, which decides how a right click arrives. Pump thread only. */
+    private var version4: Boolean = false
+
     /**
      * Reusable NOTIFYICONDATAW struct. Allocated once on the bindings
      * arena, mutated for each NIM_ADD / NIM_MODIFY / NIM_DELETE call.
@@ -410,7 +413,8 @@ internal class Win32TrayImpl private constructor(
         }
         // NIM_SETVERSION must come AFTER NIM_ADD per MSDN; it switches
         // the icon entry to NOTIFYICON_VERSION_4 mouse-message format.
-        if (!shellNotifyIcon(Win32Bindings.NIM_SETVERSION)) {
+        version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
+        if (!version4) {
             log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
         }
 
@@ -509,7 +513,11 @@ internal class Win32TrayImpl private constructor(
             when (event) {
                 Win32Bindings.WM_LBUTTONUP -> fire(TrayEvent.Activated)
                 Win32Bindings.WM_MBUTTONUP -> fire(TrayEvent.MiddleActivated)
-                Win32Bindings.WM_RBUTTONUP, Win32Bindings.WM_CONTEXTMENU -> showContextMenu(x, y)
+                // A version 4 shell sends WM_RBUTTONUP and then WM_CONTEXTMENU
+                // for one right click, and WM_CONTEXTMENU alone for Shift+F10
+                // or the menu key. Opening on both would track the popup twice.
+                Win32Bindings.WM_CONTEXTMENU -> if (version4) showContextMenu(x, y)
+                Win32Bindings.WM_RBUTTONUP -> if (!version4) showContextMenu(x, y)
             }
             0L
         }

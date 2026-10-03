@@ -6,6 +6,7 @@ import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Hands [TrayEvent]s from a backend to the consumer's listeners on a thread
@@ -21,8 +22,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * registered with an [Executor] gets each event submitted to that executor
  * instead of being called on the event thread, so ordering on that path is
  * whatever the executor guarantees (FIFO for the usual UI-thread executors).
+ *
+ * The thread starts with the first event, so a tray that is never clicked,
+ * or whose construction fails halfway, never owns one. Nothing a listener
+ * or an executor does can end it early: exceptions are logged and an
+ * interrupt flag left behind by a listener is cleared. Only [close] stops it.
  */
-internal class EventDispatcher(threadName: String) {
+internal class EventDispatcher(threadNamePrefix: String) {
 
     private class Registration(val listener: TrayEventListener, val executor: Executor?) {
         val active = AtomicBoolean(true)
@@ -32,14 +38,11 @@ internal class EventDispatcher(threadName: String) {
     private object Stop
 
     private val log = LoggerFactory.getLogger("libtray.Events")
+    private val threadName = "$threadNamePrefix-${dispatcherCounter.incrementAndGet()}"
     private val registrations = CopyOnWriteArrayList<Registration>()
     private val queue = LinkedBlockingQueue<Any>()
     private val open = AtomicBoolean(true)
-
-    private val thread = Thread({ run() }, threadName).apply {
-        isDaemon = true
-        start()
-    }
+    private var thread: Thread? = null
 
     fun subscribe(listener: TrayEventListener, executor: Executor? = null): TraySubscription {
         val registration = Registration(listener, executor)
@@ -52,7 +55,9 @@ internal class EventDispatcher(threadName: String) {
     }
 
     fun fire(event: TrayEvent) {
-        if (open.get()) queue.put(event)
+        if (!open.get()) return
+        ensureStarted()
+        queue.put(event)
     }
 
     /**
@@ -67,15 +72,27 @@ internal class EventDispatcher(threadName: String) {
         queue.put(Stop)
     }
 
+    @Synchronized
+    private fun ensureStarted() {
+        if (thread != null) return
+        thread = Thread({ run() }, threadName).apply {
+            isDaemon = true
+            start()
+        }
+    }
+
     private fun run() {
         while (true) {
             val next = try {
                 queue.take()
             } catch (_: InterruptedException) {
-                return
+                if (open.get()) continue else return
             }
             if (next === Stop) return
             deliver(next as TrayEvent)
+            // A listener that restored an interrupt it caught would otherwise
+            // make the next take() throw and end delivery for this tray.
+            Thread.interrupted()
         }
     }
 
@@ -91,6 +108,10 @@ internal class EventDispatcher(threadName: String) {
                 executor.execute { if (open.get()) invoke(registration, event) }
             } catch (e: RejectedExecutionException) {
                 log.warn("Executor rejected a tray event, dropping {}: {}", event, e.message)
+            } catch (t: Throwable) {
+                // Platform::runLater before the toolkit starts, or a Main
+                // dispatcher with no backing module, throw IllegalStateException.
+                log.warn("Executor threw on a tray event, dropping {}", event, t)
             }
         }
     }
@@ -102,5 +123,9 @@ internal class EventDispatcher(threadName: String) {
         } catch (t: Throwable) {
             log.warn("onEvent listener threw on {}", event, t)
         }
+    }
+
+    private companion object {
+        val dispatcherCounter = AtomicInteger(0)
     }
 }

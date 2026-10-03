@@ -31,9 +31,11 @@ public sealed interface TrayEvent {
 
     /**
      * The user asked for the menu, typically with a right click. Fired on
-     * Linux, from the SNI host's `ContextMenu` call, and on Windows, as the
-     * popup is built. Not fired on macOS yet: AppKit opens the status item
-     * menu itself and routes nothing back.
+     * Windows, as the popup is built. On Linux it depends on the tray host:
+     * the event comes from the SNI `ContextMenu` call, and a host that
+     * renders the dbusmenu itself, which is the common case, may open the
+     * menu without ever making that call. Not fired on macOS yet: AppKit
+     * opens the status item menu itself and routes nothing back.
      *
      * Best effort on timing. Linux sends it alongside a menu the host has
      * already rendered, and on Windows it reaches the listener on the event

@@ -90,8 +90,8 @@ fun main() {
     val exitFlag = java.util.concurrent.CountDownLatch(1)
 
     tray.onEvent { event ->
-        // Runs on the tray's libtray-events thread. Printing is safe; to
-        // touch UI, register with onEvent(executor, listener) instead.
+        // Runs on the tray's libtray-events thread, where printing is safe.
+        // To touch UI, register with onEvent(executor, listener) instead.
         when (event) {
             is TrayEvent.Activated         -> println("[smoke] event: Activated (left click)")
             is TrayEvent.MiddleActivated   -> println("[smoke] event: MiddleActivated")
