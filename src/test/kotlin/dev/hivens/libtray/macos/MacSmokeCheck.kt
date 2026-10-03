@@ -75,13 +75,8 @@ fun main() {
     clicks.send(overlay, "mouseUp:", NS_LEFT_MOUSE_UP)
     expect(events, TrayEvent.Activated, "primary click")
 
-    val middleButton = clicks.buttonNumber(NS_OTHER_MOUSE_UP)
-    if (middleButton == 2L) {
-        clicks.send(overlay, "otherMouseUp:", NS_OTHER_MOUSE_UP)
-        expect(events, TrayEvent.MiddleActivated, "middle click")
-    } else {
-        step("middle click not checked: a synthetic other-button event reports buttonNumber $middleButton")
-    }
+    clicks.sendMiddleUp(overlay)
+    expect(events, TrayEvent.MiddleActivated, "middle click")
 
     // Button actions this soon after overlay activity are dropped on purpose.
     Thread.sleep(700)
@@ -135,7 +130,11 @@ fun main() {
  * Builds mouse `NSEvent`s and sends them to a view. Needs one `objc_msgSend`
  * shape the backend has no use for, the class method
  * `mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:`,
- * which takes an `NSPoint` by value.
+ * which takes an `NSPoint` by value. That method has no button argument and
+ * reports button 0 for every other-button event, so the middle click is
+ * built as a `CGEvent` with the centre button and wrapped by
+ * `[NSEvent eventWithCGEvent:]`. Creating a `CGEvent` does not post it, so
+ * no permission is involved.
  */
 private class SyntheticClicks(private val bindings: ObjcBindings) {
     private val arena = Arena.ofShared()
@@ -166,8 +165,30 @@ private class SyntheticClicks(private val bindings: ObjcBindings) {
         ) as MemorySegment
     }
 
-    fun buttonNumber(type: Long): Long =
-        bindings.handle("objc_msgSend_long").invokeExact(event(type), bindings.sel("buttonNumber")) as Long
+    private val cgMouseEvent: MethodHandle = Linker.nativeLinker().downcallHandle(
+        SymbolLookup.libraryLookup("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", arena)
+            .find("CGEventCreateMouseEvent").orElseThrow(),
+        FunctionDescriptor.of(
+            ValueLayout.ADDRESS,     // CGEventRef
+            ValueLayout.ADDRESS,     // CGEventSourceRef, NULL
+            ValueLayout.JAVA_INT,    // CGEventType
+            point,                   // CGPoint
+            ValueLayout.JAVA_INT,    // CGMouseButton
+        ),
+    )
+
+    fun sendMiddleUp(view: MemorySegment) {
+        val cgEvent = cgMouseEvent.invokeExact(
+            MemorySegment.NULL, NS_OTHER_MOUSE_UP.toInt(), arena.allocate(point), CG_MOUSE_BUTTON_CENTER,
+        ) as MemorySegment
+        if (cgEvent.address() == 0L) fail("CGEventCreateMouseEvent returned NULL")
+        val event = bindings.handle("objc_msgSend_id_id")
+            .invokeExact(bindings.cls("NSEvent"), bindings.sel("eventWithCGEvent:"), cgEvent) as MemorySegment
+        if (event.address() == 0L) fail("eventWithCGEvent: returned nil")
+        val button = bindings.handle("objc_msgSend_long").invokeExact(event, bindings.sel("buttonNumber")) as Long
+        if (button != 2L) fail("the wrapped middle-button event reports buttonNumber $button")
+        bindings.handle("objc_msgSend_void_id").invokeExact(view, bindings.sel("otherMouseUp:"), event) as Unit
+    }
 
     fun send(view: MemorySegment, selector: String, type: Long) {
         val event = event(type)
@@ -179,7 +200,8 @@ private class SyntheticClicks(private val bindings: ObjcBindings) {
 private const val NS_LEFT_MOUSE_DOWN = 1L
 private const val NS_LEFT_MOUSE_UP = 2L
 private const val NS_RIGHT_MOUSE_DOWN = 3L
-private const val NS_OTHER_MOUSE_UP = 26L
+private const val NS_OTHER_MOUSE_UP = 26L  // also kCGEventOtherMouseUp
+private const val CG_MOUSE_BUTTON_CENTER = 2  // kCGMouseButtonCenter
 
 private fun openTray(menuOnPrimaryClick: Boolean): Tray = Tray.create(
     TrayBuilder(
