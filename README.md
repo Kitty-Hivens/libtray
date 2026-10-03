@@ -66,7 +66,7 @@ Available on Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("dev.hivens:libtray:0.1.3")
+    implementation("dev.hivens:libtray:0.2.0")
 }
 ```
 
