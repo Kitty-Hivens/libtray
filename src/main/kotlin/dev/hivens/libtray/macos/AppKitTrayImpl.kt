@@ -1,11 +1,14 @@
 package dev.hivens.libtray.macos
 
+import dev.hivens.libtray.EventDispatcher
 import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.TraySubscription
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
@@ -15,7 +18,7 @@ import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -65,7 +68,7 @@ internal class AppKitTrayImpl private constructor(
     private val log = LoggerFactory.getLogger("libtray.AppKitTray")
 
     @Volatile private var open = AtomicBoolean(true)
-    private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+    private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
      * Per-item tag → libtray id. Tags grow monotonically from 1 within
@@ -121,13 +124,14 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
-    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
-        handlers.add(handler)
-        return { handlers.remove(handler) }
-    }
+    override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
+
+    override fun onEvent(executor: Executor, listener: TrayEventListener): TraySubscription =
+        events.subscribe(listener, executor)
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        events.close()
         INSTANCE_REGISTRY.remove(instanceId)
         // Tear down SYNCHRONOUSLY on the caller thread, not via the async
         // runOnMainQueue path: close() flips `open` first, which would make a
@@ -431,11 +435,7 @@ internal class AppKitTrayImpl private constructor(
         }
     }
 
-    private fun fire(event: TrayEvent) {
-        for (h in handlers) {
-            runCatching { h(event) }.onFailure { log.warn("event handler threw", it) }
-        }
-    }
+    private fun fire(event: TrayEvent) = events.fire(event)
 
     /**
      * Run [action] on the Cocoa main queue (issue #3). Already on the main

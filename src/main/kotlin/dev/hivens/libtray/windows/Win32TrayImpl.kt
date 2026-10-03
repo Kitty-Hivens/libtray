@@ -1,11 +1,14 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.EventDispatcher
 import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.TraySubscription
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
@@ -19,8 +22,8 @@ import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -65,7 +68,7 @@ internal class Win32TrayImpl private constructor(
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
     @Volatile private var open = AtomicBoolean(true)
-    private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+    private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
      * The HWND for the message-only window. Set by the pump thread once
@@ -177,13 +180,14 @@ internal class Win32TrayImpl private constructor(
         return true
     }
 
-    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
-        handlers.add(handler)
-        return { handlers.remove(handler) }
-    }
+    override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
+
+    override fun onEvent(executor: Executor, listener: TrayEventListener): TraySubscription =
+        events.subscribe(listener, executor)
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        events.close()
         // Remove the tray icon BEFORE tearing down the window — once the
         // HWND is destroyed the shell may still hold an entry pointed at
         // a stale handle, which can leave a ghost icon until the next
@@ -640,11 +644,7 @@ internal class Win32TrayImpl private constructor(
     private fun defWindowProc(uMsg: Int, wParam: Long, lParam: Long): Long =
         bindings.handle("DefWindowProcW").invokeExact(hwnd, uMsg, wParam, lParam) as Long
 
-    private fun fire(event: TrayEvent) {
-        for (h in handlers) {
-            runCatching { h(event) }.onFailure { log.warn("event handler threw", it) }
-        }
-    }
+    private fun fire(event: TrayEvent) = events.fire(event)
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.Win32Tray")

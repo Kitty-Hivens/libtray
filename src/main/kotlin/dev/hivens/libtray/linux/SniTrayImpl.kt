@@ -1,17 +1,20 @@
 package dev.hivens.libtray.linux
 
+import dev.hivens.libtray.EventDispatcher
 import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
+import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
+import dev.hivens.libtray.TraySubscription
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
-import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -114,7 +117,7 @@ internal class SniTrayImpl internal constructor(
     @Volatile private var status: String = "Active"
     @Volatile private var open = AtomicBoolean(true)
 
-    private val handlers = CopyOnWriteArrayList<(TrayEvent) -> Unit>()
+    private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /** The single D-Bus I/O thread — sends [outgoing], polls, dispatches. */
     private val ioThread = Thread({ dispatchLoop() }, "libtray-sni-${ProcessHandle.current().pid()}").apply {
@@ -200,13 +203,14 @@ internal class SniTrayImpl internal constructor(
         return true
     }
 
-    override fun onEvent(handler: (TrayEvent) -> Unit): () -> Unit {
-        handlers.add(handler)
-        return { handlers.remove(handler) }
-    }
+    override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
+
+    override fun onEvent(executor: Executor, listener: TrayEventListener): TraySubscription =
+        events.subscribe(listener, executor)
 
     override fun close() {
         if (!open.compareAndSet(true, false)) return
+        events.close()
         // dispatchLoop checks open.get() and exits within its next poll
         // (~POLL_TIMEOUT_MS). Don't hard-interrupt — that could leave the
         // connection in a weird half-closed state with the watcher still
@@ -222,10 +226,9 @@ internal class SniTrayImpl internal constructor(
             runCatching { unref.invokeExact(leftover) as Unit }
         }
         // Everything below frees memory the I/O thread may still be reading.
-        // If it did not stop in time -- a `fire` handler that blocks, or a
-        // flush against a socket nobody is draining -- then unreffing the
-        // connection out from under a live `dbus_*` call is a segfault
-        // inside libdbus. Leaking one connection at shutdown is the better
+        // If it did not stop in time (a flush against a socket nobody is
+        // draining), unreffing the connection out from under a live
+        // `dbus_*` call is a segfault inside libdbus. Leaking one connection at shutdown is the better
         // trade, so bail out and say why.
         if (ioThread.isAlive) {
             log.warn(
@@ -261,11 +264,10 @@ internal class SniTrayImpl internal constructor(
      * thread commits to another blocking poll. Reply latency is then the
      * bus round-trip, not the poll interval.
      *
-     * Consequences of owning both directions here: a [TrayEvent] handler
-     * that blocks (they are invoked from [fire], on this thread) now also
-     * holds up outgoing signals, and a flush against a wedged socket stalls
-     * incoming dispatch. Both are bounded by the same libdbus lock either
-     * way — a second thread could only queue behind it.
+     * Consequence of owning both directions here: a flush against a wedged
+     * socket stalls incoming dispatch. That is bounded by the same libdbus
+     * lock either way, a second thread could only queue behind it. Consumer
+     * listeners never run here: [fire] hands events to [EventDispatcher].
      */
     private fun dispatchLoop() {
         val popMessage = bindings.handle("dbus_connection_pop_message")
@@ -447,12 +449,7 @@ internal class SniTrayImpl internal constructor(
         replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No such method $iface.$member")
     }
 
-    private fun fire(event: TrayEvent) {
-        handlers.forEach { handler ->
-            runCatching { handler(event) }
-                .onFailure { log.warn("onEvent handler threw: {}", it.message) }
-        }
-    }
+    private fun fire(event: TrayEvent) = events.fire(event)
 
     // ── Properties dispatch ──────────────────────────────────────────────
 
