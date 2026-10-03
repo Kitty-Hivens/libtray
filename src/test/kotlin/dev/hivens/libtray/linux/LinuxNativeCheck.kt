@@ -18,7 +18,8 @@ import kotlin.system.exitProcess
  * `linuxNativeCheck` task provides.
  *
  * Covers what a native image is most likely to break: loading libdbus and
- * binding every downcall, building the icon pixmap through ImageIO, the
+ * binding every downcall, building the icon pixmap through ImageIO and
+ * scaling an oversized icon through Java2D, the
  * watcher registration, host clicks and a menu click reaching the listener,
  * and close(). Exit code 0 means every step passed.
  */
@@ -45,6 +46,12 @@ fun main() {
     if (host.getStringProperty(name, "Title") != "libtray native check") fail("Title property")
     if (host.firstIconPixmapSize(name) != (32 to 32)) fail("IconPixmap property")
     step("properties read")
+
+    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    if (!tray.setIcon(solidPng(300))) fail("setIcon")
+    val scaled = host.firstIconPixmapSize(name)
+    if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
+    step("oversized icon scaled to 256x256")
 
     host.callNoResult(name, DBusTestClient.ITEM_PATH, DBusTestClient.ITEM_IFACE, "Activate", listOf(Arg.Int32(0), Arg.Int32(0)))
     expect(events, TrayEvent.Activated)

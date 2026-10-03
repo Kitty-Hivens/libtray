@@ -30,6 +30,8 @@ fun main() {
     step("created")
 
     if (!tray.setTooltip("updated") || !tray.setIcon(solidPng(16))) fail("update")
+    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    if (!tray.setIcon(solidPng(300))) fail("setIcon with an icon that needs scaling")
     step("updated")
 
     post(tray, Win32Bindings.WM_LBUTTONUP)

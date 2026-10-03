@@ -1,9 +1,13 @@
 # JDK metadata for the AWT and ImageIO calls libtray makes to decode, scale and
-# re-encode icons, recorded with the GraalVM native-image agent and spliced into
-# the shipped reachability-metadata.json by NativeImageMetadataTest. One JSON entry
-# per line under the section it belongs to. Lines starting with # are ignored.
+# re-encode icons, recorded with the GraalVM native-image agent (./gradlew
+# nativeAgentRun, uploaded by CI per platform) and merged across Linux, Windows
+# and macOS. NativeImageMetadataTest splices it into the shipped
+# reachability-metadata.json. One JSON entry per line under the section it belongs
+# to. Lines starting with # are ignored.
 REFLECTION
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.GraphicsEnvironment", "jniAccessible": true, "methods": [{"name": "isHeadless", "parameterTypes": []}]}
+{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.Insets", "jniAccessible": true, "fields": [{"name": "bottom"}, {"name": "left"}, {"name": "right"}, {"name": "top"}], "methods": [{"name": "<init>", "parameterTypes": ["int", "int", "int", "int"]}]}
+{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.Toolkit", "jniAccessible": true, "methods": [{"name": "getDefaultToolkit", "parameterTypes": []}, {"name": "getFontMetrics", "parameterTypes": ["java.awt.Font"]}]}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.image.BufferedImage", "jniAccessible": true, "fields": [{"name": "colorModel"}, {"name": "imageType"}, {"name": "raster"}], "methods": [{"name": "getRGB", "parameterTypes": ["int", "int", "int", "int", "int[]", "int", "int"]}, {"name": "setRGB", "parameterTypes": ["int", "int", "int", "int", "int[]", "int", "int"]}]}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.image.ColorModel", "jniAccessible": true, "fields": [{"name": "colorSpace"}, {"name": "colorSpaceType"}, {"name": "isAlphaPremultiplied"}, {"name": "is_sRGB"}, {"name": "nBits"}, {"name": "numComponents"}, {"name": "supportsAlpha"}, {"name": "transparency"}], "methods": [{"name": "getRGBdefault", "parameterTypes": []}]}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "java.awt.image.Raster", "jniAccessible": true, "fields": [{"name": "dataBuffer"}, {"name": "height"}, {"name": "minX"}, {"name": "minY"}, {"name": "numBands"}, {"name": "numDataElements"}, {"name": "sampleModel"}, {"name": "sampleModelTranslateX"}, {"name": "sampleModelTranslateY"}, {"name": "width"}]}
@@ -14,11 +18,13 @@ REFLECTION
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "javax.imageio.spi.ImageReaderSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "javax.imageio.spi.ImageWriterSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.awt.image.ByteComponentRaster", "jniAccessible": true, "fields": [{"name": "data"}, {"name": "dataOffsets"}, {"name": "pixelStride"}, {"name": "scanlineStride"}, {"name": "type"}]}
-{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.awt.image.IntegerComponentRaster", "jniAccessible": true, "fields": [{"name": "data"}, {"name": "dataOffsets"}, {"name": "pixelStride"}, {"name": "scanlineStride"}, {"name": "type"}]}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "type": "sun.java2d.Disposer", "jniAccessible": true, "methods": [{"name": "addRecord", "parameterTypes": ["java.lang.Object", "long", "long"]}]}
 RESOURCES
+{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "bundle": "sun.awt.resources.awt"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageInputStreamSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageOutputStreamSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageReaderSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageTranscoderSpi"}
 {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageWriterSpi"}
+{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/awt/resources/awt_en.properties", "module": "java.desktop"}
+{"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/awt/resources/awt_en_US.properties", "module": "java.desktop"}

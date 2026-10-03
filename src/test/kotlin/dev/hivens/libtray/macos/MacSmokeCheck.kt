@@ -41,7 +41,11 @@ import kotlin.system.exitProcess
  */
 fun main() {
     val watchdog = Thread {
-        Thread.sleep(90_000)
+        try {
+            Thread.sleep(90_000)
+        } catch (_: InterruptedException) {
+            return@Thread  // interrupted once every step has passed
+        }
         fail("timed out")
     }.apply { isDaemon = true; start() }
 
@@ -55,6 +59,8 @@ fun main() {
 
     check(tray.setTooltip("updated")) { "setTooltip" }
     check(tray.setIcon(icon(22))) { "setIcon" }
+    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    check(tray.setIcon(icon(300))) { "setIcon with an icon that needs scaling" }
     check(tray.setMenu(menu())) { "setMenu" }
     step("updated")
 
