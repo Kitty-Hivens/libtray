@@ -82,6 +82,16 @@ jobs:
           fi
           echo "publishing $v"
 
+      # The notes are rendered before anything is built, because the upload
+      # cannot be undone: a tag whose version has no CHANGELOG section stops
+      # here instead of leaving a published version without a release page,
+      # which a rerun could not fix, since the guard above refuses the version.
+      - name: Release notes
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
+        run: python3 .github/scripts/changelog_section.py CHANGELOG.md "$VERSION" > release-notes.md
+
       - name: Publish
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
@@ -107,7 +117,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
         run: |
-          python3 .github/scripts/changelog_section.py CHANGELOG.md "$VERSION" > release-notes.md
           gh release create "$GITHUB_REF_NAME" \
             --title "libtray $VERSION" \
             --notes-file release-notes.md \
