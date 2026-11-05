@@ -108,8 +108,7 @@ internal class SniTrayImpl internal constructor(
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 
-    @Volatile private var iconBytes: ByteArray = IconScaling.fit(initial.iconBytes, maxIconSize, log)
-    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(iconBytes)
+    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(IconScaling.fit(initial.iconBytes, maxIconSize, log))
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     @Volatile private var menu: TrayMenu? = initial.menu
     @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let(::DBusMenuLayout)
@@ -197,9 +196,12 @@ internal class SniTrayImpl internal constructor(
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        val fitted = IconScaling.fit(iconBytes, maxIconSize, log)
-        this.iconBytes = fitted
-        this.iconPixmap = pngToPixmaps(fitted)
+        val pixmaps = pngToPixmaps(IconScaling.fit(iconBytes, maxIconSize, log))
+        if (pixmaps.isEmpty()) {
+            log.warn("Could not decode the new tray icon ({} bytes), keeping the current one", iconBytes.size)
+            return false
+        }
+        iconPixmap = pixmaps
         emitSignal("NewIcon")
         return true
     }

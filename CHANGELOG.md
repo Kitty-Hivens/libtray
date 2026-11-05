@@ -35,6 +35,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Linux: a dbusmenu `EventGroup` call with missing or wrongly typed
   arguments crashed the process inside libdbus. It now gets an `InvalidArgs`
   error. Any client on the session bus could trigger this.
+- Linux: `setIcon` with bytes that do not decode replaced the visible icon
+  with nothing and returned true. It now keeps the current icon and returns
+  false, as the Windows backend does.
 
 ## [0.2.0]
 

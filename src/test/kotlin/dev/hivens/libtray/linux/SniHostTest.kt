@@ -93,6 +93,16 @@ class SniHostTest {
     }
 
     @Test
+    fun `setIcon with undecodable bytes reports failure and keeps the current icon`() {
+        val name = "org.libtray.HostTest.UndecodableIcon"
+        val tray = open(name)
+
+        tray.setIcon(byteArrayOf(1, 2, 3)) shouldBe false
+
+        host.firstIconPixmapSize(name) shouldBe (32 to 32)
+    }
+
+    @Test
     fun `menu clicks in an EventGroup come back by id`() {
         val name = "org.libtray.HostTest.EventGroup"
         val events = LinkedBlockingQueue<TrayEvent>()
