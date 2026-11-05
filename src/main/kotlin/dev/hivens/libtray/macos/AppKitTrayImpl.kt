@@ -9,15 +9,13 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.UpcallTarget
 import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
-import java.lang.foreign.Linker
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
-import java.lang.invoke.MethodHandles
-import java.lang.invoke.MethodType
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -771,6 +769,14 @@ internal class AppKitTrayImpl private constructor(
         internal val OBJC_METHOD_DESCRIPTOR: FunctionDescriptor =
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
 
+        private val DISPATCH_TRAMPOLINE = UpcallTarget(AppKitTrayImpl::class.java, "dispatchTrampoline", TRAMPOLINE_DESCRIPTOR)
+        private val ON_MENU_ITEM = UpcallTarget(AppKitTrayImpl::class.java, "onMenuItemEntry", OBJC_METHOD_DESCRIPTOR)
+        private val ON_STATUS_ITEM_CLICK = UpcallTarget(AppKitTrayImpl::class.java, "onStatusItemClickEntry", OBJC_METHOD_DESCRIPTOR)
+        private val ON_STATUS_VIEW_MOUSE = UpcallTarget(AppKitTrayImpl::class.java, "onStatusViewMouseEntry", OBJC_METHOD_DESCRIPTOR)
+
+        /** Every method this backend turns into an upcall stub. */
+        internal val UPCALLS = listOf(DISPATCH_TRAMPOLINE, ON_MENU_ITEM, ON_STATUS_ITEM_CLICK, ON_STATUS_VIEW_MOUSE)
+
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
@@ -805,11 +811,7 @@ internal class AppKitTrayImpl private constructor(
         private fun dispatchTrampolineStub(): MemorySegment {
             trampolineStub?.let { return it }
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java, "dispatchTrampoline",
-                MethodType.methodType(Void.TYPE, MemorySegment::class.java),
-            )
-            val stub = Linker.nativeLinker().upcallStub(handle, TRAMPOLINE_DESCRIPTOR, arena)
+            val stub = DISPATCH_TRAMPOLINE.stub(arena)
             trampolineArena = arena
             trampolineStub = stub
             return stub
@@ -903,17 +905,7 @@ internal class AppKitTrayImpl private constructor(
         private fun ensureStatusViewClass(bindings: ObjcBindings) {
             if (statusViewClass.address() != 0L) return
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onStatusViewMouseEntry",
-                MethodType.methodType(
-                    Void.TYPE,
-                    MemorySegment::class.java,   // self (the overlay)
-                    MemorySegment::class.java,   // _cmd (SEL)
-                    MemorySegment::class.java,   // NSEvent*
-                ),
-            )
-            val stub = Linker.nativeLinker().upcallStub(handle, OBJC_METHOD_DESCRIPTOR, arena)
+            val stub = ON_STATUS_VIEW_MOUSE.stub(arena)
             val className = "LibtrayStatusView_${ProcessHandle.current().pid()}"
             val newClass = bindings.handle("objc_allocateClassPair")
                 .invokeExact(bindings.cls("NSView"), arena.allocateFrom(className), 0L) as MemorySegment
@@ -1155,24 +1147,8 @@ internal class AppKitTrayImpl private constructor(
             if (menuTargetClass != null) return
 
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onMenuItemEntry",
-                MethodType.methodType(
-                    Void.TYPE,
-                    MemorySegment::class.java,   // self (id)
-                    MemorySegment::class.java,   // _cmd (SEL)
-                    MemorySegment::class.java,   // sender (id)
-                ),
-            )
-            val descriptor = OBJC_METHOD_DESCRIPTOR
-            val stub = Linker.nativeLinker().upcallStub(handle, descriptor, arena)
-            val clickHandle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onStatusItemClickEntry",
-                handle.type(),
-            )
-            val clickStub = Linker.nativeLinker().upcallStub(clickHandle, descriptor, arena)
+            val stub = ON_MENU_ITEM.stub(arena)
+            val clickStub = ON_STATUS_ITEM_CLICK.stub(arena)
             menuActionStub = stub
             statusClickStub = clickStub
             stubArena = arena

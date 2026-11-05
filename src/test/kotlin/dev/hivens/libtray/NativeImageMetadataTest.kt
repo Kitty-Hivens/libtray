@@ -11,7 +11,6 @@ import java.io.File
 import java.lang.foreign.AddressLayout
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.MemoryLayout
-import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 import java.lang.reflect.Modifier
 
@@ -43,29 +42,35 @@ class NativeImageMetadataTest {
     }
 
     @Test
-    fun `every upcall target exists as a static method`() {
-        for ((owner, methods) in UPCALL_TARGETS) {
-            for ((name, parameters) in methods) {
-                val method = owner.getDeclaredMethod(name, *parameters.toTypedArray())
-                Modifier.isStatic(method.modifiers) shouldBe true
-            }
+    fun `every upcall target is a static method matching its descriptor`() {
+        for (target in UPCALL_TARGETS) {
+            val type = target.descriptor.toMethodType()
+            val method = target.owner.getDeclaredMethod(target.method, *type.parameterArray())
+            Modifier.isStatic(method.modifiers) shouldBe true
+            method.returnType shouldBe type.returnType()
         }
+    }
+
+    @Test
+    fun `upcall stubs are only built through UpcallTarget`() {
+        // A stub built anywhere else would be missing from the generated file.
+        val offenders = File("src/main/kotlin").walkTopDown()
+            .filter { it.extension == "kt" && it.name != "Foreign.kt" && ".upcallStub(" in it.readText() }
+            .map { it.path }
+            .toList()
+        offenders shouldBe emptyList()
     }
 
     private fun render(): String {
         val downcalls = (DBusBindings.DOWNCALL_DESCRIPTORS + Win32Bindings.DOWNCALL_DESCRIPTORS + ObjcBindings.DOWNCALL_DESCRIPTORS)
             .map(::signature).distinct().sorted()
-        val upcalls = listOf(
-            Win32Bindings.WNDPROC_DESCRIPTOR,
-            AppKitTrayImpl.TRAMPOLINE_DESCRIPTOR,
-            AppKitTrayImpl.OBJC_METHOD_DESCRIPTOR,
-        ).map(::signature).distinct().sorted()
+        val upcalls = UPCALL_TARGETS.map { signature(it.descriptor) }.distinct().sorted()
 
         val (jdkReflection, jdkResources) = jdkEntries()
-        val upcallReflection = UPCALL_TARGETS.entries.sortedBy { it.key.name }.map { (owner, methods) ->
-            val methodLines = methods.sortedBy { it.first }.joinToString(",\n") { (name, parameters) ->
-                val types = parameters.joinToString(", ") { "\"${it.name}\"" }
-                """        { "name": "$name", "parameterTypes": [$types] }"""
+        val upcallReflection = UPCALL_TARGETS.groupBy { it.owner }.entries.sortedBy { it.key.name }.map { (owner, targets) ->
+            val methodLines = targets.sortedBy { it.method }.joinToString(",\n") { target ->
+                val types = target.descriptor.toMethodType().parameterList().joinToString(", ") { "\"${it.name}\"" }
+                """        { "name": "${target.method}", "parameterTypes": [$types] }"""
             }
             "    {\n      \"type\": \"${owner.name}\",\n      \"methods\": [\n$methodLines\n      ]\n    }"
         }
@@ -124,25 +129,11 @@ class NativeImageMetadataTest {
     private companion object {
         const val METADATA_PATH = "src/main/resources/META-INF/native-image/dev.hivens/libtray/reachability-metadata.json"
 
-        private val MS = MemorySegment::class.java
-        private val INT = Int::class.javaPrimitiveType!!
-        private val LONG = Long::class.javaPrimitiveType!!
-
         /**
          * The static methods the backends turn into upcall stubs through
          * `MethodHandles.lookup().findStatic`, which a native image resolves
          * only for methods registered for reflection.
          */
-        val UPCALL_TARGETS: Map<Class<*>, List<Pair<String, List<Class<*>>>>> = mapOf(
-            Win32TrayImpl::class.java to listOf(
-                "wndProcEntry" to listOf(MS, INT, LONG, LONG),
-            ),
-            AppKitTrayImpl::class.java to listOf(
-                "dispatchTrampoline" to listOf(MS),
-                "onMenuItemEntry" to listOf(MS, MS, MS),
-                "onStatusItemClickEntry" to listOf(MS, MS, MS),
-                "onStatusViewMouseEntry" to listOf(MS, MS, MS),
-            ),
-        )
+        val UPCALL_TARGETS: List<UpcallTarget> = AppKitTrayImpl.UPCALLS + Win32TrayImpl.WND_PROC
     }
 }

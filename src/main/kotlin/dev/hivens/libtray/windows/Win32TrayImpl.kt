@@ -9,6 +9,7 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.UpcallTarget
 import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
@@ -18,8 +19,6 @@ import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
-import java.lang.invoke.MethodHandles
-import java.lang.invoke.MethodType
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
@@ -692,6 +691,9 @@ internal class Win32TrayImpl private constructor(
         /** How long close() waits for the pump thread before leaving its resources allocated. */
         private const val PUMP_JOIN_TIMEOUT_MS: Long = 2_000
 
+        /** The one upcall libtray needs on Windows: the OS calls it for every message to our windows. */
+        internal val WND_PROC = UpcallTarget(Win32TrayImpl::class.java, "wndProcEntry", Win32Bindings.WNDPROC_DESCRIPTOR)
+
         /**
          * HWND address → instance map. The WndProc upcall stub gets
          * called by Windows with the HWND as its first argument; we
@@ -798,7 +800,7 @@ internal class Win32TrayImpl private constructor(
             }
 
             // Build the WndProc upcall stub once per JVM, lazily.
-            val (stub, _) = ensureWndProcStub(bindings) ?: run {
+            val (stub, _) = ensureWndProcStub() ?: run {
                 log.warn("Could not create WndProc upcall stub")
                 return null
             }
@@ -862,28 +864,17 @@ internal class Win32TrayImpl private constructor(
          * the single stub instead of each allocating its own.
          */
         @Synchronized
-        private fun ensureWndProcStub(bindings: Win32Bindings): Pair<MemorySegment, Arena>? {
+        private fun ensureWndProcStub(): Pair<MemorySegment, Arena>? {
             wndProcStub?.let { stub -> wndProcArena?.let { arena -> return stub to arena } }
             return runCatching {
-                val handle = MethodHandles.lookup().findStatic(
-                    Win32TrayImpl::class.java,
-                    "wndProcEntry",
-                    MethodType.methodType(
-                        Long::class.javaPrimitiveType!!,
-                        MemorySegment::class.java,
-                        Int::class.javaPrimitiveType!!,
-                        Long::class.javaPrimitiveType!!,
-                        Long::class.javaPrimitiveType!!,
-                    ),
-                )
                 val arena = Arena.ofShared()
-                val stub = Linker.nativeLinker().upcallStub(handle, bindings.wndProcDescriptor, arena)
+                val stub = WND_PROC.stub(arena)
                 // Same arena, so the fallback stays callable for as long as
                 // the stub the OS holds -- see defWindowProcHandle's KDoc.
                 defWindowProcHandle = SymbolLookup.libraryLookup("user32", arena)
                     .find("DefWindowProcW")
                     .map { symbol ->
-                        Linker.nativeLinker().downcallHandle(symbol, bindings.defWindowProcDescriptor)
+                        Linker.nativeLinker().downcallHandle(symbol, Win32Bindings.WNDPROC_DESCRIPTOR)
                     }
                     .orElse(null)
                 wndProcStub = stub
