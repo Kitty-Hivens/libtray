@@ -87,12 +87,11 @@ internal class AppKitTrayImpl private constructor(
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
-     * Per-item tag → libtray id. Tags grow monotonically from 1 within
-     * an instance and are rebuilt on every [setMenu]; the upcall
-     * handler walks live instances to find the owner.
+     * Per-item tag -> libtray id, rebuilt on every [setMenu]. The upcall
+     * handler walks live instances to find the owner, which works because
+     * [nextTag] is shared by all of them.
      */
     private val tagToId = ConcurrentHashMap<Int, String>()
-    private val nextTag = AtomicInteger(1)
 
     /** Currently-installed NSMenu* (retained), or NULL when no menu set. */
     @Volatile private var currentMenu: MemorySegment = MemorySegment.NULL
@@ -178,11 +177,9 @@ internal class AppKitTrayImpl private constructor(
         tearDownOnMainThread()
         // The ObjcBindings arena is deliberately NOT closed here (unlike the
         // Linux / Win32 backends). runOnMainQueue can leave actions queued on
-        // the GCD main queue that still reference this instance's msgSend
-        // handles, and the menu-target class + its upcall stub are already
-        // process-lifetime; closing the arena would risk a use-after-free for a
-        // deferred action. The cost is a one-time set of downcall handles,
-        // reclaimed at process exit.
+        // the GCD main queue that still use the msgSend handles, and the
+        // menu-target class + its upcall stub are already process-lifetime.
+        // All trays share one set of bindings, see sharedBindings.
     }
 
     /**
@@ -757,6 +754,9 @@ internal class AppKitTrayImpl private constructor(
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
         private val instanceCounter = AtomicInteger(0)
 
+        /** Next `NSMenuItem` tag. Process-wide: the tag alone has to identify the owning tray. */
+        private val nextTag = AtomicInteger(1)
+
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
 
@@ -837,7 +837,7 @@ internal class AppKitTrayImpl private constructor(
         @JvmStatic
         @Suppress("unused", "UNUSED_PARAMETER")
         fun onMenuItemEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
-            val bindings = lastBindings ?: return
+            val bindings = sharedBindings ?: return
             val tag = try {
                 (bindings.handle("objc_msgSend_long")
                     .invokeExact(sender, bindings.sel("tag")) as Long).toInt()
@@ -930,15 +930,22 @@ internal class AppKitTrayImpl private constructor(
             log.info("Registered runtime ObjC class {} for status item clicks", className)
         }
 
-        /** Last-loaded bindings, used by the static upcall handler. */
-        @Volatile private var lastBindings: ObjcBindings? = null
+        /**
+         * The process's one set of bindings, also read by the static upcall
+         * handler. Their arena is never closed (see [close]), so loading per
+         * tray would keep another set of handles alive for every create().
+         */
+        @Volatile private var sharedBindings: ObjcBindings? = null
+
+        @Synchronized
+        private fun loadSharedBindings(): ObjcBindings? =
+            sharedBindings ?: ObjcBindings.load()?.also { sharedBindings = it }
 
         fun create(builder: TrayBuilder): Tray? {
-            val bindings = ObjcBindings.load() ?: run {
+            val bindings = loadSharedBindings() ?: run {
                 log.info("Objective-C runtime / AppKit not loadable — AppKit tray unavailable")
                 return null
             }
-            lastBindings = bindings
 
             // Caller-thread check. NSStatusItem and every NSWindow
             // constructor it delegates to are pinned to OS thread 0

@@ -46,6 +46,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   skipped its teardown. On macOS the same flag on the main thread could end
   the JVM from a menu click.
 - Linux: a setter racing `close()` could throw instead of returning false.
+- macOS: with more than one tray, a menu click could be delivered to the
+  wrong tray, because menu item tags were only unique within a tray.
+- macOS: each `Tray.create` kept another set of native bindings alive for the
+  life of the process. All trays now share one.
 
 ## [0.2.0]
 

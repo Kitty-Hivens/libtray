@@ -72,6 +72,20 @@ fun main() {
         .invokeExact(nsMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
     expect(events, TrayEvent.MenuItemSelected("noop"), "menu item action")
 
+    // A second tray built the same way must get its own menu clicks. Its items
+    // would carry the same tags as the first tray's if tags were per tray.
+    val other = openTray(menuOnPrimaryClick = false)
+    val otherEvents = LinkedBlockingQueue<TrayEvent>()
+    other.onEvent { otherEvents.add(it) }
+    check(other.setMenu(menu())) { "setMenu on the second tray" }
+    val otherMenu = field<MemorySegment>(other, "currentMenu")
+    bindings.handle("objc_msgSend_void_long")
+        .invokeExact(otherMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
+    expect(otherEvents, TrayEvent.MenuItemSelected("noop"), "second tray's menu item action")
+    val strayEvent = events.poll(200, TimeUnit.MILLISECONDS)
+    if (strayEvent != null) fail("the first tray received $strayEvent for the second tray's menu")
+    other.close()
+
     val overlay = field<MemorySegment>(tray, "statusView")
     if (overlay.address() == 0L) fail("no click overlay was installed")
     clicks.send(overlay, "mouseDown:", NS_LEFT_MOUSE_DOWN)
