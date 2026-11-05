@@ -35,6 +35,10 @@ internal class DBusTestClient : AutoCloseable {
         data class UInt32(val value: Int) : Arg
         data class VariantInt32(val value: Int) : Arg
         data object EmptyStringArray : Arg
+        data class Int32Array(val values: List<Int>) : Arg
+
+        /** The `a(isvu)` of a dbusmenu `EventGroup`, one "clicked" event per id. */
+        data class MenuClicks(val ids: List<Int>) : Arg
     }
 
     /**
@@ -155,7 +159,35 @@ internal class DBusTestClient : AutoCloseable {
                 ) as Int
                 bindings.handle("dbus_message_iter_close_container").invokeExact(iter, array) as Int
             }
+            is Arg.Int32Array -> appendArray(arena, iter, "i", arg.values.map { Arg.Int32(it) })
+            is Arg.MenuClicks -> {
+                val array = arena.allocate(bindings.messageIterLayout)
+                bindings.handle("dbus_message_iter_open_container").invokeExact(
+                    iter, DBusBindings.DBUS_TYPE_ARRAY.toInt(), arena.allocateUtf8("(isvu)"), array,
+                ) as Int
+                for (id in arg.ids) {
+                    val struct = arena.allocate(bindings.messageIterLayout)
+                    bindings.handle("dbus_message_iter_open_container").invokeExact(
+                        array, DBusBindings.DBUS_TYPE_STRUCT.toInt(), MemorySegment.NULL, struct,
+                    ) as Int
+                    append(arena, struct, Arg.Int32(id))
+                    append(arena, struct, Arg.Str("clicked"))
+                    append(arena, struct, Arg.VariantInt32(0))
+                    append(arena, struct, Arg.UInt32(0))
+                    bindings.handle("dbus_message_iter_close_container").invokeExact(array, struct) as Int
+                }
+                bindings.handle("dbus_message_iter_close_container").invokeExact(iter, array) as Int
+            }
         }
+    }
+
+    private fun appendArray(arena: Arena, iter: MemorySegment, elementSignature: String, elements: List<Arg>) {
+        val array = arena.allocate(bindings.messageIterLayout)
+        bindings.handle("dbus_message_iter_open_container").invokeExact(
+            iter, DBusBindings.DBUS_TYPE_ARRAY.toInt(), arena.allocateUtf8(elementSignature), array,
+        ) as Int
+        for (element in elements) append(arena, array, element)
+        bindings.handle("dbus_message_iter_close_container").invokeExact(iter, array) as Int
     }
 
     private fun int(arena: Arena, value: Int): MemorySegment =

@@ -461,6 +461,11 @@ internal class SniTrayImpl internal constructor(
         replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No such method $iface.$member")
     }
 
+    private fun replyInvalidArgs(msg: MemorySegment, why: String) {
+        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
+        replyError(msg, "org.freedesktop.DBus.Error.InvalidArgs", why)
+    }
+
     private fun fire(event: TrayEvent) = events.fire(event)
 
     // ── Properties dispatch ──────────────────────────────────────────────
@@ -883,17 +888,26 @@ internal class SniTrayImpl internal constructor(
         }
     }
 
-    /** EventGroup(events: a(isvu)) — batched Event. Reply: a(i) of unhandled ids. */
+    /**
+     * EventGroup(events: a(isvu)), a batched Event. Reply: ai of unhandled ids.
+     *
+     * Types are checked before each recurse. Anything on the session bus can
+     * call this, and `dbus_message_iter_recurse` on a value that is not a
+     * container takes the whole process down inside libdbus.
+     */
     private fun handleMenuEventGroup(msg: MemorySegment) {
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val outerType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
+            if (outerType.toByte() != DBusBindings.DBUS_TYPE_ARRAY) return replyInvalidArgs(msg, EVENT_GROUP_ARGS)
             val arrIter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_recurse").invokeExact(iter, arrIter) as Unit
             // Walk each (i s v u) tuple — pull id + event_id, ignore data + ts.
             while (true) {
                 val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(arrIter) as Int
                 if (argType.toByte() == DBusBindings.DBUS_TYPE_INVALID) break
+                if (argType.toByte() != DBusBindings.DBUS_TYPE_STRUCT) return replyInvalidArgs(msg, EVENT_GROUP_ARGS)
                 val structIter = call.allocate(bindings.messageIterLayout)
                 bindings.handle("dbus_message_iter_recurse").invokeExact(arrIter, structIter) as Unit
                 val id = readInt(call, structIter) ?: 0
@@ -1130,6 +1144,7 @@ internal class SniTrayImpl internal constructor(
 
         private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
         private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
+        private const val EVENT_GROUP_ARGS = "EventGroup takes a(isvu)"
 
         /**
          * How long `dbus_connection_read_write` blocks per iteration. It

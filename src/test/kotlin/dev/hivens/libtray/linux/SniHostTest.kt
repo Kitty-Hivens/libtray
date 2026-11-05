@@ -6,9 +6,11 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.linux.DBusTestClient.Arg
+import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldStartWith
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -88,6 +90,34 @@ class SniHostTest {
 
         take(events) shouldBe TrayEvent.MenuItemSelected("exit")
         events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+    }
+
+    @Test
+    fun `menu clicks in an EventGroup come back by id`() {
+        val name = "org.libtray.HostTest.EventGroup"
+        val events = LinkedBlockingQueue<TrayEvent>()
+        open(name).onEvent { events.add(it) }
+
+        callEventGroup(name, listOf(Arg.MenuClicks(emptyList())))
+        callEventGroup(name, listOf(Arg.MenuClicks(listOf(1, 2, 3))))
+
+        // Item 2 is the separator, which must not surface.
+        take(events) shouldBe TrayEvent.MenuItemSelected("show")
+        take(events) shouldBe TrayEvent.MenuItemSelected("exit")
+        events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+    }
+
+    @Test
+    fun `a malformed EventGroup gets an error and the item keeps serving`() {
+        val name = "org.libtray.HostTest.MalformedEventGroup"
+        open(name)
+
+        for (args in listOf(emptyList(), listOf(Arg.Int32(1)), listOf(Arg.Int32Array(listOf(1))))) {
+            shouldThrow<IllegalStateException> { callEventGroup(name, args) }
+                .message.shouldContain("InvalidArgs")
+        }
+
+        host.getStringProperty(name, "Status") shouldBe "Active"
     }
 
     @Test
@@ -187,6 +217,9 @@ class SniHostTest {
     private fun clickMenu(name: String, id: Int) =
         host.callNoResult(name, DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "Event",
             listOf(Arg.Int32(id), Arg.Str("clicked"), Arg.VariantInt32(0), Arg.UInt32(0)))
+
+    private fun callEventGroup(name: String, args: List<Arg>) =
+        host.callNoResult(name, DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "EventGroup", args)
 
     private fun xy() = listOf(Arg.Int32(0), Arg.Int32(0))
 

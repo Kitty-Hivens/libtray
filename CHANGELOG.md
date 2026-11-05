@@ -31,6 +31,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Colour is averaged premultiplied by alpha. Against the previous output,
   alpha matches exactly and colour within one level.
 
+### Fixed
+- Linux: a dbusmenu `EventGroup` call with missing or wrongly typed
+  arguments crashed the process inside libdbus. It now gets an `InvalidArgs`
+  error. Any client on the session bus could trigger this.
+
 ## [0.2.0]
 
 This release reworks the public API for Java callers and the threading
