@@ -131,6 +131,23 @@ class SniHostTest {
     }
 
     @Test
+    fun `a click on an item of a replaced menu is dropped`() {
+        val name = "org.libtray.HostTest.ReplacedMenu"
+        val events = LinkedBlockingQueue<TrayEvent>()
+        val tray = open(name)
+        tray.onEvent { events.add(it) }
+
+        tray.setMenu(TrayMenu(TrayMenuItem.Standard("a", "A"), TrayMenuItem.Standard("b", "B"), TrayMenuItem.Standard("c", "C")))
+
+        // Id 3 was "exit" in the menu a host may still have on screen.
+        clickMenu(name, 3)
+        events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+
+        clickMenu(name, 4)
+        take(events) shouldBe TrayEvent.MenuItemSelected("a")
+    }
+
+    @Test
     fun `registers with the watcher under its bus name`() {
         DBusTestClient.Watcher().use { watcher ->
             open(linuxBusName = null)

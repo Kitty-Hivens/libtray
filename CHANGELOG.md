@@ -38,6 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Linux: `setIcon` with bytes that do not decode replaced the visible icon
   with nothing and returned true. It now keeps the current icon and returns
   false, as the Windows backend does.
+- Linux: a click on an open menu that `setMenu` had just replaced could
+  fire the new menu's item with the same position. Menu ids are no longer
+  reused within a tray, so such a click is dropped.
 
 ## [0.2.0]
 

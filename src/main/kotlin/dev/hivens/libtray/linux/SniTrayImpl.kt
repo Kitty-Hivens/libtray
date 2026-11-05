@@ -110,8 +110,8 @@ internal class SniTrayImpl internal constructor(
 
     @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(IconScaling.fit(initial.iconBytes, maxIconSize, log))
     @Volatile private var tooltip: String = initial.tooltip ?: ""
-    @Volatile private var menu: TrayMenu? = initial.menu
-    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let(::DBusMenuLayout)
+    private val menuIds = AtomicInteger(0)
+    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let { DBusMenuLayout(it, menuIds) }
     private val layoutRevision = AtomicInteger(0)
     @Volatile private var status: String = "Active"
     @Volatile private var open = AtomicBoolean(true)
@@ -208,8 +208,7 @@ internal class SniTrayImpl internal constructor(
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
-        this.menu = menu
-        this.menuLayout = menu?.let(::DBusMenuLayout)
+        menuLayout = menu?.let { DBusMenuLayout(it, menuIds) }
         layoutRevision.incrementAndGet()
         emitLayoutUpdated()
         return true
