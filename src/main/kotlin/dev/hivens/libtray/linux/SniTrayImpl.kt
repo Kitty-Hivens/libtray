@@ -112,8 +112,7 @@ internal class SniTrayImpl internal constructor(
     private val menuIds = AtomicInteger(0)
     @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let { DBusMenuLayout(it, menuIds) }
     private val layoutRevision = AtomicInteger(0)
-    @Volatile private var status: String = "Active"
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
 
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
@@ -266,11 +265,11 @@ internal class SniTrayImpl internal constructor(
         // before the final unref. A shared dbus_bus_get connection must never
         // be closed, but this backend owns a private one.
         runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
-            .onFailure { log.warn("dbus_connection_close threw on shutdown: {}", it.message) }
+            .onFailure { log.warn("dbus_connection_close threw on shutdown", it) }
         try {
             bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
         } catch (t: Throwable) {
-            log.warn("dbus_connection_unref threw on shutdown: {}", t.message)
+            log.warn("dbus_connection_unref threw on shutdown", t)
         }
         // Release the shared arena (library lookup + every downcall handle).
         // Safe now that the I/O thread is provably gone; the SNI backend uses no
@@ -318,13 +317,15 @@ internal class SniTrayImpl internal constructor(
                     try {
                         dispatchOne(msg)
                     } catch (t: Throwable) {
-                        log.warn("Message dispatch threw, dropping message: {}", t.message)
+                        log.warn("Message dispatch threw, dropping message", t)
                     } finally {
                         runCatching { unref.invokeExact(msg) as Unit }
                     }
                 }
             } catch (t: Throwable) {
-                log.warn("D-Bus I/O iteration threw: {}", t.message)
+                // A broken bus repeats this twice a second, so the stack is debug only.
+                log.warn("D-Bus I/O iteration threw: {}", t.toString())
+                log.debug("D-Bus I/O iteration threw", t)
                 // Sleep briefly so a permanently-broken bus doesn't
                 // burn CPU at 100% logging.
                 Thread.sleep(500)
@@ -360,7 +361,7 @@ internal class SniTrayImpl internal constructor(
                     send.invokeExact(connection, msg, serial) as Int
                 }
             } catch (t: Throwable) {
-                log.warn("send failed, dropping message: {}", t.message)
+                log.warn("send failed, dropping message", t)
             } finally {
                 runCatching { unref.invokeExact(msg) as Unit }
             }
@@ -551,7 +552,7 @@ internal class SniTrayImpl internal constructor(
             // own; with libtray composing the same prefix the result
             // would be "App — App — status".
             "Title"         -> appendVariantString(call, parent, currentTitle())
-            "Status"        -> appendVariantString(call, parent, status)
+            "Status"        -> appendVariantString(call, parent, "Active")
             "WindowId"      -> appendVariantInt(call, parent, 0)
             "IconName"      -> appendVariantString(call, parent, "")
             "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
@@ -1146,7 +1147,7 @@ internal class SniTrayImpl internal constructor(
             }
             listOf(Pixmap(w, h, out))
         }.getOrElse {
-            log.warn("Icon decode failed: {}", it.message)
+            log.warn("Icon decode failed", it)
             emptyList()
         }
     }
@@ -1367,7 +1368,7 @@ internal class SniTrayImpl internal constructor(
                     // heap-allocates its name / message strings -- the
                     // confined arena does not own them.
                     freeError(bindings, error)
-                }.onFailure { log.warn("AddMatch for NameOwnerChanged failed: {}", it.message) }
+                }.onFailure { log.warn("AddMatch for NameOwnerChanged failed", it) }
 
                 SniTrayImpl(bindings, conn, itemId, builder)
             }
@@ -1415,5 +1416,3 @@ internal class SniTrayImpl internal constructor(
         }
     }
 }
-
-// allocateUtf8 now lives in DBusBindings.kt (shared across the linux package).

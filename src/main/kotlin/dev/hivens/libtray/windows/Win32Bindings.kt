@@ -65,9 +65,6 @@ internal class Win32Bindings private constructor(
 
         val HWND_MESSAGE: MemorySegment = MemorySegment.ofAddress(-3L)
 
-        // CW_USEDEFAULT for x/y/width/height. Values are signed 32-bit.
-        const val CW_USEDEFAULT: Int = 0x80000000.toInt()
-
         /**
          * Library names — Win32 system DLLs. JDK's `SymbolLookup.libraryLookup`
          * is given the un-suffixed name; the loader appends `.dll` and walks
@@ -228,11 +225,9 @@ internal class Win32Bindings private constructor(
         const val MF_POPUP:     Int = 0x00000010
         const val MF_SEPARATOR: Int = 0x00000800
         const val MF_GRAYED:    Int = 0x00000001
-        const val MF_DISABLED:  Int = 0x00000002
 
         const val TPM_RIGHTBUTTON: Int = 0x0002
         const val TPM_RETURNCMD:   Int = 0x0100
-        const val TPM_NONOTIFY:    Int = 0x0080
 
         // ── Shell_NotifyIcon constants from shellapi.h ─────────────────────
 
@@ -244,7 +239,6 @@ internal class Win32Bindings private constructor(
         const val NIF_MESSAGE: Int = 0x00000001
         const val NIF_ICON:    Int = 0x00000002
         const val NIF_TIP:     Int = 0x00000004
-        const val NIF_STATE:   Int = 0x00000008
 
         /**
          * `NIF_SHOWTIP` (Vista+): show the standard tooltip even when the

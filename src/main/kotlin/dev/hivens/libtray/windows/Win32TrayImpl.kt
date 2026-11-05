@@ -65,7 +65,7 @@ internal class Win32TrayImpl private constructor(
 
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
@@ -277,7 +277,7 @@ internal class Win32TrayImpl private constructor(
         return runCatching {
             (bindings.handle("Shell_NotifyIconW").invokeExact(message, notifyIconData) as Int) != 0
         }.getOrElse { t ->
-            log.warn("Shell_NotifyIcon (msg={}) threw: {}", message, t.message)
+            log.warn("Shell_NotifyIcon (msg={}) threw", message, t)
             false
         }
     }
@@ -506,7 +506,7 @@ internal class Win32TrayImpl private constructor(
                 hInstance,                              // hInstance
                 MemorySegment.NULL,                     // lpParam
             ) as MemorySegment
-        }.onFailure { log.warn("CreateWindowExW threw: {}", it.message) }.getOrNull()
+        }.onFailure { log.warn("CreateWindowExW threw", it) }.getOrNull()
     }
 
     // ── WndProc dispatch (called from the upcall stub) ───────────────────
@@ -774,7 +774,7 @@ internal class Win32TrayImpl private constructor(
             val tray = runCatching {
                 createInternal(bindings, builder)
             }.onFailure { t ->
-                log.warn("Win32 tray construction threw: {}", t.message)
+                log.warn("Win32 tray construction threw", t)
             }.getOrNull()
             if (tray == null) {
                 // No instance owns the arena, so nothing will ever close it.
@@ -881,7 +881,7 @@ internal class Win32TrayImpl private constructor(
                 wndProcArena = arena
                 stub to arena
             }.onFailure {
-                log.warn("WndProc upcall stub creation failed: {}", it.message)
+                log.warn("WndProc upcall stub creation failed", it)
             }.getOrNull()
         }
 

@@ -41,8 +41,6 @@ internal class DBusBindings internal constructor(
     companion object {
         /** D-Bus bus types from dbus/dbus-shared.h. */
         const val DBUS_BUS_SESSION: Int = 0
-        const val DBUS_BUS_SYSTEM:  Int = 1
-        const val DBUS_BUS_STARTER: Int = 2
 
         /** Message type from dbus/dbus-protocol.h -- only method calls owe a reply. */
         const val DBUS_MESSAGE_TYPE_METHOD_CALL: Int = 1
@@ -184,18 +182,6 @@ internal class DBusBindings internal constructor(
             ),
             Triple("dbus_message_get_path",
                 ValueLayout.ADDRESS,
-                listOf(ValueLayout.ADDRESS),
-            ),
-            Triple("dbus_message_get_destination",
-                ValueLayout.ADDRESS,
-                listOf(ValueLayout.ADDRESS),
-            ),
-            Triple("dbus_message_get_sender",
-                ValueLayout.ADDRESS,
-                listOf(ValueLayout.ADDRESS),
-            ),
-            Triple("dbus_message_get_serial",
-                ValueLayout.JAVA_INT,
                 listOf(ValueLayout.ADDRESS),
             ),
             Triple("dbus_message_get_no_reply",

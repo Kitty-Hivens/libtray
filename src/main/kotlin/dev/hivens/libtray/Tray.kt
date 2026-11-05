@@ -100,7 +100,7 @@ public interface Tray : AutoCloseable {
                     else -> null
                 }
             }.onFailure {
-                log.info("Tray backend construction failed: {}", it.message ?: it.javaClass.simpleName)
+                log.warn("Tray backend construction failed", it)
             }.getOrNull()
             return backend.also {
                 if (it == null) log.info("Tray unavailable for os.name={}", osName)

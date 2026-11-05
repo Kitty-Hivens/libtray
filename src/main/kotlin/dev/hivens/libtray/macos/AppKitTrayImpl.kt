@@ -78,7 +78,7 @@ internal class AppKitTrayImpl private constructor(
 
     private val log = LoggerFactory.getLogger("libtray.AppKitTray")
 
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
 
     /** Set by the one [tearDown] that runs, wherever close() ended up running it. */
     private val tornDown = AtomicBoolean(false)
@@ -147,14 +147,14 @@ internal class AppKitTrayImpl private constructor(
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
         return runCatching { applyIcon(iconBytes); true }.getOrElse { t ->
-            log.warn("setIcon threw: {}", t.message); false
+            log.warn("setIcon threw", t); false
         }
     }
 
     override fun setTooltip(text: String): Boolean {
         if (!open.get()) return false
         return runCatching { applyTooltip(text); true }.getOrElse { t ->
-            log.warn("setTooltip threw: {}", t.message); false
+            log.warn("setTooltip threw", t); false
         }
     }
 
@@ -164,7 +164,7 @@ internal class AppKitTrayImpl private constructor(
             if (menu == null) clearMenu() else applyMenu(menu)
             true
         }.getOrElse { t ->
-            log.warn("setMenu threw: {}", t.message); false
+            log.warn("setMenu threw", t); false
         }
     }
 
@@ -557,7 +557,7 @@ internal class AppKitTrayImpl private constructor(
                 ) as Unit
             }
         }.onFailure {
-            log.warn("Installing the status item click handling failed, clicks will not reach the app: {}", it.message)
+            log.warn("Installing the status item click handling failed, clicks will not reach the app", it)
         }
     }
 
@@ -808,7 +808,7 @@ internal class AppKitTrayImpl private constructor(
         @JvmStatic
         fun dispatchTrampoline(context: MemorySegment) {
             val action = PENDING.remove(context.address()) ?: return
-            runCatching { action() }.onFailure { log.warn("main-queue action threw: {}", it.message) }
+            runCatching { action() }.onFailure { log.warn("main-queue action threw", it) }
         }
 
         /** The single shared upcall stub bridging GCD to [dispatchTrampoline]. Built once, process-lifetime. */
@@ -849,7 +849,7 @@ internal class AppKitTrayImpl private constructor(
                 (bindings.handle("objc_msgSend_long")
                     .invokeExact(sender, bindings.sel("tag")) as Long).toInt()
             } catch (t: Throwable) {
-                log.warn("onMenuItem: tag read threw: {}", t.message)
+                log.warn("onMenuItem: tag read threw", t)
                 return
             }
             for (inst in INSTANCE_REGISTRY.values) {
@@ -874,7 +874,7 @@ internal class AppKitTrayImpl private constructor(
         fun onStatusItemClickEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
             val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusButton.address() == sender.address() } ?: return
             runCatching { inst.handleStatusItemAction() }
-                .onFailure { log.warn("onStatusItemClick: handling threw: {}", it.message) }
+                .onFailure { log.warn("onStatusItemClick: handling threw", it) }
         }
 
         /**
@@ -886,7 +886,7 @@ internal class AppKitTrayImpl private constructor(
         fun onStatusViewMouseEntry(self: MemorySegment, cmd: MemorySegment, event: MemorySegment) {
             val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusView.address() == self.address() } ?: return
             runCatching { inst.handleStatusViewMouse(cmd, event) }
-                .onFailure { log.warn("status view mouse handling threw: {}", it.message) }
+                .onFailure { log.warn("status view mouse handling threw", it) }
         }
 
         /** The `LibtrayStatusView_<pid>` class, built once per JVM. */
@@ -1016,7 +1016,7 @@ internal class AppKitTrayImpl private constructor(
                 }
                 log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
                 AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
-            }.onFailure { log.warn("AppKit tray construction threw: {}", it.message) }.getOrNull()
+            }.onFailure { log.warn("AppKit tray construction threw", it) }.getOrNull()
         }
 
         /**
@@ -1040,7 +1040,7 @@ internal class AppKitTrayImpl private constructor(
                 // is unspecified, as in isNSAppRunning.
                 (ret and 0xffL) != 0L
             }.getOrElse {
-                log.warn("[NSThread isMainThread] threw: {} — assuming non-main", it.message)
+                log.warn("[NSThread isMainThread] threw, assuming non-main", it)
                 false
             }
         }
@@ -1110,7 +1110,7 @@ internal class AppKitTrayImpl private constructor(
                 }
                 log.info("[create] NSApplication activation policy = Accessory, finishLaunching fired")
             }.onFailure {
-                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {}; proceeding anyway", it.message)
+                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw, proceeding anyway", it)
             }
         }
 
@@ -1131,7 +1131,7 @@ internal class AppKitTrayImpl private constructor(
                     .invokeExact(app, bindings.sel("isRunning")) as Long
                 (ret and 0xffL) != 0L
             }.getOrElse {
-                log.warn("[NSApp isRunning] threw: {}; assuming not running", it.message)
+                log.warn("[NSApp isRunning] threw, assuming not running", it)
                 false
             }
         }
