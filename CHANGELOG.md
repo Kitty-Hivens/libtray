@@ -41,6 +41,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Linux: a click on an open menu that `setMenu` had just replaced could
   fire the new menu's item with the same position. Menu ids are no longer
   reused within a tray, so such a click is dropped.
+- A thread with its interrupt flag set got `InterruptedException` from the
+  setters on Linux and from `close()` on Linux and macOS, and `close()` then
+  skipped its teardown. On macOS the same flag on the main thread could end
+  the JVM from a menu click.
+- Linux: a setter racing `close()` could throw instead of returning false.
 
 ## [0.2.0]
 

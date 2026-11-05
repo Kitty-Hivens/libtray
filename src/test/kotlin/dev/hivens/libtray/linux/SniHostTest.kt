@@ -20,7 +20,9 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.imageio.ImageIO
+import kotlin.concurrent.thread
 
 /**
  * End-to-end coverage of the SNI backend against a live session bus, with
@@ -100,6 +102,40 @@ class SniHostTest {
         tray.setIcon(byteArrayOf(1, 2, 3)) shouldBe false
 
         host.firstIconPixmapSize(name) shouldBe (32 to 32)
+    }
+
+    @Test
+    fun `setters work from a thread with its interrupt flag set`() {
+        val tray = open("org.libtray.HostTest.Interrupted")
+
+        Thread.currentThread().interrupt()
+        val result = tray.setTooltip("while interrupted")
+
+        Thread.interrupted() shouldBe true
+        result shouldBe true
+    }
+
+    @Test
+    fun `setters racing close never throw`() {
+        repeat(20) { round ->
+            val tray = open("org.libtray.HostTest.CloseRace$round")
+            val failure = AtomicReference<Throwable?>()
+            val setter = thread {
+                try {
+                    while (tray.isOpen) {
+                        tray.setTooltip("racing")
+                        tray.setMenu(null)
+                    }
+                    tray.setTooltip("after close") shouldBe false
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+            }
+            Thread.sleep(5)
+            tray.close()
+            setter.join(2_000)
+            failure.get() shouldBe null
+        }
     }
 
     @Test

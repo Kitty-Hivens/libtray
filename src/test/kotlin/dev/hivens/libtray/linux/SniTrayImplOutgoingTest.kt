@@ -57,6 +57,18 @@ class SniTrayImplOutgoingTest {
     }
 
     @Test
+    fun `close on an interrupted thread finishes the teardown and keeps the flag`() {
+        val rec = RecordingDbus()
+        val tray = newTray(rec)
+
+        Thread.currentThread().interrupt()
+        tray.close()
+
+        Thread.interrupted() shouldBe true
+        rec.connLifecycle.toList() shouldContainExactly listOf("close", "unref")
+    }
+
+    @Test
     fun `drains queued messages in FIFO order, sending and unrefing each without flushing`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)

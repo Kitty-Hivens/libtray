@@ -8,6 +8,7 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
@@ -188,9 +189,10 @@ internal class SniTrayImpl internal constructor(
         // "ToolTip" property branch below for the why), so NewTitle has to
         // fire when tooltip text changes. NewToolTip is kept for hosts
         // that strictly key on the ToolTip-changed signal.
-        emitSignal("NewTitle")
-        emitSignal("NewToolTip")
-        return true
+        return signalling("setTooltip") {
+            emitSignal("NewTitle")
+            emitSignal("NewToolTip")
+        }
     }
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
@@ -202,16 +204,28 @@ internal class SniTrayImpl internal constructor(
             return false
         }
         iconPixmap = pixmaps
-        emitSignal("NewIcon")
-        return true
+        return signalling("setIcon") { emitSignal("NewIcon") }
     }
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
         menuLayout = menu?.let { DBusMenuLayout(it, menuIds) }
         layoutRevision.incrementAndGet()
-        emitLayoutUpdated()
-        return true
+        return signalling("setMenu") { emitLayoutUpdated() }
+    }
+
+    /**
+     * The libdbus half of a setter. close() on another thread can close the
+     * bindings arena right after the setter's open check, and the next
+     * downcall then throws. The caller gets false, as for any other closed
+     * tray.
+     */
+    private inline fun signalling(what: String, emit: () -> Unit): Boolean = try {
+        emit()
+        true
+    } catch (t: Throwable) {
+        if (open.get()) log.warn("{} could not signal the tray host", what, t)
+        false
     }
 
     override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
@@ -227,7 +241,7 @@ internal class SniTrayImpl internal constructor(
         // connection in a weird half-closed state with the watcher still
         // expecting our service, and could abandon a half-built outgoing
         // message mid-FFM call.
-        ioThread.join(JOIN_TIMEOUT_MS)
+        waitPastInterrupt { ioThread.join(JOIN_TIMEOUT_MS) }
         // Final drain: a caller racing close() can enqueue after the loop
         // did its own last drain, so unref anything still in `outgoing`
         // rather than leak the libdbus message.
@@ -1092,9 +1106,9 @@ internal class SniTrayImpl internal constructor(
             runCatching { bindings.handle("dbus_message_unref").invokeExact(reply) as Unit }
             return
         }
-        // LinkedBlockingQueue#offer with no capacity bound always succeeds.
-        // Defensive `else` would be dead code; rely on the contract.
-        outgoing.put(reply)
+        // Always succeeds without a capacity bound, and unlike put it does not
+        // throw on a caller whose interrupt flag is set.
+        outgoing.offer(reply)
         // close() can run its final drain between the check above and this
         // put, which would leave the message queued forever with its ref
         // held. Re-check and drain what nobody is coming back for; poll() is

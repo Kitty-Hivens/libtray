@@ -9,6 +9,7 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
@@ -211,7 +212,9 @@ internal class AppKitTrayImpl private constructor(
                 done.countDown()
             }
         }
-        if (enqueued && done.await(CLOSE_ON_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) return
+        var finished = false
+        if (enqueued) waitPastInterrupt { finished = done.await(CLOSE_ON_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
+        if (finished) return
         log.warn(
             "Cocoa main queue did not run the tray teardown within {} ms; tearing down on {} instead",
             CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
@@ -844,7 +847,9 @@ internal class AppKitTrayImpl private constructor(
             }
             for (inst in INSTANCE_REGISTRY.values) {
                 val id = inst.tagToId[tag] ?: continue
-                inst.fire(TrayEvent.MenuItemSelected(id))
+                // An exception leaving an upcall ends the JVM.
+                runCatching { inst.fire(TrayEvent.MenuItemSelected(id)) }
+                    .onFailure { log.warn("onMenuItem: firing the event threw", it) }
                 return
             }
             // Tag fell through every instance — typically means the
