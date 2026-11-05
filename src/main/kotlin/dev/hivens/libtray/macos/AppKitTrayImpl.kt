@@ -94,6 +94,11 @@ internal class AppKitTrayImpl private constructor(
     /** Currently-installed NSMenu* (retained), or NULL when no menu set. */
     @Volatile private var currentMenu: MemorySegment = MemorySegment.NULL
 
+    /** For the macOS check, which drives the native objects directly. */
+    internal val currentMenuHandle: MemorySegment get() = currentMenu
+    internal val statusButtonHandle: MemorySegment get() = statusButton
+    internal val statusViewHandle: MemorySegment get() = statusView
+
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 

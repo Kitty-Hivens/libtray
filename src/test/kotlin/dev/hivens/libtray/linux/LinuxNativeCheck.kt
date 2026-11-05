@@ -5,8 +5,12 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
-import dev.hivens.libtray.solidPng
+import dev.hivens.libtray.expect
+import dev.hivens.libtray.fail
 import dev.hivens.libtray.linux.DBusTestClient.Arg
+import dev.hivens.libtray.solidPng
+import dev.hivens.libtray.startWatchdog
+import dev.hivens.libtray.step
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
@@ -14,16 +18,17 @@ import kotlin.system.exitProcess
 /**
  * The Linux backend driven end to end as a plain program, so it can run as a
  * GraalVM native image as well as on the JVM: no JUnit, no assertion
- * library. It needs a session bus nobody else uses, which the
- * `linuxNativeCheck` task provides.
+ * library. It needs a session bus nobody else uses, which the `nativeCheck`
+ * and `nativeAgentRun` tasks provide.
  *
  * Covers what a native image is most likely to break: loading libdbus and
  * binding every downcall, building the icon pixmap through ImageIO and
- * scaling an oversized icon through Java2D, the
- * watcher registration, host clicks and a menu click reaching the listener,
- * and close(). Exit code 0 means every step passed.
+ * scaling an oversized icon, the watcher registration, host clicks and a menu
+ * click reaching the listener, and close(). Exit code 0 means every step
+ * passed.
  */
 fun main() {
+    startWatchdog()
     val name = "org.libtray.NativeCheck.Item"
     val watcher = DBusTestClient.Watcher()
     val host = DBusTestClient()
@@ -47,7 +52,7 @@ fun main() {
     if (host.firstIconPixmapSize(name) != (32 to 32)) fail("IconPixmap property")
     step("properties read")
 
-    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    // Past maxIconSize: decoded, averaged down and re-encoded.
     if (!tray.setIcon(solidPng(300))) fail("setIcon")
     val scaled = host.firstIconPixmapSize(name)
     if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
@@ -65,19 +70,6 @@ fun main() {
 
     host.close()
     watcher.close()
-    println("[native-check] PASS")
+    step("PASS")
     exitProcess(0)
-}
-
-private fun expect(events: LinkedBlockingQueue<TrayEvent>, expected: TrayEvent) {
-    val got = events.poll(3, TimeUnit.SECONDS)
-    if (got != expected) fail("expected $expected, got $got")
-    step("$expected reached the listener")
-}
-
-private fun step(what: String) = println("[native-check] $what")
-
-private fun fail(why: String): Nothing {
-    System.err.println("[native-check] FAIL: $why")
-    exitProcess(1)
 }

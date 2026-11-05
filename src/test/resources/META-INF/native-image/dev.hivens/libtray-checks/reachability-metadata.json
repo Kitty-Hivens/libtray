@@ -1,14 +1,4 @@
 {
-  "reflection": [
-    {
-      "type": "dev.hivens.libtray.macos.AppKitTrayImpl",
-      "fields": [
-        { "name": "currentMenu" },
-        { "name": "statusButton" },
-        { "name": "statusView" }
-      ]
-    }
-  ],
   "foreign": {
     "downcalls": [
       { "returnType": "void", "parameterTypes": ["void*", "jint", "jlong"] },

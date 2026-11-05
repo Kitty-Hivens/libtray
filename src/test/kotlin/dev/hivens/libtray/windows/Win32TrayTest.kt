@@ -112,18 +112,8 @@ class Win32TrayTest {
         ),
     ) ?: error("Tray.create returned null: Shell_NotifyIcon is not available in this session")
 
-    /** Post the tray window a callback in the NOTIFYICON_VERSION_4 layout: event in LOWORD(lParam), icon id in HIWORD. */
     private fun post(tray: Tray, mouseEvent: Int) {
-        val hwnd = (tray as Win32TrayImpl).windowHandle
-        val bindings = Win32Bindings.load() ?: error("user32 not loadable")
-        try {
-            val lParam = (mouseEvent.toLong() and 0xffff) or (Win32Bindings.TRAY_ICON_UID.toLong() shl 16)
-            val ok = bindings.handle("PostMessageW")
-                .invokeExact(hwnd, Win32Bindings.WM_TRAY_CALLBACK, 0L, lParam) as Int
-            (ok != 0) shouldBe true
-        } finally {
-            bindings.arena.close()
-        }
+        postShellCallback(tray, mouseEvent) shouldBe true
     }
 
     private fun icon(size: Int): ByteArray {

@@ -5,7 +5,14 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.IconScaling
+import dev.hivens.libtray.expect
+import dev.hivens.libtray.fail
+import dev.hivens.libtray.pngSize
 import dev.hivens.libtray.solidPng
+import dev.hivens.libtray.startWatchdog
+import dev.hivens.libtray.step
+import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -40,14 +47,7 @@ import kotlin.system.exitProcess
  * Exit code 0 means every step passed.
  */
 fun main() {
-    val watchdog = Thread {
-        try {
-            Thread.sleep(90_000)
-        } catch (_: InterruptedException) {
-            return@Thread  // interrupted once every step has passed
-        }
-        fail("timed out")
-    }.apply { isDaemon = true; start() }
+    startWatchdog()
 
     val bindings = ObjcBindings.load() ?: fail("ObjcBindings.load returned null")
     val clicks = SyntheticClicks(bindings)
@@ -58,15 +58,22 @@ fun main() {
     step("created")
 
     check(tray.setTooltip("updated")) { "setTooltip" }
-    check(tray.setIcon(icon(22))) { "setIcon" }
-    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
-    check(tray.setIcon(icon(300))) { "setIcon with an icon that needs scaling" }
+    check(tray.setIcon(solidPng(22))) { "setIcon" }
+    check(tray.setIcon(solidPng(300))) { "setIcon with an icon that needs scaling" }
     check(tray.setMenu(menu())) { "setMenu" }
     step("updated")
 
+    // NSImage takes any size and fit falls back to the original bytes, so the
+    // setIcon above passes even with scaling broken. Check the result itself:
+    // this is what exercises the AWT and ImageIO metadata on macOS.
+    val log = LoggerFactory.getLogger("libtray.check")
+    val scaled = pngSize(IconScaling.fit(solidPng(300), IconScaling.DEFAULT_MAX_SIZE, log))
+    if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
+    step("oversized icon scaled to 256x256")
+
     // [menu performActionForItemAtIndex:0] sends the item's action to its
     // target, which is the path a real click on the item takes.
-    val nsMenu = field<MemorySegment>(tray, "currentMenu")
+    val nsMenu = (tray as AppKitTrayImpl).currentMenuHandle
     if (nsMenu.address() == 0L) fail("no NSMenu was built")
     bindings.handle("objc_msgSend_void_long")
         .invokeExact(nsMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
@@ -78,7 +85,7 @@ fun main() {
     val otherEvents = LinkedBlockingQueue<TrayEvent>()
     other.onEvent { otherEvents.add(it) }
     check(other.setMenu(menu())) { "setMenu on the second tray" }
-    val otherMenu = field<MemorySegment>(other, "currentMenu")
+    val otherMenu = (other as AppKitTrayImpl).currentMenuHandle
     bindings.handle("objc_msgSend_void_long")
         .invokeExact(otherMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
     expect(otherEvents, TrayEvent.MenuItemSelected("noop"), "second tray's menu item action")
@@ -86,7 +93,7 @@ fun main() {
     if (strayEvent != null) fail("the first tray received $strayEvent for the second tray's menu")
     other.close()
 
-    val overlay = field<MemorySegment>(tray, "statusView")
+    val overlay = tray.statusViewHandle
     if (overlay.address() == 0L) fail("no click overlay was installed")
     clicks.send(overlay, "mouseDown:", NS_LEFT_MOUSE_DOWN)
     clicks.send(overlay, "mouseUp:", NS_LEFT_MOUSE_UP)
@@ -97,7 +104,7 @@ fun main() {
 
     // Button actions this soon after overlay activity are dropped on purpose.
     Thread.sleep(700)
-    val button = field<MemorySegment>(tray, "statusButton")
+    val button = tray.statusButtonHandle
     bindings.handle("objc_msgSend_void_id").invokeExact(button, bindings.sel("performClick:"), MemorySegment.NULL) as Unit
     expect(events, TrayEvent.Activated, "button action (VoiceOver path)")
 
@@ -132,8 +139,7 @@ fun main() {
         if (second.isOpen) fail("still open after close()")
         if (tookMs >= 2_000) fail("close() fell back to the timeout ($tookMs ms)")
         step("closed from a background thread in $tookMs ms")
-        watchdog.interrupt()
-        println("[mac-check] PASS")
+        step("PASS")
         exitProcess(0)
     }, "mac-check-closer").start()
 
@@ -145,11 +151,11 @@ fun main() {
 
 /**
  * Builds mouse `NSEvent`s and sends them to a view. Each event starts as a
- * `CGEvent` that is given a type, a button number and modifier flags, then
- * is wrapped by `[NSEvent eventWithCGEvent:]`. Creating a `CGEvent` does not
- * post it, so no permission is involved, and none of these calls passes a
- * struct by value, so the check also builds as a GraalVM native image
- * without extra foreign metadata.
+ * `CGEvent` that is given a type, a button number and cleared modifier flags,
+ * then is wrapped by `[NSEvent eventWithCGEvent:]`. Creating a `CGEvent` does
+ * not post it, so no permission is involved. The two call shapes here that the
+ * library itself does not use are registered for GraalVM native image under
+ * the test resources.
  */
 private class SyntheticClicks(private val bindings: ObjcBindings) {
     private val arena = Arena.ofShared()
@@ -171,12 +177,12 @@ private class SyntheticClicks(private val bindings: ObjcBindings) {
     // void CGEventSetFlags(CGEventRef, CGEventFlags)
     private val setFlags = bind("CGEventSetFlags", FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG))
 
-    fun send(view: MemorySegment, selector: String, type: Long, button: Long = 0, flags: Long = 0) {
+    fun send(view: MemorySegment, selector: String, type: Long, button: Long = 0) {
         val cgEvent = create.invokeExact(MemorySegment.NULL) as MemorySegment
         if (cgEvent.address() == 0L) fail("CGEventCreate returned NULL")
         setType.invokeExact(cgEvent, type.toInt()) as Unit
         setField.invokeExact(cgEvent, CG_MOUSE_EVENT_BUTTON_NUMBER, button) as Unit
-        setFlags.invokeExact(cgEvent, flags) as Unit
+        setFlags.invokeExact(cgEvent, 0L) as Unit
         val event = bindings.handle("objc_msgSend_id_id")
             .invokeExact(bindings.cls("NSEvent"), bindings.sel("eventWithCGEvent:"), cgEvent) as MemorySegment
         if (event.address() == 0L) fail("eventWithCGEvent: returned nil for type $type")
@@ -197,7 +203,7 @@ private const val CG_MOUSE_EVENT_BUTTON_NUMBER = 3
 private fun openTray(menuOnPrimaryClick: Boolean): Tray = Tray.create(
     TrayBuilder(
         title = "libtray-mac-check",
-        iconBytes = icon(32),
+        iconBytes = solidPng(32),
         tooltip = "libtray check",
         menu = menu(),
         macosMenuOnPrimaryClick = menuOnPrimaryClick,
@@ -205,21 +211,3 @@ private fun openTray(menuOnPrimaryClick: Boolean): Tray = Tray.create(
 ) ?: fail("Tray.create returned null")
 
 private fun menu() = TrayMenu(TrayMenuItem.Standard("noop", "Noop"), TrayMenuItem.Standard("exit", "Exit"))
-
-private inline fun <reified T> field(tray: Tray, name: String): T =
-    AppKitTrayImpl::class.java.getDeclaredField(name).apply { isAccessible = true }.get(tray) as T
-
-private fun expect(events: LinkedBlockingQueue<TrayEvent>, expected: TrayEvent, what: String) {
-    val got = events.poll(5, TimeUnit.SECONDS)
-    if (got != expected) fail("$what delivered $got, expected $expected")
-    step("$what reached the listener")
-}
-
-private fun step(what: String) = println("[mac-check] $what")
-
-private fun fail(why: String): Nothing {
-    System.err.println("[mac-check] FAIL: $why")
-    exitProcess(1)
-}
-
-private fun icon(size: Int): ByteArray = solidPng(size)
