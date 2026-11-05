@@ -11,7 +11,6 @@ import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.Linker
 import java.lang.foreign.MemoryLayout
@@ -29,7 +28,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import javax.imageio.ImageIO
 
 /**
  * Windows tray backend on top of `Shell_NotifyIcon` + a hidden
@@ -345,7 +343,7 @@ internal class Win32TrayImpl private constructor(
     // Feeding bottom-up rows here paints the glyph upside down (issue #4).
 
     private fun pngToHicon(bytes: ByteArray): MemorySegment? {
-        val img = runCatching { ImageIO.read(ByteArrayInputStream(bytes)) }.getOrNull() ?: run {
+        val img = runCatching { IconScaling.decode(bytes) }.getOrNull() ?: run {
             log.warn("ImageIO could not decode PNG ({} bytes)", bytes.size)
             return null
         }

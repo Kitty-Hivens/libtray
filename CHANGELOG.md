@@ -31,6 +31,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Colour is averaged premultiplied by alpha. Against the previous output,
   alpha matches exactly and colour within one level.
 
+- Icons decode and encode through in-memory streams. `ImageIO` used to create
+  a temporary file on every call, which a read-only temp directory turned into
+  a lost icon. Scaling also reads the source one row at a time instead of
+  copying the whole frame.
+
 ### Fixed
 - Linux: a dbusmenu `EventGroup` call with missing or wrongly typed
   arguments crashed the process inside libdbus. It now gets an `InvalidArgs`

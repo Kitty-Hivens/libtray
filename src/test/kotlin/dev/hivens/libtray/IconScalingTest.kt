@@ -56,10 +56,8 @@ class IconScalingTest {
 
     @Test
     fun `the scaled icon still carries the picture`() {
-        // Dimensions alone would also pass for a fully blank result, which
-        // is the failure mode of drawing an asynchronously-produced Image:
-        // getScaledInstance does not block, so a null-observer drawImage can
-        // legitimately paint nothing. Assert on pixels instead.
+        // Dimensions alone would also pass for a fully blank result, so this
+        // checks the pixels that come back through averaging and the PNG encoder.
         val img = ImageIO.read(ByteArrayInputStream(IconScaling.fit(png(1024, 1024), 64, log)))
 
         val centre = img.getRGB(32, 32)
@@ -118,6 +116,15 @@ class IconScalingTest {
         // would give pink, the halo premultiplied averaging avoids.
         val source = intArrayOf(0xFFFF0000.toInt(), 0x00FFFFFF)
         IconScaling.areaAverage(source, 2, 1, 1, 1).single() shouldBe 0x80FF0000.toInt()
+    }
+
+    @Test
+    fun `partial alpha weights the colour by how opaque each pixel is`() {
+        // Half-transparent red next to opaque blue. Alpha: (128 + 255) / 2 = 192.
+        // Red: 128 x 255 / 383 = 85. Blue: 255 x 255 / 383 = 170. Counting any
+        // visible pixel as opaque would give 128 for both.
+        val source = intArrayOf(0x80FF0000.toInt(), 0xFF0000FF.toInt())
+        IconScaling.areaAverage(source, 2, 1, 1, 1).single() shouldBe 0xC05500AA.toInt()
     }
 
     @Test

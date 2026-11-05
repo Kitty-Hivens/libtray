@@ -10,7 +10,6 @@ import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.waitPastInterrupt
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
@@ -19,7 +18,6 @@ import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import javax.imageio.ImageIO
 
 /**
  * Linux tray backend — `org.kde.StatusNotifierItem` over D-Bus session
@@ -1132,7 +1130,7 @@ internal class SniTrayImpl internal constructor(
      */
     private fun pngToPixmaps(bytes: ByteArray): List<Pixmap> {
         return runCatching {
-            val img = ImageIO.read(ByteArrayInputStream(bytes)) ?: return emptyList()
+            val img = IconScaling.decode(bytes) ?: return emptyList()
             val w = img.width
             val h = img.height
             val argb = IntArray(w * h)
