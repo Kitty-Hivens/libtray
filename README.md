@@ -77,12 +77,18 @@ specifically) to permit the native calls.
 **GraalVM native image.** The jar ships its reachability metadata in
 `META-INF/native-image/dev.hivens/libtray/`, which `native-image` picks up
 from the classpath: every foreign call shape and upcall the three backends
-use, plus the AWT and ImageIO entries libtray's icon handling needs. Pass
+use, plus AWT and ImageIO entries for icon handling. Pass
 `--enable-native-access=ALL-UNNAMED` to `native-image` as well. Icon
 decoding goes through AWT, so the build writes `libawt` and its companion
 libraries next to the executable, and they have to ship with it. CI builds
-and runs a native check program on Linux, Windows and macOS with only that
-metadata.
+and runs a native check program on Linux, Windows and macOS against the jar
+and its metadata, using GraalVM for JDK 25. Older versions are untested, and
+the `SharedArenaSupport` option the jar enables may not exist on them.
+
+Those entries cover 8-bit RGB, RGBA, gray and gray+alpha PNGs. Other images,
+including palette PNGs such as `pngquant` or `optipng` output, 1-bit and
+16-bit PNGs, GIF and JPEG, fail to decode in a native image, although they
+work on the JVM. Convert icons to 8-bit RGBA for a native build.
 </details>
 
 <details>

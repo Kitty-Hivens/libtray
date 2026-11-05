@@ -3,10 +3,10 @@ package dev.hivens.libtray
 /**
  * Static description of the right-click menu attached to a tray icon.
  *
- * Immutable by design — to update the menu, build a new [TrayMenu] and
- * call [Tray.setMenu]. Backends diff against the previous menu when
- * possible (DBusMenu has explicit "layout updated" signals; Win32 rebuilds
- * the HMENU; macOS rebuilds the NSMenu).
+ * Immutable by design: to update the menu, build a new [TrayMenu] and call
+ * [Tray.setMenu]. Each backend rebuilds its native menu from it whole (a new
+ * DBusMenu layout on Linux, a new NSMenu on macOS, a new HMENU on Windows at
+ * every right click).
  */
 public data class TrayMenu(
     val items: List<TrayMenuItem>,
@@ -15,10 +15,9 @@ public data class TrayMenu(
     public constructor(vararg items: TrayMenuItem) : this(items.toList())
 
     init {
-        // Don't enforce uniqueness on item ids — some platforms (Win32)
-        // index by HMENU position rather than id, and a duplicate id is
-        // valid as long as both items don't both receive a click. Library
-        // surface stays "you set, you handle".
+        // Item ids are not checked for uniqueness. Backends key their native
+        // items by their own numbers, so two items sharing an id both work and
+        // both report that id. Library surface stays "you set, you handle".
         require(items.isNotEmpty()) { "menu must have at least one item; pass null to setMenu to remove the menu instead" }
     }
 }

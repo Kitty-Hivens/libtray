@@ -12,9 +12,9 @@ import java.lang.invoke.MethodHandle
 
 /**
  * Panama bindings to `libdbus-1` — the reference D-Bus client library
- * shipped on every desktop Linux. Loaded once per process via
- * [DBusBindings.load]; the resulting object holds method handles for the
- * subset of the libdbus API that the SNI backend uses.
+ * shipped on every desktop Linux. Each tray loads its own through
+ * [DBusBindings.load] and closes them with itself. The object holds method
+ * handles for the subset of the libdbus API that the SNI backend uses.
  *
  * Wire-level approach: a polling dispatch loop (`dbus_connection_read_write`
  * + `dbus_connection_pop_message`) so message handling runs on a thread

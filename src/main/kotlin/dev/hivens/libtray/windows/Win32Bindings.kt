@@ -11,9 +11,9 @@ import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
 
 /**
- * Panama bindings to the three Win32 system DLLs the tray backend needs.
- * Loaded once per process via [Win32Bindings.load]; the resulting object
- * holds method handles for the subset of `user32`/`shell32`/`gdi32`/
+ * Panama bindings to the Win32 system DLLs the tray backend needs. Each tray
+ * loads its own through [Win32Bindings.load] and closes them with itself. The
+ * object holds method handles for the subset of `user32`/`shell32`/`gdi32`/
  * `kernel32` the [Win32TrayImpl] uses.
  *
  * Wire-level approach: a hidden message-only `HWND_MESSAGE` window

@@ -8,9 +8,8 @@ import java.util.concurrent.Executor
  *
  * Created via [Tray.create]; closed via [close] (or auto-closed if the
  * caller uses `use { }`). All other methods are valid only between
- * creation and close — operating on a closed Tray is a no-op (logged at
- * debug, doesn't throw) so a forgotten close in a finally block can't
- * crash the application.
+ * creation and close. On a closed Tray the setters do nothing and return
+ * false, so a call that races close() can't crash the application.
  *
  * Threading: implementations don't pin the caller to a specific thread.
  * Events are delivered on one event thread per tray that libtray owns, in
@@ -25,7 +24,16 @@ import java.util.concurrent.Executor
  * mutating call (`setTooltip` / `setIcon` / `setMenu`) returns boolean
  * success rather than throwing, so a transient backend failure
  * (D-Bus daemon restart, AppIndicator service unregister) degrades the
- * tray to "stale visual" instead of taking down the host application.
+ * tray to "stale visual" instead of taking down the host application. The
+ * one exception is an empty array passed to `setIcon`, a programming error
+ * that throws IllegalArgumentException.
+ *
+ * What a true return means differs by platform. On Windows the icon and
+ * tooltip setters report the result of the shell call, and `setMenu` only
+ * stores the menu for the next right click. Linux reports that the signal was
+ * queued for the tray host. macOS applies the change directly on the Cocoa main
+ * thread and queues it from any other, so there it can also mean only that it
+ * was queued.
  */
 public interface Tray : AutoCloseable {
 
@@ -35,23 +43,31 @@ public interface Tray : AutoCloseable {
     /**
      * Replace the tooltip shown when the user hovers over the icon.
      * Empty string is allowed and removes the tooltip.
-     * @return true on confirmed success.
+     * @return false when the tray is closed or the change failed. See the
+     *   class KDoc for what true means on each platform.
      */
     public fun setTooltip(text: String): Boolean
 
     /**
-     * Replace the icon. Bytes must be a format the host supports — PNG
-     * is universal; ICO works on Windows; ICNS works on macOS; PNG is
-     * always safe. The library does NOT decode the bytes itself, just
-     * hands them to the backend.
-     * @return true on confirmed success.
+     * Replace the icon. PNG works on every platform. Linux and Windows decode
+     * through ImageIO, so they take what the JDK reads (PNG, JPEG, GIF, BMP)
+     * and not ICO or ICNS. macOS passes the bytes to NSImage, which also takes
+     * formats like ICNS. In a GraalVM native image the choice is narrower, see
+     * the README.
+     *
+     * Bytes that do not decode leave the current icon in place on Linux and
+     * Windows, which return false. macOS decodes on the main thread, shows a
+     * text placeholder instead, and can still return true.
+     * @return false when the tray is closed or the change failed. See the
+     *   class KDoc for what true means on each platform.
      */
     public fun setIcon(iconBytes: ByteArray): Boolean
 
     /**
      * Replace the right-click menu. `null` removes the menu (the icon
      * becomes click-only).
-     * @return true on confirmed success.
+     * @return false when the tray is closed or the change failed. See the
+     *   class KDoc for what true means on each platform.
      */
     public fun setMenu(menu: TrayMenu?): Boolean
 

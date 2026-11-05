@@ -12,14 +12,12 @@ package dev.hivens.libtray
  * TrayBuilder spec = TrayBuilder.of("MyApp", iconBytes).menu(menu).build();
  * ```
  *
- * @property title The application identifier the tray host uses to
- *   distinguish this icon from other apps' icons. Linux derives the SNI
- *   `Id` from it; Windows uses it for the notification-area uniqueness key;
- *   macOS shows it as the AppleScript identifier. Pick something stable
- *   across releases (typically your reverse-DNS app id or program name).
- * @property iconBytes Initial icon bytes. PNG is the universally-supported
- *   format. The library doesn't decode — backends pass the bytes straight
- *   to the OS surface.
+ * @property title The application's name. Linux derives the SNI `Id` from it
+ *   and shows it as the default `Title`, Windows names its hidden window after
+ *   it, and macOS does not use it. Pick something stable across releases
+ *   (typically your program name).
+ * @property iconBytes Initial icon bytes. PNG works on every platform, see
+ *   [Tray.setIcon] for the rest.
  * @property tooltip Optional initial tooltip. Default null = no tooltip.
  * @property menu Optional initial right-click menu. Default null = the
  *   icon is click-only (no menu pops on right-click).
