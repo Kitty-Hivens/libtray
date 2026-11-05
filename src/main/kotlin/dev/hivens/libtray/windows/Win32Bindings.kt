@@ -17,7 +17,7 @@ import java.lang.invoke.MethodHandle
  *
  * Wire-level approach: a hidden message-only `HWND_MESSAGE` window
  * receives `Shell_NotifyIcon` callbacks (`WM_USER+1` and friends), with a
- * `PeekMessageW`/`DispatchMessageW` pump on a daemon thread we own.
+ * `GetMessageW`/`DispatchMessageW` pump on a daemon thread we own.
  * Unlike the Linux SNI design, Win32 unavoidably needs ONE Panama upcall
  * stub — the WndProc — because Windows calls into the WndProc
  * synchronously to dispatch each message. The single stub routes by
@@ -45,7 +45,6 @@ internal class Win32Bindings private constructor(
 
         const val WM_DESTROY:    Int = 0x0002
         const val WM_CLOSE:      Int = 0x0010
-        const val WM_QUIT:       Int = 0x0012
         // Posted to the menu's owner window to cancel a tracking popup from
         // another thread -- the cross-thread way out of TrackPopupMenu.
         const val WM_CANCELMODE: Int = 0x001F
@@ -135,14 +134,13 @@ internal class Win32Bindings private constructor(
             ),
 
             // ── user32: message pump ───────────────────────────────────────
-            Triple("PeekMessageW",
-                ValueLayout.JAVA_INT,                                       // BOOL
+            Triple("GetMessageW",
+                ValueLayout.JAVA_INT,                                       // BOOL: 0 for WM_QUIT, -1 on error
                 listOf(
                     ValueLayout.ADDRESS,     // LPMSG
                     ValueLayout.ADDRESS,     // HWND filter (NULL = all)
                     ValueLayout.JAVA_INT,    // UINT wMsgFilterMin
                     ValueLayout.JAVA_INT,    // UINT wMsgFilterMax
-                    ValueLayout.JAVA_INT,    // UINT wRemoveMsg
                 ),
             ),
             Triple("TranslateMessage",
@@ -274,10 +272,6 @@ internal class Win32Bindings private constructor(
         /** Custom message id Shell_NotifyIcon dispatches to our WndProc. */
         const val WM_TRAY_CALLBACK: Int = WM_USER + 1
 
-        /** PeekMessage flags from winuser.h. */
-        const val PM_NOREMOVE: Int = 0x0000
-        const val PM_REMOVE:   Int = 0x0001
-
         /**
          * `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)`, which is
          * also the shape of `DefWindowProcW`. See [wndProcDescriptor].
@@ -355,7 +349,7 @@ internal class Win32Bindings private constructor(
     )
 
     /**
-     * MSG from winuser.h — populated by PeekMessageW / GetMessageW. POINT
+     * MSG from winuser.h — populated by GetMessageW. POINT
      * is two LONGs; lPrivate is undocumented padding the kernel reserves.
      *
      * ```c

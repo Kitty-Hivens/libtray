@@ -46,6 +46,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   skipped its teardown. On macOS the same flag on the main thread could end
   the JVM from a menu click.
 - Linux: a setter racing `close()` could throw instead of returning false.
+- Windows: an idle tray woke its thread about 60 times a second. The pump
+  now sleeps in `GetMessageW`. It also processes the `WM_CLOSE` that `close()`
+  posts, which it used to exit before seeing, so the window is destroyed
+  before its class is unregistered.
+- Windows: setters from different threads could interleave on the shared
+  `NOTIFYICONDATA`, and a setter racing `close()` could throw. `close()` also
+  released native handles a pump thread that had not stopped was still using.
 - macOS: with more than one tray, a menu click could be delivered to the
   wrong tray, because menu item tags were only unique within a tray.
 - macOS: each `Tray.create` kept another set of native bindings alive for the

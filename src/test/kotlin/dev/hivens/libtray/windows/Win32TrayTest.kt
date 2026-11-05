@@ -13,7 +13,9 @@ import java.awt.image.BufferedImage
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.imageio.ImageIO
+import kotlin.concurrent.thread
 
 /**
  * The Win32 backend on a real Windows session. Clicks are simulated by
@@ -55,6 +57,49 @@ class Win32TrayTest {
             val start = System.nanoTime()
             tray.close()
             ((System.nanoTime() - start) / 1_000_000 < 2_000) shouldBe true
+        }
+    }
+
+    @Test
+    fun `close destroys the window and keeps an interrupt flag`() {
+        val tray = open()
+        val hwnd = (tray as Win32TrayImpl).windowHandle
+
+        Thread.currentThread().interrupt()
+        tray.close()
+        Thread.interrupted() shouldBe true
+
+        val bindings = Win32Bindings.load() ?: error("user32 not loadable")
+        try {
+            val posted = bindings.handle("PostMessageW")
+                .invokeExact(hwnd, Win32Bindings.WM_TRAY_CALLBACK, 0L, 0L) as Int
+            posted shouldBe 0
+        } finally {
+            bindings.arena.close()
+        }
+    }
+
+    @Test
+    fun `setters from several threads and a racing close never throw`() {
+        repeat(5) {
+            val tray = open()
+            val failure = AtomicReference<Throwable?>()
+            val setters = listOf(
+                thread { hammer(tray, failure) { tray.setTooltip("racing") } },
+                thread { hammer(tray, failure) { tray.setIcon(icon(16)) } },
+            )
+            Thread.sleep(50)
+            tray.close()
+            setters.forEach { it.join(5_000) }
+            failure.get() shouldBe null
+        }
+    }
+
+    private fun hammer(tray: Tray, failure: AtomicReference<Throwable?>, call: () -> Unit) {
+        try {
+            while (tray.isOpen) call()
+        } catch (t: Throwable) {
+            failure.set(t)
         }
     }
 
