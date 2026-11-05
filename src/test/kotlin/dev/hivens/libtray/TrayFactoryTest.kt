@@ -51,8 +51,8 @@ class TrayFactoryTest {
         // bus + tray watcher, so the assertion is "the contract holds":
         // either we got a live tray (its isOpen is true and close is
         // safe to call) or we got null (no native backend reachable).
-        // CI containers without D-Bus go down the null path; the
-        // maintainer's desktop goes down the live-tray path. Both pass.
+        // CI containers without D-Bus go down the null path, and the private
+        // bus the test task sets up goes down the live-tray path. Both pass.
         val tray = Tray.create(TrayBuilder(title = "libtray-factory-test", iconBytes = sampleIcon))
         if (tray != null) {
             tray.isOpen shouldBe true

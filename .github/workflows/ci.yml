@@ -23,6 +23,7 @@ jobs:
     # (macSmokeCheck), and on Windows the Win32 tests post the tray window
     # the shell's callbacks.
     name: Build & test (${{ matrix.name }})
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -60,11 +61,12 @@ jobs:
           retention-days: 7
 
   native:
-    # The platform's check program built as a GraalVM native image with only
-    # the reachability metadata the jar ships, then run, which is what a
-    # consumer's native build sees. Catches a foreign call or upcall target
-    # added without metadata before it reaches a release.
+    # The platform's check program built as a GraalVM native image against the
+    # library jar and its metadata, then run, which is what a consumer's native
+    # build sees. Catches a foreign call or upcall target added without
+    # metadata before it reaches a release.
     name: Native image (${{ matrix.name }})
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
