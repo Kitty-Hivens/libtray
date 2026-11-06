@@ -52,6 +52,12 @@ jobs:
         run: command -v dbus-daemon
       - name: Build + test
         run: ./gradlew build --stacktrace
+      # Reports what Tray.create does next to AWT, for reading in the log. Allowed
+      # to fail because a hang is one of the answers it is looking for.
+      - name: Probe Tray.create next to AWT
+        if: runner.os == 'macOS'
+        continue-on-error: true
+        run: ./gradlew macAwtProbe macAwtProbeFirstThread --continue --stacktrace
       - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v7

@@ -237,6 +237,25 @@ val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     onlyIf("macOS") { isMac }
 }
 
+// What Tray.create does next to AWT on macOS, which is what a Compose or Swing
+// app runs into. Reports only, see MacAwtProbe. Run with and without the flag
+// the backend's log recommends, since an app can only pick one. Not part of
+// check: CI runs these on macOS without letting them fail the build.
+listOf(
+    "macAwtProbe" to emptyList(),
+    "macAwtProbeFirstThread" to listOf("-XstartOnFirstThread"),
+).forEach { (taskName, extraArgs) ->
+    tasks.register<JavaExec>(taskName) {
+        group = "verification"
+        description = "Report what Tray.create returns next to AWT, JVM flags: $extraArgs."
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("dev.hivens.libtray.macos.MacAwtProbeKt")
+        jvmArgs(listOf("--enable-native-access=ALL-UNNAMED") + extraArgs)
+        val isMac = osName.contains("mac")
+        onlyIf("macOS") { isMac }
+    }
+}
+
 // GraalVM native-image check: the platform's check program built as a native
 // image against the library jar, then run. This is what a consumer's native
 // build sees, so a missing foreign call or upcall target or a packaging
