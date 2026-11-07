@@ -64,12 +64,18 @@ fun main() {
     step("updated")
 
     // NSImage takes any size and fit falls back to the original bytes, so the
-    // setIcon above passes even with scaling broken. Check the result itself:
-    // this is what exercises the AWT and ImageIO metadata on macOS.
+    // setIcon above passes even with scaling broken. Check the result itself.
+    // A macOS native image is the exception: GraalVM writes no AWT libraries
+    // next to it, so fit hands the original back and NSImage shows it
+    // unscaled, as the README says.
     val log = LoggerFactory.getLogger("libtray.check")
     val scaled = pngSize(IconScaling.fit(solidPng(300), IconScaling.DEFAULT_MAX_SIZE, log))
-    if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
-    step("oversized icon scaled to 256x256")
+    val nativeImage = System.getProperty("org.graalvm.nativeimage.imagecode") != null
+    when {
+        scaled == (256 to 256) -> step("oversized icon scaled to 256x256")
+        nativeImage && scaled == (300 to 300) -> step("oversized icon left at 300x300, no AWT in a macOS native image")
+        else -> fail("oversized icon came back as $scaled, expected 256x256")
+    }
 
     // [menu performActionForItemAtIndex:0] sends the item's action to its
     // target, which is the path a real click on the item takes.
