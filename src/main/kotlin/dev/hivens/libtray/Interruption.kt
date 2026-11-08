@@ -1,17 +1,35 @@
 package dev.hivens.libtray
 
-/**
- * Run [wait], a bounded wait on another thread, with the caller's interrupt
- * flag held back and restored afterwards. close() has to finish its teardown
- * and cannot throw, and an interrupted caller would otherwise get
- * InterruptedException from the first join or await.
- */
-internal inline fun waitPastInterrupt(wait: () -> Unit) {
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+
+// Bounded waits for close() and create(), which have to finish and cannot
+// throw. An interrupt, already pending or arriving mid-wait, neither ends the
+// wait early nor gets lost: the caller's flag is set again afterwards.
+
+/** Join this thread for up to [timeoutMs]. True when it ended. */
+internal fun Thread.joinPastInterrupt(timeoutMs: Long): Boolean =
+    waitPastInterrupt(timeoutMs, { !isAlive }) { join(it) }
+
+/** Await this latch for up to [timeoutMs]. True when it reached zero. */
+internal fun CountDownLatch.awaitPastInterrupt(timeoutMs: Long): Boolean =
+    waitPastInterrupt(timeoutMs, { count == 0L }) { await(it, TimeUnit.MILLISECONDS) }
+
+private fun waitPastInterrupt(timeoutMs: Long, done: () -> Boolean, wait: (remainingMs: Long) -> Unit): Boolean {
+    val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
     var interrupted = Thread.interrupted()
     try {
-        wait()
-    } catch (_: InterruptedException) {
-        interrupted = true
+        while (!done()) {
+            val remainingMs = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime())
+            if (remainingMs <= 0) break
+            try {
+                wait(remainingMs)
+            } catch (_: InterruptedException) {
+                interrupted = true
+            }
+        }
+        return done()
+    } finally {
+        if (interrupted) Thread.currentThread().interrupt()
     }
-    if (interrupted) Thread.currentThread().interrupt()
 }

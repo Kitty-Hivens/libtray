@@ -10,7 +10,7 @@ import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.UpcallTarget
-import dev.hivens.libtray.waitPastInterrupt
+import dev.hivens.libtray.awaitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
@@ -19,7 +19,6 @@ import java.lang.foreign.ValueLayout
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -212,9 +211,7 @@ internal class AppKitTrayImpl private constructor(
                 done.countDown()
             }
         }
-        var finished = false
-        if (enqueued) waitPastInterrupt { finished = done.await(CLOSE_ON_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS) }
-        if (finished) return
+        if (enqueued && done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) return
         log.warn(
             "Cocoa main queue did not run the tray teardown within {} ms; tearing down on {} instead",
             CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,

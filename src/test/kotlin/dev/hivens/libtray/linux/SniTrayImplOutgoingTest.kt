@@ -69,6 +69,35 @@ class SniTrayImplOutgoingTest {
     }
 
     @Test
+    fun `an interrupt during close's wait does not cut the wait short`() {
+        val rec = RecordingDbus()
+        val inPoll = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        // Hold the I/O thread inside a poll so close() has to wait for it.
+        rec.onReadWrite = {
+            inPoll.countDown()
+            release.await()
+        }
+        val tray = newTray(rec)
+        inPoll.await(2, TimeUnit.SECONDS) shouldBe true
+
+        val flagAfterClose = AtomicReference<Boolean?>()
+        val closer = thread {
+            tray.close()
+            flagAfterClose.set(Thread.currentThread().isInterrupted)
+        }
+        awaitUntil(2_000) { closer.state == Thread.State.TIMED_WAITING } shouldBe true
+        closer.interrupt()
+        Thread.sleep(100)
+        release.countDown()
+        closer.join(3_000)
+
+        closer.isAlive shouldBe false
+        rec.connLifecycle.toList() shouldContainExactly listOf("close", "unref")
+        flagAfterClose.get() shouldBe true
+    }
+
+    @Test
     fun `drains queued messages in FIFO order, sending and unrefing each without flushing`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)

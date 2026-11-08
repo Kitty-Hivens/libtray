@@ -8,7 +8,7 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TraySubscription
-import dev.hivens.libtray.waitPastInterrupt
+import dev.hivens.libtray.joinPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
@@ -212,17 +212,22 @@ internal class SniTrayImpl internal constructor(
     }
 
     /**
-     * The libdbus half of a setter. close() on another thread can close the
-     * bindings arena right after the setter's open check, and the next
-     * downcall then throws. The caller gets false, as for any other closed
-     * tray.
+     * Held by a setter's libdbus calls and by close() while it frees the
+     * connection and the arena, so a setter never builds a message on bindings
+     * that are going away, and a message it built is always handed on or freed.
      */
-    private inline fun signalling(what: String, emit: () -> Unit): Boolean = try {
-        emit()
-        true
-    } catch (t: Throwable) {
-        if (open.get()) log.warn("{} could not signal the tray host", what, t)
-        false
+    private val nativeLock = Any()
+
+    /** The libdbus half of a setter. False once the tray is closed. */
+    private inline fun signalling(what: String, emit: () -> Unit): Boolean = synchronized(nativeLock) {
+        if (!open.get()) return false
+        try {
+            emit()
+            true
+        } catch (t: Throwable) {
+            log.warn("{} could not signal the tray host", what, t)
+            false
+        }
     }
 
     override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
@@ -238,15 +243,7 @@ internal class SniTrayImpl internal constructor(
         // connection in a weird half-closed state with the watcher still
         // expecting our service, and could abandon a half-built outgoing
         // message mid-FFM call.
-        waitPastInterrupt { ioThread.join(JOIN_TIMEOUT_MS) }
-        // Final drain: a caller racing close() can enqueue after the loop
-        // did its own last drain, so unref anything still in `outgoing`
-        // rather than leak the libdbus message.
-        val unref = bindings.handle("dbus_message_unref")
-        while (true) {
-            val leftover = outgoing.poll() ?: break
-            runCatching { unref.invokeExact(leftover) as Unit }
-        }
+        ioThread.joinPastInterrupt(JOIN_TIMEOUT_MS)
         // Everything below frees memory the I/O thread may still be reading.
         // Every blocking call it makes is bounded below the join budget, so
         // this is a backstop: if it did not stop in time anyway, unreffing
@@ -261,21 +258,30 @@ internal class SniTrayImpl internal constructor(
             )
             return
         }
-        // Private connection: close (detach from the bus, release the socket)
-        // before the final unref. A shared dbus_bus_get connection must never
-        // be closed, but this backend owns a private one.
-        runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
-            .onFailure { log.warn("dbus_connection_close threw on shutdown", it) }
-        try {
-            bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
-        } catch (t: Throwable) {
-            log.warn("dbus_connection_unref threw on shutdown", t)
+        synchronized(nativeLock) {
+            // Final drain: a setter that queued after the loop did its own last
+            // drain left its message in `outgoing`, so unref it rather than leak it.
+            val unref = bindings.handle("dbus_message_unref")
+            while (true) {
+                val leftover = outgoing.poll() ?: break
+                runCatching { unref.invokeExact(leftover) as Unit }
+            }
+            // Private connection: close (detach from the bus, release the socket)
+            // before the final unref. A shared dbus_bus_get connection must never
+            // be closed, but this backend owns a private one.
+            runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
+                .onFailure { log.warn("dbus_connection_close threw on shutdown", it) }
+            try {
+                bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
+            } catch (t: Throwable) {
+                log.warn("dbus_connection_unref threw on shutdown", t)
+            }
+            // Release the shared arena (library lookup + every downcall handle).
+            // Safe now that the I/O thread is provably gone. The SNI backend uses
+            // no upcall stubs, so unlike Win32 and macOS there is no separate
+            // long-lived arena that must outlive close().
+            runCatching { bindings.arena.close() }
         }
-        // Release the shared arena (library lookup + every downcall handle).
-        // Safe now that the I/O thread is provably gone; the SNI backend uses no
-        // upcall stubs, so -- unlike Win32 / macOS -- there is no separate
-        // long-lived arena that must outlive close().
-        runCatching { bindings.arena.close() }
     }
 
     // ── D-Bus I/O loop ───────────────────────────────────────────────────
@@ -452,8 +458,12 @@ internal class SniTrayImpl internal constructor(
         }
     }
 
-    /** Send a D-Bus error reply (UnknownMethod / UnknownInterface / ...) in answer to a method call. */
+    /**
+     * Send a D-Bus error reply (UnknownMethod / UnknownInterface / ...) in
+     * answer to a method call. Skipped when the caller set NO_REPLY_EXPECTED.
+     */
     private fun replyError(msg: MemorySegment, errorName: String, errorMessage: String) {
+        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
         Arena.ofConfined().use { call ->
             val nameSeg = call.allocateUtf8(errorName)
             val msgSeg  = call.allocateUtf8(errorMessage)
@@ -467,18 +477,14 @@ internal class SniTrayImpl internal constructor(
      * Answer an unhandled method call with UnknownMethod. Leaving a method
      * call unanswered blocks the caller to its own timeout (~25 s) -- some
      * hosts probe objects before subscribing and would stall on startup.
-     * Skipped when the caller set NO_REPLY_EXPECTED.
      */
     private fun replyUnknownMethod(msg: MemorySegment, iface: String, member: String) {
-        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
         log.debug("Unhandled method {}.{} -- replying UnknownMethod", iface, member)
         replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No such method $iface.$member")
     }
 
-    private fun replyInvalidArgs(msg: MemorySegment, why: String) {
-        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
+    private fun replyInvalidArgs(msg: MemorySegment, why: String) =
         replyError(msg, "org.freedesktop.DBus.Error.InvalidArgs", why)
-    }
 
     private fun fire(event: TrayEvent) = events.fire(event)
 
@@ -1108,10 +1114,10 @@ internal class SniTrayImpl internal constructor(
         // Always succeeds without a capacity bound, and unlike put it does not
         // throw on a caller whose interrupt flag is set.
         outgoing.offer(reply)
-        // close() can run its final drain between the check above and this
-        // put, which would leave the message queued forever with its ref
-        // held. Re-check and drain what nobody is coming back for; poll() is
-        // atomic, so a message still reaches exactly one unref.
+        // The I/O thread can run its final drain between the check above and
+        // this offer, which would leave the message queued forever with its
+        // ref held. Re-check and drain what nobody is coming back for. poll()
+        // is atomic, so a message still reaches exactly one unref.
         if (!open.get()) {
             val unref = bindings.handle("dbus_message_unref")
             while (true) {
