@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicReference
  *   5. WndProc routes `WM_DESTROY` / `WM_USER+1` / `WM_COMMAND` to
  *      Kotlin-side handlers; everything else gets `DefWindowProcW`.
  *   6. `Shell_NotifyIcon` NIM_ADD registers the icon (built from the
- *      builder's PNG via [pngToHicon]), NIM_SETVERSION opts into the
+ *      builder's PNG via [iconPixels] and [createHicon]), NIM_SETVERSION opts into the
  *      v4 mouse-message format, NIM_MODIFY carries later icon / tooltip
  *      changes, and NIM_DELETE removes the entry on [close].
  *
@@ -164,16 +164,17 @@ internal class Win32TrayImpl private constructor(
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        // Scaling is plain JVM work and stays outside the lock. CreateIcon
-        // runs under it, so close() cannot free the arena between creating
-        // the HICON and handing it to the shell or destroying it.
-        val fitted = IconScaling.fit(iconBytes, initial.maxIconSize, log)
+        // Scaling, decoding and the pixel conversion are plain JVM work and stay
+        // outside the lock. CreateIcon runs under it, so close() cannot free the
+        // arena between creating the HICON and handing it to the shell or
+        // destroying it.
+        val pixels = iconPixels(IconScaling.fit(iconBytes, initial.maxIconSize, log)) ?: run {
+            log.warn("The new icon could not be converted for CreateIcon, setIcon ignored")
+            return false
+        }
         return synchronized(shellLock) {
             if (!open.get()) return false
-            val newIcon = pngToHicon(fitted) ?: run {
-                log.warn("PNG to HICON conversion returned null, setIcon ignored")
-                return false
-            }
+            val newIcon = createHicon(pixels) ?: return false
             // Destroy the old icon only after the shell has the new one, so
             // the struct never points at a freed HICON.
             val prev = iconHandle.getAndSet(newIcon)
@@ -341,7 +342,11 @@ internal class Win32TrayImpl private constructor(
     // default only applies to DIBs (CreateDIBitmap with positive height).
     // Feeding bottom-up rows here paints the glyph upside down (issue #4).
 
-    private fun pngToHicon(bytes: ByteArray): MemorySegment? {
+    /** An icon converted to the two bitmaps CreateIcon takes. */
+    private class IconPixels(val width: Int, val height: Int, val xorBytes: ByteArray, val andBytes: ByteArray)
+
+    /** Decode [bytes] and convert them for CreateIcon. JVM work only, no native call. */
+    private fun iconPixels(bytes: ByteArray): IconPixels? {
         val img = runCatching { IconScaling.decode(bytes) }.getOrNull() ?: run {
             log.warn("ImageIO could not decode PNG ({} bytes)", bytes.size)
             return null
@@ -377,21 +382,25 @@ internal class Win32TrayImpl private constructor(
         // tells Windows "use alpha from XOR bits"; correct on Vista+.
         val maskScanline = ((w + 31) / 32) * 4
         val andBytes = ByteArray(maskScanline * h)
+        return IconPixels(w, h, xorBytes, andBytes)
+    }
 
-        // Confined arena for the bitmap bytes — CreateIcon copies them
+    /** CreateIcon from converted pixels. Callers hold [shellLock], since this uses the arena. */
+    private fun createHicon(pixels: IconPixels): MemorySegment? {
+        // Confined arena for the bitmap bytes. CreateIcon copies them
         // into the icon resource synchronously, so we can free as soon
         // as the call returns. Without this they'd accumulate in
-        // bindings.arena (shared, JVM-lifetime) on every setIcon call —
-        // ~4KB per 32x32 update, which adds up on apps that animate the
-        // tray glyph.
+        // bindings.arena (shared, JVM-lifetime) on every setIcon call,
+        // about 4KB per 32x32 update, which adds up on apps that animate
+        // the tray glyph.
         val createIcon = bindings.handle("CreateIcon")
         val hicon = Arena.ofConfined().use { tmp ->
-            val xorSeg = tmp.allocate(xorBytes.size.toLong())
-            xorSeg.asByteBuffer().put(xorBytes)
-            val andSeg = tmp.allocate(andBytes.size.toLong())
-            andSeg.asByteBuffer().put(andBytes)
+            val xorSeg = tmp.allocate(pixels.xorBytes.size.toLong())
+            xorSeg.asByteBuffer().put(pixels.xorBytes)
+            val andSeg = tmp.allocate(pixels.andBytes.size.toLong())
+            andSeg.asByteBuffer().put(pixels.andBytes)
             createIcon.invokeExact(
-                hInstance, w, h, 1.toByte(), 32.toByte(), andSeg, xorSeg,
+                hInstance, pixels.width, pixels.height, 1.toByte(), 32.toByte(), andSeg, xorSeg,
             ) as MemorySegment
         }
         if (hicon.address() == 0L) {
@@ -419,15 +428,15 @@ internal class Win32TrayImpl private constructor(
         HWND_INSTANCES[createdHwnd.address()] = this
         log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
 
-        val fittedIcon = IconScaling.fit(initial.iconBytes, initial.maxIconSize, log)
+        val initialPixels = iconPixels(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
         // Under the lock and only while open: a create() that gave up on a slow
         // startup has already called close(), whose NIM_DELETE ran before this
         // NIM_ADD could, so adding now would leave an icon nobody can remove.
         val nimAddOk: Boolean? = synchronized(shellLock) {
             if (!open.get()) return@synchronized null
-            val initialIcon = pngToHicon(fittedIcon)
+            val initialIcon = initialPixels?.let(::createHicon)
             if (initialIcon == null) {
-                log.warn("PNG to HICON conversion returned null, the tray entry will register without an icon")
+                log.warn("The initial icon could not be created, the tray entry will register without one")
             } else {
                 iconHandle.set(initialIcon)
             }

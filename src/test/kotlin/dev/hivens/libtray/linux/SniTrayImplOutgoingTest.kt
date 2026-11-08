@@ -98,6 +98,39 @@ class SniTrayImplOutgoingTest {
     }
 
     @Test
+    fun `close waits for a setter inside its libdbus calls and every signal it built is freed`() {
+        val rec = RecordingDbus()
+        val inEmit = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val builds = AtomicInteger(0)
+        // Hold the first signal build, as a slow libdbus call would.
+        rec.onNewSignal = {
+            if (builds.incrementAndGet() == 1) {
+                inEmit.countDown()
+                release.await()
+            }
+        }
+        val tray = newTray(rec)
+        val setter = thread { tray.setTooltip("racing close") }
+        inEmit.await(2, TimeUnit.SECONDS) shouldBe true
+
+        val closer = thread { tray.close() }
+        Thread.sleep(300)
+        // Freeing the connection and the arena now would pull them out from
+        // under the setter's next libdbus call.
+        closer.isAlive shouldBe true
+        rec.connLifecycle.toList() shouldContainExactly emptyList()
+
+        release.countDown()
+        setter.join(3_000)
+        closer.join(3_000)
+
+        closer.isAlive shouldBe false
+        rec.connLifecycle.toList() shouldContainExactly listOf("close", "unref")
+        (rec.signals.toSet() - rec.unrefed.toSet()) shouldBe emptySet()
+    }
+
+    @Test
     fun `drains queued messages in FIFO order, sending and unrefing each without flushing`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)
@@ -245,6 +278,7 @@ class SniTrayImplOutgoingTest {
             "dbus_message_unref" to l.bind(rec, "unref", MethodType.methodType(void, seg)),
             "dbus_connection_close" to l.bind(rec, "connClose", MethodType.methodType(void, seg)),
             "dbus_connection_unref" to l.bind(rec, "connUnref", MethodType.methodType(void, seg)),
+            "dbus_message_new_signal" to l.bind(rec, "newSignal", MethodType.methodType(seg, seg, seg, seg)),
         )
         return DBusBindings(Arena.ofShared(), handles)
     }
@@ -275,6 +309,13 @@ class SniTrayImplOutgoingTest {
 
         /** Optional hook run inside each poll, standing in for an arriving call. */
         @Volatile var onReadWrite: (() -> Unit)? = null
+
+        /** Optional hook run when a setter builds a signal, before it gets its address. */
+        @Volatile var onNewSignal: (() -> Unit)? = null
+
+        /** Addresses handed out as signals, starting at 1000 to stay clear of the queued test segments. */
+        val signals = ConcurrentLinkedQueue<Long>()
+        private val nextSignal = AtomicInteger(1000)
 
         // Real dbus_connection_read_write blocks up to timeoutMs; sleep a
         // little so the loop doesn't busy-spin during the test.
@@ -311,6 +352,13 @@ class SniTrayImplOutgoingTest {
 
         fun connUnref(connection: MemorySegment) {
             connUnrefs.incrementAndGet(); connLifecycle.add("unref")
+        }
+
+        fun newSignal(path: MemorySegment, iface: MemorySegment, member: MemorySegment): MemorySegment {
+            onNewSignal?.invoke()
+            val address = nextSignal.getAndIncrement().toLong()
+            signals.add(address)
+            return MemorySegment.ofAddress(address)
         }
 
         private fun record(event: String) {

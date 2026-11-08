@@ -172,6 +172,14 @@ internal class SniTrayImpl internal constructor(
     // a live session bus. See SniTrayImplOutgoingTest.
     internal val outgoing = LinkedBlockingQueue<MemorySegment>()
 
+    /**
+     * Held by a setter's libdbus calls and by close() while it frees the
+     * connection and the arena, so a setter never builds a message on bindings
+     * that are going away, and a message it built is always handed on or freed.
+     */
+    private val nativeLock = Any()
+
+    // Last, so the I/O thread never sees a field that is not yet initialised.
     init {
         ioThread.start()
     }
@@ -210,13 +218,6 @@ internal class SniTrayImpl internal constructor(
         layoutRevision.incrementAndGet()
         return signalling("setMenu") { emitLayoutUpdated() }
     }
-
-    /**
-     * Held by a setter's libdbus calls and by close() while it frees the
-     * connection and the arena, so a setter never builds a message on bindings
-     * that are going away, and a message it built is always handed on or freed.
-     */
-    private val nativeLock = Any()
 
     /** The libdbus half of a setter. False once the tray is closed. */
     private inline fun signalling(what: String, emit: () -> Unit): Boolean = synchronized(nativeLock) {

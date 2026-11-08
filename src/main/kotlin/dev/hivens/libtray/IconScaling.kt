@@ -62,7 +62,7 @@ internal object IconScaling {
             // up here, and this is the only trace of it on macOS. It repeats on
             // every setIcon, so the stack is logged once per process.
             if (t is Error && decoderFailureLogged.compareAndSet(false, true)) {
-                log.warn("The image decoder failed on a tray icon, sending icons unscaled from now on", t)
+                log.warn("The image decoder failed on a tray icon, sending it unscaled. Later failures are logged at debug.", t)
             } else {
                 log.debug("The image decoder failed on a tray icon", t)
             }

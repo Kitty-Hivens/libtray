@@ -62,6 +62,17 @@ class NativeImageMetadataTest {
         offenders shouldBe emptyList()
     }
 
+    @Test
+    fun `every UpcallTarget in the sources is in the registry`() {
+        // The registry only sees targets created while a backend class
+        // initialises. One behind `by lazy`, inside a function or in a class
+        // missing from BACKENDS would drop out of the metadata without this.
+        val declarations = File("src/main/kotlin").walkTopDown()
+            .filter { it.extension == "kt" }
+            .sumOf { file -> file.readLines().count { "UpcallTarget(" in it && "class UpcallTarget(" !in it } }
+        UPCALL_TARGETS.size shouldBe declarations
+    }
+
     private fun render(): String {
         val downcalls = (DBusBindings.DOWNCALL_DESCRIPTORS + Win32Bindings.DOWNCALL_DESCRIPTORS + ObjcBindings.DOWNCALL_DESCRIPTORS)
             .map(::signature).distinct().sorted()
@@ -140,7 +151,8 @@ class NativeImageMetadataTest {
          */
         val UPCALL_TARGETS: List<UpcallTarget> by lazy {
             for (backend in BACKENDS) Class.forName(backend.name, true, backend.classLoader)
-            UpcallTarget.all
+            // Only the backends': a target some other test creates must not end up in the shipped file.
+            UpcallTarget.all.filter { it.owner in BACKENDS }
         }
     }
 }

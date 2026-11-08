@@ -1,3 +1,5 @@
+import java.util.concurrent.TimeUnit
+
 plugins {
     alias(libs.plugins.kotlin.jvm)
     `java-library`
@@ -11,7 +13,12 @@ plugins {
 }
 
 val osName = System.getProperty("os.name").lowercase()
-val linuxWithDbus = osName.contains("linux") && File("/usr/bin/dbus-daemon").exists()
+// Looked up on PATH, where ProcessBuilder in PrivateSessionBus finds it too, so
+// a host with dbus-daemon outside /usr/bin (NixOS) still gets a private bus
+// instead of the desktop's.
+val linuxWithDbus = osName.contains("linux") &&
+    providers.environmentVariable("PATH").orElse("").get().split(File.pathSeparator)
+        .any { File(it, "dbus-daemon").canExecute() }
 
 // SmokeMain lives in the TEST source set (src/test) so it stays OUT of the
 // published library jar yet keeps `internal` access to the backends (the macOS
@@ -173,10 +180,19 @@ abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, Au
 
     override fun close() {
         daemon.destroy()
+        // A daemon left stopped by a test that died between SIGSTOP and SIGCONT
+        // never handles the SIGTERM above.
+        if (!daemon.waitFor(2, TimeUnit.SECONDS)) daemon.destroyForcibly()
     }
 }
 
-val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {}
+// One user at a time: sniHostTest, nativeCheck and nativeAgentRun each run a
+// watcher on this bus, which only one can own, and sniHostTest stops the daemon
+// in one of its tests. With the configuration cache, tasks of this project can
+// otherwise run in parallel.
+val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {
+    maxParallelUsages.set(1)
+}
 
 // A bus of its own for the test task, which can run in parallel with
 // sniHostTest. That task stops its daemon to test a bus that stops reading,

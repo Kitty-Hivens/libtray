@@ -212,10 +212,17 @@ internal class AppKitTrayImpl private constructor(
             }
         }
         if (enqueued && done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) return
-        log.warn(
-            "Cocoa main queue did not run the tray teardown within {} ms; tearing down on {} instead",
-            CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
-        )
+        if (enqueued) {
+            log.warn(
+                "Cocoa main queue did not run the tray teardown within {} ms, tearing down on {} instead",
+                CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
+            )
+        } else {
+            log.warn(
+                "Could not queue the tray teardown on the Cocoa main queue, tearing down on {} instead",
+                Thread.currentThread().name,
+            )
+        }
         tearDown()
     }
 

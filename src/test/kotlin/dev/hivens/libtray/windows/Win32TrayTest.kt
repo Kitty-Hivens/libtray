@@ -83,13 +83,17 @@ class Win32TrayTest {
         repeat(5) {
             val tray = open()
             val failure = AtomicReference<Throwable?>()
-            val started = CountDownLatch(2)
+            // One latch per setter: a shared one could be run down by a single
+            // fast setter before the other one had made a call at all.
+            val tooltipStarted = CountDownLatch(1)
+            val iconStarted = CountDownLatch(1)
             val setters = listOf(
-                thread { hammer(tray, failure, started) { tray.setTooltip("racing") } },
-                thread { hammer(tray, failure, started) { tray.setIcon(solidPng(16)) } },
+                thread { hammer(tray, failure, tooltipStarted) { tray.setTooltip("racing") } },
+                thread { hammer(tray, failure, iconStarted) { tray.setIcon(solidPng(16)) } },
             )
             // close() has to land while both setters are looping, not before they start.
-            started.await(5, TimeUnit.SECONDS) shouldBe true
+            tooltipStarted.await(5, TimeUnit.SECONDS) shouldBe true
+            iconStarted.await(5, TimeUnit.SECONDS) shouldBe true
             tray.close()
             setters.forEach { it.join(5_000) }
             setters.none { it.isAlive } shouldBe true
