@@ -128,6 +128,18 @@ class IconScalingTest {
     }
 
     @Test
+    fun `each source row is read once even when two target rows share it`() {
+        // 3 rows to 2: row 1 straddles both targets.
+        val reads = mutableListOf<Int>()
+        val source = IntArray(3 * 3) { 0xFF000000.toInt() }
+        IconScaling.areaAverageRows(3, 3, 2, 2) { y, row ->
+            reads += y
+            System.arraycopy(source, y * 3, row, 0, 3)
+        }
+        reads shouldBe listOf(0, 1, 2)
+    }
+
+    @Test
     fun `a fully transparent area stays fully transparent`() {
         IconScaling.areaAverage(IntArray(4) { 0x00FFFFFF }, 2, 2, 1, 1).single() shouldBe 0
     }

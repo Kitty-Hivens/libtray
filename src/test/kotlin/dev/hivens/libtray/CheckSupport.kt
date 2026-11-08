@@ -25,7 +25,9 @@ internal fun expect(events: LinkedBlockingQueue<TrayEvent>, expected: TrayEvent,
 internal fun startWatchdog(seconds: Long = 90) {
     Thread {
         Thread.sleep(seconds * 1_000)
-        fail("timed out after $seconds s")
+        System.err.println("[check] FAIL: timed out after $seconds s")
+        // Not exitProcess: a shutdown hook could wait on whatever hung.
+        Runtime.getRuntime().halt(1)
     }.apply {
         isDaemon = true
         start()

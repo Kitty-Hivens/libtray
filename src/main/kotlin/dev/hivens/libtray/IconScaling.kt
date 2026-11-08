@@ -4,6 +4,7 @@ import org.slf4j.Logger
 import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
 import javax.imageio.stream.MemoryCacheImageInputStream
 import javax.imageio.stream.MemoryCacheImageOutputStream
@@ -39,6 +40,8 @@ internal object IconScaling {
      */
     const val DEFAULT_MAX_SIZE: Int = 256
 
+    private val decoderFailureLogged = AtomicBoolean(false)
+
     /**
      * Return [bytes] unchanged, or a PNG re-encoding scaled to fit a
      * [maxSize]-square box with the aspect ratio preserved.
@@ -56,8 +59,13 @@ internal object IconScaling {
         } catch (t: Throwable) {
             // Bytes ImageIO cannot read are expected, the OS may still take
             // them. An Error is not: a native image missing its metadata ends
-            // up here, and this is the only trace of it on macOS.
-            if (t is Error) log.warn("The image decoder failed on a tray icon, sending it unscaled", t)
+            // up here, and this is the only trace of it on macOS. It repeats on
+            // every setIcon, so the stack is logged once per process.
+            if (t is Error && decoderFailureLogged.compareAndSet(false, true)) {
+                log.warn("The image decoder failed on a tray icon, sending icons unscaled from now on", t)
+            } else {
+                log.debug("The image decoder failed on a tray icon", t)
+            }
             return bytes
         } ?: return bytes
         val width = image.width
@@ -70,7 +78,7 @@ internal object IconScaling {
         val targetHeight = max(1, (height * scale).roundToInt())
 
         return runCatching {
-            val scaled = areaAverage(width, height, targetWidth, targetHeight) { y, row ->
+            val scaled = areaAverageRows(width, height, targetWidth, targetHeight) { y, row ->
                 image.getRGB(0, y, width, 1, row, 0, width)
             }
             val out = BufferedImage(targetWidth, targetHeight, BufferedImage.TYPE_INT_ARGB)
@@ -107,7 +115,7 @@ internal object IconScaling {
         sourceHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-    ): IntArray = areaAverage(sourceWidth, sourceHeight, targetWidth, targetHeight) { y, row ->
+    ): IntArray = areaAverageRows(sourceWidth, sourceHeight, targetWidth, targetHeight) { y, row ->
         System.arraycopy(source, y * sourceWidth, row, 0, sourceWidth)
     }
 
@@ -132,7 +140,7 @@ internal object IconScaling {
      * native-image metadata. Against its output, alpha matches exactly and
      * colour within one level.
      */
-    private fun areaAverage(
+    internal fun areaAverageRows(
         sourceWidth: Int,
         sourceHeight: Int,
         targetWidth: Int,
@@ -143,6 +151,9 @@ internal object IconScaling {
         val stepX = sourceWidth.toDouble() / targetWidth
         val stepY = sourceHeight.toDouble() / targetHeight
         val row = IntArray(sourceWidth)
+        // A source row on the boundary between two target rows is needed by
+        // both, and target rows are built in order, so remember the last one.
+        var loadedRow = -1
         // Running totals for the target row being built, one slot per target pixel.
         val area = DoubleArray(targetWidth)
         val alpha = DoubleArray(targetWidth)
@@ -155,7 +166,10 @@ internal object IconScaling {
             for (totals in arrayOf(area, alpha, red, green, blue)) totals.fill(0.0)
             var y = top.toInt()
             while (y < bottom && y < sourceHeight) {
-                readRow(y, row)
+                if (y != loadedRow) {
+                    readRow(y, row)
+                    loadedRow = y
+                }
                 val coverY = min(y + 1.0, bottom) - max(y.toDouble(), top)
                 for (tx in 0 until targetWidth) {
                     val left = tx * stepX

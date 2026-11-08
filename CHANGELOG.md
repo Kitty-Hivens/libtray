@@ -48,9 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   fire the new menu's item with the same position. Menu ids are no longer
   reused within a tray, so such a click is dropped.
 - A thread with its interrupt flag set got `InterruptedException` from the
-  setters on Linux and from `close()` on Linux and macOS, and `close()` then
-  skipped its teardown. On macOS the same flag on the main thread could end
-  the JVM from a menu click.
+  setters on Linux, from `close()` on all three platforms and from
+  `Tray.create` on Windows, and `close()` then skipped its teardown. An
+  interrupt arriving during `close()` now no longer cuts its wait short
+  either. On macOS the same flag on the main thread could end the JVM from a
+  menu click.
 - Linux: a setter racing `close()` could throw instead of returning false.
 - Windows: an idle tray woke its thread about 60 times a second. The pump
   now sleeps in `GetMessageW`. It also processes the `WM_CLOSE` that `close()`

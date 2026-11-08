@@ -5,16 +5,15 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.solidPng
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.condition.EnabledOnOs
 import org.junit.jupiter.api.condition.OS
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
-import javax.imageio.ImageIO
 import kotlin.concurrent.thread
 
 /**
@@ -30,7 +29,7 @@ class Win32TrayTest {
         val tray = open()
         try {
             tray.setTooltip("updated") shouldBe true
-            tray.setIcon(icon(16)) shouldBe true
+            tray.setIcon(solidPng(16)) shouldBe true
             tray.setMenu(TrayMenu(TrayMenuItem.Standard("only", "Only"))) shouldBe true
             tray.setMenu(null) shouldBe true
         } finally {
@@ -84,20 +83,26 @@ class Win32TrayTest {
         repeat(5) {
             val tray = open()
             val failure = AtomicReference<Throwable?>()
+            val started = CountDownLatch(2)
             val setters = listOf(
-                thread { hammer(tray, failure) { tray.setTooltip("racing") } },
-                thread { hammer(tray, failure) { tray.setIcon(icon(16)) } },
+                thread { hammer(tray, failure, started) { tray.setTooltip("racing") } },
+                thread { hammer(tray, failure, started) { tray.setIcon(solidPng(16)) } },
             )
-            Thread.sleep(50)
+            // close() has to land while both setters are looping, not before they start.
+            started.await(5, TimeUnit.SECONDS) shouldBe true
             tray.close()
             setters.forEach { it.join(5_000) }
+            setters.none { it.isAlive } shouldBe true
             failure.get() shouldBe null
         }
     }
 
-    private fun hammer(tray: Tray, failure: AtomicReference<Throwable?>, call: () -> Unit) {
+    private fun hammer(tray: Tray, failure: AtomicReference<Throwable?>, started: CountDownLatch, call: () -> Unit) {
         try {
-            while (tray.isOpen) call()
+            while (tray.isOpen) {
+                call()
+                started.countDown()
+            }
         } catch (t: Throwable) {
             failure.set(t)
         }
@@ -106,7 +111,7 @@ class Win32TrayTest {
     private fun open(): Tray = Tray.create(
         TrayBuilder(
             title = "libtray-win32-test",
-            iconBytes = icon(32),
+            iconBytes = solidPng(32),
             tooltip = "libtray test",
             menu = TrayMenu(TrayMenuItem.Standard("show", "Show"), TrayMenuItem.Standard("exit", "Exit")),
         ),
@@ -114,10 +119,5 @@ class Win32TrayTest {
 
     private fun post(tray: Tray, mouseEvent: Int) {
         postShellCallback(tray, mouseEvent) shouldBe true
-    }
-
-    private fun icon(size: Int): ByteArray {
-        val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
-        return ByteArrayOutputStream().also { ImageIO.write(image, "PNG", it) }.toByteArray()
     }
 }

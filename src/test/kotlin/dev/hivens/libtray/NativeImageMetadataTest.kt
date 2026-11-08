@@ -1,6 +1,7 @@
 package dev.hivens.libtray
 
 import dev.hivens.libtray.linux.DBusBindings
+import dev.hivens.libtray.linux.SniTrayImpl
 import dev.hivens.libtray.macos.AppKitTrayImpl
 import dev.hivens.libtray.macos.ObjcBindings
 import dev.hivens.libtray.windows.Win32Bindings
@@ -129,11 +130,17 @@ class NativeImageMetadataTest {
     private companion object {
         const val METADATA_PATH = "src/main/resources/META-INF/native-image/dev.hivens/libtray/reachability-metadata.json"
 
+        /** Every backend class. Initialising one creates its upcall targets, which register themselves. */
+        private val BACKENDS = listOf(AppKitTrayImpl::class.java, SniTrayImpl::class.java, Win32TrayImpl::class.java)
+
         /**
          * The static methods the backends turn into upcall stubs through
          * `MethodHandles.lookup().findStatic`, which a native image resolves
          * only for methods registered for reflection.
          */
-        val UPCALL_TARGETS: List<UpcallTarget> = AppKitTrayImpl.UPCALLS + Win32TrayImpl.WND_PROC
+        val UPCALL_TARGETS: List<UpcallTarget> by lazy {
+            for (backend in BACKENDS) Class.forName(backend.name, true, backend.classLoader)
+            UpcallTarget.all
+        }
     }
 }

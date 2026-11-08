@@ -178,6 +178,11 @@ abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, Au
 
 val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {}
 
+// A bus of its own for the test task, which can run in parallel with
+// sniHostTest. That task stops its daemon to test a bus that stops reading,
+// and runs a watcher that would pick up the test task's trays as well.
+val testSessionBus = gradle.sharedServices.registerIfAbsent("testSessionBus", PrivateSessionBus::class) {}
+
 tasks.test {
     useJUnitPlatform {
         excludeTags("sni-host")
@@ -187,14 +192,14 @@ tasks.test {
     testLogging {
         events("passed", "skipped", "failed")
     }
-    // Native code under test will eventually want this; harmless on tests
-    // that don't reach Panama.
+    // The backends' native calls need this. Harmless on tests that don't
+    // reach Panama.
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     // TrayFactoryTest creates a real tray, which must not show up on a
     // developer's desktop.
     if (linuxWithDbus) {
-        usesService(privateSessionBus)
-        val bus = privateSessionBus
+        usesService(testSessionBus)
+        val bus = testSessionBus
         doFirst {
             (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         }

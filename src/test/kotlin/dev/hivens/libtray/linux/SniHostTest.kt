@@ -16,12 +16,11 @@ import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
+import dev.hivens.libtray.solidPng
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
-import javax.imageio.ImageIO
 import kotlin.concurrent.thread
 
 /**
@@ -120,20 +119,24 @@ class SniHostTest {
         repeat(20) { round ->
             val tray = open("org.libtray.HostTest.CloseRace$round")
             val failure = AtomicReference<Throwable?>()
+            val started = CountDownLatch(1)
             val setter = thread {
                 try {
                     while (tray.isOpen) {
                         tray.setTooltip("racing")
                         tray.setMenu(null)
+                        started.countDown()
                     }
                     tray.setTooltip("after close") shouldBe false
                 } catch (t: Throwable) {
                     failure.set(t)
                 }
             }
-            Thread.sleep(5)
+            // close() has to land while the setter is looping, not before it starts.
+            started.await(2, TimeUnit.SECONDS) shouldBe true
             tray.close()
             setter.join(2_000)
+            setter.isAlive shouldBe false
             failure.get() shouldBe null
         }
     }
@@ -259,7 +262,7 @@ class SniHostTest {
         val tray = Tray.create(
             TrayBuilder(
                 title = title,
-                iconBytes = icon32(),
+                iconBytes = solidPng(32),
                 menu = TrayMenu(
                     TrayMenuItem.Standard("show", "Show"),
                     TrayMenuItem.Separator,
@@ -300,10 +303,6 @@ class SniHostTest {
         return samples[samples.size / 2]
     }
 
-    private fun icon32(): ByteArray {
-        val image = BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB)
-        return ByteArrayOutputStream().also { ImageIO.write(image, "PNG", it) }.toByteArray()
-    }
 
     private companion object {
         const val LATENCY_BUDGET_MS = 250.0

@@ -776,9 +776,6 @@ internal class AppKitTrayImpl private constructor(
         private val ON_STATUS_ITEM_CLICK = UpcallTarget(AppKitTrayImpl::class.java, "onStatusItemClickEntry", OBJC_METHOD_DESCRIPTOR)
         private val ON_STATUS_VIEW_MOUSE = UpcallTarget(AppKitTrayImpl::class.java, "onStatusViewMouseEntry", OBJC_METHOD_DESCRIPTOR)
 
-        /** Every method this backend turns into an upcall stub. */
-        internal val UPCALLS = listOf(DISPATCH_TRAMPOLINE, ON_MENU_ITEM, ON_STATUS_ITEM_CLICK, ON_STATUS_VIEW_MOUSE)
-
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 

@@ -340,7 +340,7 @@ internal class Win32Bindings private constructor(
     )
 
     /**
-     * MSG from winuser.h — populated by GetMessageW. POINT
+     * MSG from winuser.h, populated by GetMessageW. POINT
      * is two LONGs; lPrivate is undocumented padding the kernel reserves.
      *
      * ```c
