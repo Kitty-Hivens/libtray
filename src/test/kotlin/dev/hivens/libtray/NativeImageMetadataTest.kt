@@ -63,6 +63,19 @@ class NativeImageMetadataTest {
     }
 
     @Test
+    fun `downcall handles are only bound from the descriptor lists`() {
+        // The metadata comes from the bindings' DOWNCALL_DESCRIPTORS. A handle
+        // bound anywhere else must use a shape that is already in them.
+        val binders = File("src/main/kotlin").walkTopDown()
+            .filter { it.extension == "kt" && ".downcallHandle(" in it.readText() }
+            .map { it.name }
+            .toSet()
+        binders shouldBe setOf("DBusBindings.kt", "Win32Bindings.kt", "ObjcBindings.kt", "Win32TrayImpl.kt")
+        // Win32TrayImpl binds the pre-instance DefWindowProcW fallback with the WndProc shape.
+        Win32Bindings.DOWNCALL_DESCRIPTORS.contains(Win32Bindings.WNDPROC_DESCRIPTOR) shouldBe true
+    }
+
+    @Test
     fun `every UpcallTarget in the sources is in the registry`() {
         // The registry only sees targets created while a backend class
         // initialises. One behind `by lazy`, inside a function or in a class

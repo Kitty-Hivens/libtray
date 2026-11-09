@@ -194,9 +194,9 @@ internal class AppKitTrayImpl private constructor(
      * item. Waiting keeps close() synchronous: the icon is gone when it
      * returns. The wait is bounded because a main thread that is blocked,
      * or a process that never runs a Cocoa loop, would otherwise hang the
-     * caller. On timeout the teardown runs on the calling thread instead,
-     * since leaving the icon up is worse, and [tornDown] keeps the queued
-     * copy from running it a second time.
+     * caller. On timeout, or when the teardown could not be queued at all, it
+     * runs on the calling thread instead, since leaving the icon up is worse,
+     * and [tornDown] keeps a queued copy from running it a second time.
      */
     private fun tearDownOnMainThread() {
         if (isCocoaMainThread(bindings) || bindings.mainQueue.address() == 0L) {
@@ -1143,10 +1143,10 @@ internal class AppKitTrayImpl private constructor(
          * `-onStatusItemClick:(id)`, each mapped to a Panama upcall stub,
          * register, instantiate.
          *
-         * Class name is suffixed with PID so re-loading libtray (e.g.
-         * test harnesses, isolated classloaders) doesn't trip
-         * "class already registered". Idempotent — early-returns when
-         * already built.
+         * The class name carries the PID. That does not help a second copy of
+         * libtray loaded by another classloader in the same process: it gets
+         * the same name, objc_allocateClassPair returns nil and its create()
+         * returns null. Idempotent, it returns early when already built.
          */
         @Synchronized
         private fun ensureMenuTargetClass(bindings: ObjcBindings) {

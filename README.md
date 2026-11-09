@@ -43,7 +43,7 @@ read end-to-end in one sitting.
 |----------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Linux    | `org.kde.StatusNotifierItem` over D-Bus + `com.canonical.dbusmenu` for the menu | Talks to the desktop's tray host directly via libdbus. No GTK / GLib runtime dependency. Works on KDE, GNOME with the SNI extension, Hyprland (via waybar / similar), Cinnamon, Budgie. |
 | Windows  | `Shell_NotifyIcon` via `shell32`                                                | Win32 message-pump driven. The classic "balloon notification" surface.                                                                                                                  |
-| macOS    | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend`                      | Menu-bar item top-right. Requires the JVM to be running with a Cocoa main thread (most JVM desktop apps already do).                                                                    |
+| macOS    | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend`                      | Menu-bar item top-right. `Tray.create` has to run on the Cocoa main thread: it works from the JavaFX application thread, but AWT, Swing and Compose apps currently get `null`.          |
 
 Each backend lives in its own package so consumers can audit / patch the
 one that affects them without grokking the others.

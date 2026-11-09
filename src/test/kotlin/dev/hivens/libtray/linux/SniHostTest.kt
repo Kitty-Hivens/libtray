@@ -170,6 +170,26 @@ class SniHostTest {
     }
 
     @Test
+    fun `property and menu calls with missing arguments get InvalidArgs`() {
+        val name = "org.libtray.HostTest.MissingArguments"
+        open(name)
+
+        // An empty method return would carry the wrong signature for Get and GetProperty.
+        val calls = listOf(
+            Triple(DBusTestClient.ITEM_PATH, "org.freedesktop.DBus.Properties", "Get"),
+            Triple(DBusTestClient.ITEM_PATH, "org.freedesktop.DBus.Properties", "GetAll"),
+            Triple(DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "GetProperty"),
+            Triple(DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "Event"),
+        )
+        for ((path, iface, member) in calls) {
+            shouldThrow<IllegalStateException> { host.callNoResult(name, path, iface, member) }
+                .message.shouldContain("InvalidArgs")
+        }
+
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
     fun `a click on an item of a replaced menu is dropped`() {
         val name = "org.libtray.HostTest.ReplacedMenu"
         val events = LinkedBlockingQueue<TrayEvent>()

@@ -41,8 +41,9 @@ public interface Tray : AutoCloseable {
     public val isOpen: Boolean
 
     /**
-     * Replace the tooltip shown when the user hovers over the icon.
-     * Empty string is allowed and removes the tooltip.
+     * Replace the tooltip shown when the user hovers over the icon. An empty
+     * string removes it on Windows and macOS. On Linux the tray host falls
+     * back to the title given to [TrayBuilder].
      * @return false when the tray is closed or the change failed. See the
      *   class KDoc for what true means on each platform.
      */

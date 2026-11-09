@@ -5,14 +5,11 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
-import dev.hivens.libtray.IconScaling
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
-import dev.hivens.libtray.pngSize
 import dev.hivens.libtray.solidPng
 import dev.hivens.libtray.startWatchdog
 import dev.hivens.libtray.step
-import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -37,6 +34,8 @@ import kotlin.system.exitProcess
  * accessibility grant the runner does not have. Covered:
  *
  *  - create, update, and fire a menu item through AppKit
+ *  - an oversized icon reaches the status button scaled to 256 px
+ *  - a second tray's menu item reaches that tray, not the first
  *  - primary press and release with macosMenuOnPrimaryClick false: Activated
  *  - middle release: MiddleActivated
  *  - a press on the button itself, as VoiceOver does: Activated
@@ -60,26 +59,25 @@ fun main() {
     check(tray.setTooltip("updated")) { "setTooltip" }
     check(tray.setIcon(solidPng(22))) { "setIcon" }
     check(tray.setIcon(solidPng(300))) { "setIcon with an icon that needs scaling" }
-    check(tray.setMenu(menu())) { "setMenu" }
     step("updated")
 
-    // NSImage takes any size and fit falls back to the original bytes, so the
-    // setIcon above passes even with scaling broken. Check the result itself.
-    // A macOS native image is the exception: GraalVM writes no AWT libraries
-    // next to it, so fit hands the original back and NSImage shows it
-    // unscaled, as the README says.
-    val log = LoggerFactory.getLogger("libtray.check")
-    val scaled = pngSize(IconScaling.fit(solidPng(300), IconScaling.DEFAULT_MAX_SIZE, log))
+    // NSImage takes any size and setIcon returns true either way, so read the
+    // width of the image the status button now shows. This runs on the main
+    // thread, so applyIcon has already run. A macOS native image is the
+    // exception: GraalVM writes no AWT libraries next to it, so the icon goes
+    // to NSImage unscaled, as the README says.
+    val shownWidth = shownIconWidth(bindings, (tray as AppKitTrayImpl).statusButtonHandle)
     val nativeImage = System.getProperty("org.graalvm.nativeimage.imagecode") != null
     when {
-        scaled == (256 to 256) -> step("oversized icon scaled to 256x256")
-        nativeImage && scaled == (300 to 300) -> step("oversized icon left at 300x300, no AWT in a macOS native image")
-        else -> fail("oversized icon came back as $scaled, expected 256x256")
+        shownWidth == 256L -> step("oversized icon shown at 256 px")
+        nativeImage && shownWidth == 300L -> step("oversized icon shown at 300 px, no AWT in a macOS native image")
+        else -> fail("the status button shows the oversized icon at $shownWidth px, expected 256")
     }
+    check(tray.setMenu(menu())) { "setMenu" }
 
     // [menu performActionForItemAtIndex:0] sends the item's action to its
     // target, which is the path a real click on the item takes.
-    val nsMenu = (tray as AppKitTrayImpl).currentMenuHandle
+    val nsMenu = tray.currentMenuHandle
     if (nsMenu.address() == 0L) fail("no NSMenu was built")
     bindings.handle("objc_msgSend_void_long")
         .invokeExact(nsMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
@@ -217,3 +215,14 @@ private fun openTray(menuOnPrimaryClick: Boolean): Tray = Tray.create(
 ) ?: fail("Tray.create returned null")
 
 private fun menu() = TrayMenu(TrayMenuItem.Standard("noop", "Noop"), TrayMenuItem.Standard("exit", "Exit"))
+
+/** `[[[button image] representations] firstObject] pixelsWide`, the width of the icon the button shows. */
+private fun shownIconWidth(bindings: ObjcBindings, button: MemorySegment): Long {
+    val msgSendId = bindings.handle("objc_msgSend_id")
+    val image = msgSendId.invokeExact(button, bindings.sel("image")) as MemorySegment
+    if (image.address() == 0L) fail("the status button has no image")
+    val representations = msgSendId.invokeExact(image, bindings.sel("representations")) as MemorySegment
+    val representation = msgSendId.invokeExact(representations, bindings.sel("firstObject")) as MemorySegment
+    if (representation.address() == 0L) fail("the status button's image has no representation")
+    return bindings.handle("objc_msgSend_long").invokeExact(representation, bindings.sel("pixelsWide")) as Long
+}

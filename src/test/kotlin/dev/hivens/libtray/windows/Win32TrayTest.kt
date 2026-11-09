@@ -91,10 +91,15 @@ class Win32TrayTest {
                 thread { hammer(tray, failure, tooltipStarted) { tray.setTooltip("racing") } },
                 thread { hammer(tray, failure, iconStarted) { tray.setIcon(solidPng(16)) } },
             )
-            // close() has to land while both setters are looping, not before they start.
-            tooltipStarted.await(5, TimeUnit.SECONDS) shouldBe true
-            iconStarted.await(5, TimeUnit.SECONDS) shouldBe true
-            tray.close()
+            try {
+                // close() has to land while both setters are looping, not before they start.
+                tooltipStarted.await(5, TimeUnit.SECONDS) shouldBe true
+                iconStarted.await(5, TimeUnit.SECONDS) shouldBe true
+            } finally {
+                // Also when the wait failed, so the icon and the setters do not
+                // outlive this test.
+                tray.close()
+            }
             setters.forEach { it.join(5_000) }
             setters.none { it.isAlive } shouldBe true
             failure.get() shouldBe null

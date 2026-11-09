@@ -58,9 +58,10 @@ import java.util.concurrent.atomic.AtomicInteger
  * That one thread owns the connection outright: each iteration sends
  * whatever the public API and the previous iteration's replies left in
  * [outgoing], then polls the socket, then dispatches what arrived. No
- * other thread touches libdbus, which is what keeps reply latency at
- * the bare bus round-trip — see [outgoing] for why a second sender
- * thread cannot.
+ * other thread touches the connection: setters only build messages, under
+ * [nativeLock], and leave them in [outgoing]. That is what keeps reply
+ * latency at the bare bus round-trip. See [outgoing] for why a second
+ * sender thread cannot.
  *
  * Menu: the full DBusMenu (`com.canonical.dbusmenu`) protocol is served
  * from `/MenuBar`, so the desktop's own menu UI renders the [TrayMenu] —
@@ -260,8 +261,9 @@ internal class SniTrayImpl internal constructor(
             return
         }
         synchronized(nativeLock) {
-            // Final drain: a setter that queued after the loop did its own last
-            // drain left its message in `outgoing`, so unref it rather than leak it.
+            // Final drain, a backstop: sendAndUnref already frees what a setter
+            // queues after the I/O thread's last drain, so this normally finds
+            // nothing. Anything it does find would otherwise leak.
             val unref = bindings.handle("dbus_message_unref")
             while (true) {
                 val leftover = outgoing.poll() ?: break
@@ -495,9 +497,9 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
-            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val ifaceName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Get takes (ss)")
             (bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int)
-            val propName  = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val propName  = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Get takes (ss)")
 
             if (ifaceName != "org.kde.StatusNotifierItem") {
                 replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
@@ -516,7 +518,7 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
-            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val ifaceName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "GetAll takes (s)")
             if (ifaceName != "org.kde.StatusNotifierItem") {
                 replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
                     "No properties for interface $ifaceName")
@@ -754,13 +756,15 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_append_basic")
                 .invokeExact(replyIter, DBusBindings.DBUS_TYPE_UINT32.toInt(), intBuf) as Int
 
-            // Root struct (ia{sv}av) — recursive subtree from parentId.
-            marshallNode(call, replyIter, parentId, depth)
+            // Root struct (ia{sv}av), the recursive subtree from parentId. One
+            // layout for the whole reply: setMenu can swap it in the meantime,
+            // and mixing the two would pair one menu's ids with another's labels.
+            marshallNode(call, replyIter, menuLayout, parentId, depth)
             sendAndUnref(reply)
         }
     }
 
-    private fun marshallNode(call: Arena, parent: MemorySegment, nodeId: Int, depthRemaining: Int) {
+    private fun marshallNode(call: Arena, parent: MemorySegment, layout: DBusMenuLayout?, nodeId: Int, depthRemaining: Int) {
         val struct = call.allocate(bindings.messageIterLayout)
         openContainer(parent, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
 
@@ -774,7 +778,7 @@ internal class SniTrayImpl internal constructor(
         val dictSig = call.allocateUtf8("{sv}")
         val dictArr = call.allocate(bindings.messageIterLayout)
         openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dictArr)
-        val props = menuLayout?.propertiesOf(nodeId).orEmpty()
+        val props = layout?.propertiesOf(nodeId).orEmpty()
         for ((name, value) in props) {
             appendMenuPropertyEntry(call, dictArr, name, value)
         }
@@ -786,11 +790,11 @@ internal class SniTrayImpl internal constructor(
         openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, childSig, childArr)
         if (depthRemaining != 0) {
             val nextDepth = if (depthRemaining < 0) -1 else depthRemaining - 1
-            for (childId in menuLayout?.childrenOf(nodeId).orEmpty()) {
+            for (childId in layout?.childrenOf(nodeId).orEmpty()) {
                 val variant = call.allocate(bindings.messageIterLayout)
                 val variantSig = call.allocateUtf8("(ia{sv}av)")
                 openContainer(childArr, DBusBindings.DBUS_TYPE_VARIANT, variantSig, variant)
-                marshallNode(call, variant, childId, nextDepth)
+                marshallNode(call, variant, layout, childId, nextDepth)
                 closeContainer(childArr, variant)
             }
         }
@@ -828,6 +832,7 @@ internal class SniTrayImpl internal constructor(
             val arrSig = call.allocateUtf8("(ia{sv})")
             val arr = call.allocate(bindings.messageIterLayout)
             openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
+            val layout = menuLayout  // one layout for the whole reply, as in GetLayout
             for (id in ids) {
                 val struct = call.allocate(bindings.messageIterLayout)
                 openContainer(arr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
@@ -838,7 +843,7 @@ internal class SniTrayImpl internal constructor(
                 val dictSig = call.allocateUtf8("{sv}")
                 val dict = call.allocate(bindings.messageIterLayout)
                 openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dict)
-                for ((name, value) in menuLayout?.propertiesOf(id).orEmpty()) {
+                for ((name, value) in layout?.propertiesOf(id).orEmpty()) {
                     appendMenuPropertyEntry(call, dict, name, value)
                 }
                 closeContainer(struct, dict)
@@ -854,9 +859,9 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
-            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            val id = readInt(call, iter) ?: return replyInvalidArgs(msg, "GetProperty takes (is)")
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
-            val propName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val propName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "GetProperty takes (is)")
 
             val value = menuLayout?.propertiesOf(id)?.get(propName)
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
@@ -900,9 +905,9 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
-            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            val id = readInt(call, iter) ?: return replyInvalidArgs(msg, "Event takes (isvu)")
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
-            val eventId = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val eventId = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Event takes (isvu)")
             // data + timestamp ignored — we don't expose them as event fields.
             if (eventId == "clicked") fireMenuClick(id)
             replyEmpty(msg)

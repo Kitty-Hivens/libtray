@@ -247,8 +247,9 @@ internal class Win32TrayImpl private constructor(
             }
         }
         // Everything after the join frees what a live pump thread is still
-        // using. Its WndProc needs the instance mapping and the arena's handles,
-        // and an exception leaving that upcall would end the JVM. Leak them instead.
+        // using: its WndProc looks the instance up in HWND_INSTANCES, the class
+        // cannot be unregistered while its window exists, and the arena cannot
+        // close while GetMessageW holds the MSG buffer. Leak them instead.
         if (!pumpThread.joinPastInterrupt(PUMP_JOIN_TIMEOUT_MS)) {
             log.warn(
                 "libtray-win32 did not stop within {} ms. Leaving its window class and native handles " +
@@ -429,9 +430,9 @@ internal class Win32TrayImpl private constructor(
         log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
 
         val initialPixels = iconPixels(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
-        // Under the lock and only while open: a create() that gave up on a slow
-        // startup has already called close(), whose NIM_DELETE ran before this
-        // NIM_ADD could, so adding now would leave an icon nobody can remove.
+        // Under the lock and only while open. Once a create() that gave up on a
+        // slow startup has called close(), an icon added here would outlive the
+        // tray close() just tore down, whichever of the two got the lock first.
         val nimAddOk: Boolean? = synchronized(shellLock) {
             if (!open.get()) return@synchronized null
             val initialIcon = initialPixels?.let(::createHicon)
@@ -459,8 +460,9 @@ internal class Win32TrayImpl private constructor(
             added
         }
         if (nimAddOk == null) {
-            // close() saw no window yet, so it posted nothing that would end
-            // this thread. Take the window down here instead.
+            // close() may have run before the window existed and posted nothing
+            // that would end this thread, so take the window down here. Anything
+            // it did post goes away with the window.
             runCatching { bindings.handle("DestroyWindow").invokeExact(createdHwnd) as Int }
             HWND_INSTANCES.remove(createdHwnd.address())
             readyLatch.countDown()
@@ -761,7 +763,8 @@ internal class Win32TrayImpl private constructor(
         }
 
         /**
-         * Pre-instance DefWindowProc, resolved onto the same process-lifetime
+         * DefWindowProc for messages with no instance yet, and the fallback when
+         * an instance's dispatch throws. Resolved onto the same process-lifetime
          * arena as the WndProc stub.
          *
          * It must NOT come from a Win32Bindings instance: those arenas are

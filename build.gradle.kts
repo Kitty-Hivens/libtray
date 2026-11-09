@@ -219,6 +219,11 @@ tasks.test {
         doFirst {
             (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         }
+    } else if (osName.contains("linux")) {
+        // No dbus-daemon to start a private bus with. An address nothing listens
+        // on makes Tray.create return null, where inheriting the variable would
+        // put the test tray on the desktop.
+        environment("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/libtray-test-bus")
     }
 }
 
@@ -297,7 +302,7 @@ val nativeCheckImage = layout.buildDirectory.file(
 
 // What the check programs run on, without the test frameworks, whose jars may
 // carry native-image metadata of their own.
-val nativeCheckRuntime: Configuration by configurations.creating {
+val nativeCheckRuntime: Configuration = configurations.create("nativeCheckRuntime") {
     extendsFrom(configurations.runtimeClasspath.get())
 }
 
@@ -346,9 +351,11 @@ val nativeCheck = tasks.register<Exec>("nativeCheck") {
     usesService(privateSessionBus)
     val bus = privateSessionBus
     val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
     doFirst {
         (this as Exec).commandLine(image.get().asFile.absolutePath)
         if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
             environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         }
     }
@@ -371,8 +378,12 @@ tasks.register<JavaExec>("nativeAgentRun") {
     usesService(privateSessionBus)
     val bus = privateSessionBus
     val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
     doFirst {
-        if (linux) (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
+            (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
     }
 }
 

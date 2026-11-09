@@ -2,13 +2,8 @@ package dev.hivens.libtray
 
 import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
-import java.nio.ByteBuffer
 import java.util.zip.CRC32
 import java.util.zip.Deflater
-
-/** Width and height from a PNG's IHDR chunk, read without AWT. */
-internal fun pngSize(png: ByteArray): Pair<Int, Int> =
-    ByteBuffer.wrap(png).let { it.getInt(16) to it.getInt(20) }
 
 /**
  * A solid-colour RGBA PNG built without AWT. The native-image checks use it
