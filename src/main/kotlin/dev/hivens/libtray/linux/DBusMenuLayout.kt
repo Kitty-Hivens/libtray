@@ -17,12 +17,13 @@ import java.util.concurrent.atomic.AtomicInteger
  * [SniTrayImpl.setMenu] swaps in a fresh layout and emits the
  * `LayoutUpdated` signal so the host re-fetches.
  *
- * IDs are sequential ints starting from 1 (root is the reserved 0).
- * Stable across queries within a single layout instance, NOT across
- * layout swaps — host re-reads the layout after `LayoutUpdated` so it
- * always sees a consistent view.
+ * IDs are sequential ints drawn from [ids] (root is the reserved 0). A tray
+ * passes the same counter for every layout it builds, so an id never comes
+ * back with another meaning. A host can still click an item of the menu it
+ * has on screen after [SniTrayImpl.setMenu] replaced it, and that click has
+ * to find nothing rather than land on whichever new item reused the id.
  */
-internal class DBusMenuLayout(menu: TrayMenu) {
+internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger(0)) {
 
     /** Exposed for property dispatch — caller iterates by int id. */
     val nodesById: Map<Int, Node>
@@ -33,7 +34,6 @@ internal class DBusMenuLayout(menu: TrayMenu) {
     init {
         val nodes = HashMap<Int, Node>()
         val children = HashMap<Int, MutableList<Int>>()
-        val counter = AtomicInteger(0)
 
         // Root node — id 0, holds the top-level items as children.
         nodes[0] = Node(
@@ -45,7 +45,7 @@ internal class DBusMenuLayout(menu: TrayMenu) {
 
         fun walk(items: List<TrayMenuItem>, parentId: Int) {
             for (item in items) {
-                val id = counter.incrementAndGet()
+                val id = ids.incrementAndGet()
                 val kind = when (item) {
                     is TrayMenuItem.Standard -> NodeKind.Standard
                     is TrayMenuItem.Submenu  -> NodeKind.Submenu

@@ -255,29 +255,12 @@ internal class ObjcBindings private constructor(
         internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> = LOAD_SET.map { it.third }
 
         /**
-         * NSStatusItem length sentinel — `NSVariableStatusItemLength`
-         * from `NSStatusBar.h`. Tells AppKit "size to fit the icon",
-         * which is what every well-behaved menu-bar app picks.
-         */
-        const val NS_VARIABLE_STATUS_ITEM_LENGTH: Double = -1.0
-
-        /**
          * `NSSquareStatusItemLength` — fixed square width matching the
-         * menu bar height. More forgiving than `NSVariableStatusItemLength`
+         * menu bar height. More forgiving than a variable length
          * when the icon paint pipeline is wonky: even an empty button
          * takes up a square slot, which is at least visible to the user.
          */
         const val NS_SQUARE_STATUS_ITEM_LENGTH: Double = -2.0
-
-        /**
-         * `NSApplicationActivationPolicyRegular` — full GUI app (Dock
-         * icon, menu bar, ⌘-tab eligible). Requires a real `.app`
-         * bundle to behave correctly; a plain JVM process running with
-         * `java …` gets weird half-state ("application is damaged"
-         * pop-ups, missing menu bar). Not what we want for a tray-only
-         * library.
-         */
-        const val NS_APP_POLICY_REGULAR: Long = 0L
 
         /**
          * `NSApplicationActivationPolicyAccessory` — background agent

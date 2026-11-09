@@ -56,10 +56,8 @@ class IconScalingTest {
 
     @Test
     fun `the scaled icon still carries the picture`() {
-        // Dimensions alone would also pass for a fully blank result, which
-        // is the failure mode of drawing an asynchronously-produced Image:
-        // getScaledInstance does not block, so a null-observer drawImage can
-        // legitimately paint nothing. Assert on pixels instead.
+        // Dimensions alone would also pass for a fully blank result, so this
+        // checks the pixels that come back through averaging and the PNG encoder.
         val img = ImageIO.read(ByteArrayInputStream(IconScaling.fit(png(1024, 1024), 64, log)))
 
         val centre = img.getRGB(32, 32)
@@ -118,6 +116,27 @@ class IconScalingTest {
         // would give pink, the halo premultiplied averaging avoids.
         val source = intArrayOf(0xFFFF0000.toInt(), 0x00FFFFFF)
         IconScaling.areaAverage(source, 2, 1, 1, 1).single() shouldBe 0x80FF0000.toInt()
+    }
+
+    @Test
+    fun `partial alpha weights the colour by how opaque each pixel is`() {
+        // Half-transparent red next to opaque blue. Alpha: (128 + 255) / 2 = 192.
+        // Red: 128 x 255 / 383 = 85. Blue: 255 x 255 / 383 = 170. Counting any
+        // visible pixel as opaque would give 128 for both.
+        val source = intArrayOf(0x80FF0000.toInt(), 0xFF0000FF.toInt())
+        IconScaling.areaAverage(source, 2, 1, 1, 1).single() shouldBe 0xC05500AA.toInt()
+    }
+
+    @Test
+    fun `each source row is read once even when two target rows share it`() {
+        // 3 rows to 2: row 1 straddles both targets.
+        val reads = mutableListOf<Int>()
+        val source = IntArray(3 * 3) { 0xFF000000.toInt() }
+        IconScaling.areaAverageRows(3, 3, 2, 2) { y, row ->
+            reads += y
+            System.arraycopy(source, y * 3, row, 0, 3)
+        }
+        reads shouldBe listOf(0, 1, 2)
     }
 
     @Test

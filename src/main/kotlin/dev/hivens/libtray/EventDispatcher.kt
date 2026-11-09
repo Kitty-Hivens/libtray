@@ -57,7 +57,10 @@ internal class EventDispatcher(threadNamePrefix: String) {
     fun fire(event: TrayEvent) {
         if (!open.get()) return
         ensureStarted()
-        queue.put(event)
+        // offer, not put: the queue is unbounded, and put throws when the
+        // calling thread's interrupt flag is set, which from an upcall would
+        // end the JVM.
+        queue.offer(event)
     }
 
     /**
@@ -69,7 +72,7 @@ internal class EventDispatcher(threadNamePrefix: String) {
     fun close() {
         if (!open.compareAndSet(true, false)) return
         queue.clear()
-        queue.put(Stop)
+        queue.offer(Stop)
     }
 
     @Synchronized

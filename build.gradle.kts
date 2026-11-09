@@ -1,3 +1,5 @@
+import java.util.concurrent.TimeUnit
+
 plugins {
     alias(libs.plugins.kotlin.jvm)
     `java-library`
@@ -9,6 +11,14 @@ plugins {
     // Kotlin DSL accessor for this script). Idempotent.
     `signing`
 }
+
+val osName = System.getProperty("os.name").lowercase()
+// Looked up on PATH, where ProcessBuilder in PrivateSessionBus finds it too, so
+// a host with dbus-daemon outside /usr/bin (NixOS) still gets a private bus
+// instead of the desktop's.
+val linuxWithDbus = osName.contains("linux") &&
+    providers.environmentVariable("PATH").orElse("").get().split(File.pathSeparator)
+        .any { File(it, "dbus-daemon").canExecute() }
 
 // SmokeMain lives in the TEST source set (src/test) so it stays OUT of the
 // published library jar yet keeps `internal` access to the backends (the macOS
@@ -31,7 +41,7 @@ tasks.register<JavaExec>("runSmoke") {
     // AWT EDT also doesn't fit — it's a separate thread spawned by
     // CocoaToolkit. The flag makes JVM main == OS thread 0 == AppKit
     // main thread, so libtray's calls land where Cocoa wants them.
-    if (System.getProperty("os.name").lowercase().contains("mac")) {
+    if (osName.contains("mac")) {
         jvmArgs("-XstartOnFirstThread")
     }
     // Show INFO-level logs so the smoke harness surfaces backend
@@ -56,11 +66,10 @@ tasks.register<JavaExec>("runSmoke") {
 // JavaFX/libtray coexistence).
 val javafxVersion = "25.0.3"
 val javafxClassifier: String = run {
-    val os = System.getProperty("os.name").lowercase()
     val aarch64 = System.getProperty("os.arch").lowercase() in setOf("aarch64", "arm64")
     when {
-        os.contains("mac") || os.contains("darwin") -> if (aarch64) "mac-aarch64" else "mac"
-        os.contains("win") -> if (aarch64) "win-aarch64" else "win"
+        osName.contains("mac") || osName.contains("darwin") -> if (aarch64) "mac-aarch64" else "mac"
+        osName.contains("win") -> if (aarch64) "win-aarch64" else "win"
         else -> if (aarch64) "linux-aarch64" else "linux"
     }
 }
@@ -88,9 +97,7 @@ tasks.register<JavaExec>("runJavaFxSmoke") {
     // runSmoke we do NOT force -XstartOnFirstThread by default (matches a
     // normal JavaFX launch). If JavaFX refuses to start on a given host
     // complaining about the main thread, retry with `-PfxFirstThread`.
-    if (project.hasProperty("fxFirstThread") &&
-        System.getProperty("os.name").lowercase().contains("mac")
-    ) {
+    if (project.hasProperty("fxFirstThread") && osName.contains("mac")) {
         jvmArgs("-XstartOnFirstThread")
     }
     // Force JavaFX's software render pipeline. JavaFX 25 defaults to Metal
@@ -156,20 +163,6 @@ dependencies {
     testImplementation(libs.kotest.assertions)
 }
 
-tasks.test {
-    useJUnitPlatform {
-        excludeTags("sni-host")
-    }
-    // List every test with its outcome, so a CI log shows which platform
-    // tests ran and which skipped themselves on that runner.
-    testLogging {
-        events("passed", "skipped", "failed")
-    }
-    // Native code under test will eventually want this; harmless on tests
-    // that don't reach Panama.
-    jvmArgs("--enable-native-access=ALL-UNNAMED")
-}
-
 // End-to-end Linux tests in which the test plays the tray host. They run on
 // a private session bus from PrivateSessionBus below, so a desktop's real
 // tray host neither sees the test items nor holds the watcher name the tests
@@ -187,10 +180,52 @@ abstract class PrivateSessionBus : BuildService<BuildServiceParameters.None>, Au
 
     override fun close() {
         daemon.destroy()
+        // A daemon left stopped by a test that died between SIGSTOP and SIGCONT
+        // never handles the SIGTERM above.
+        if (!daemon.waitFor(2, TimeUnit.SECONDS)) daemon.destroyForcibly()
     }
 }
 
-val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {}
+// One user at a time: sniHostTest, nativeCheck and nativeAgentRun each run a
+// watcher on this bus, which only one can own, and sniHostTest stops the daemon
+// in one of its tests. With the configuration cache, tasks of this project can
+// otherwise run in parallel.
+val privateSessionBus = gradle.sharedServices.registerIfAbsent("privateSessionBus", PrivateSessionBus::class) {
+    maxParallelUsages.set(1)
+}
+
+// A bus of its own for the test task, which can run in parallel with
+// sniHostTest. That task stops its daemon to test a bus that stops reading,
+// and runs a watcher that would pick up the test task's trays as well.
+val testSessionBus = gradle.sharedServices.registerIfAbsent("testSessionBus", PrivateSessionBus::class) {}
+
+tasks.test {
+    useJUnitPlatform {
+        excludeTags("sni-host")
+    }
+    // List every test with its outcome, so a CI log shows which platform
+    // tests ran and which skipped themselves on that runner.
+    testLogging {
+        events("passed", "skipped", "failed")
+    }
+    // The backends' native calls need this. Harmless on tests that don't
+    // reach Panama.
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // TrayFactoryTest creates a real tray, which must not show up on a
+    // developer's desktop.
+    if (linuxWithDbus) {
+        usesService(testSessionBus)
+        val bus = testSessionBus
+        doFirst {
+            (this as Test).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
+    } else if (osName.contains("linux")) {
+        // No dbus-daemon to start a private bus with. An address nothing listens
+        // on makes Tray.create return null, where inheriting the variable would
+        // put the test tray on the desktop.
+        environment("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/libtray-test-bus")
+    }
+}
 
 val sniHostTest = tasks.register<Test>("sniHostTest") {
     group = "verification"
@@ -211,9 +246,8 @@ val sniHostTest = tasks.register<Test>("sniHostTest") {
         environment("LIBTRAY_PRIVATE_BUS", "1")
         environment("LIBTRAY_PRIVATE_BUS_PID", bus.get().pid.toString())
     }
-    val linuxWithDbus = System.getProperty("os.name").lowercase().contains("linux") &&
-        File("/usr/bin/dbus-daemon").exists()
-    onlyIf("Linux with dbus-daemon") { linuxWithDbus }
+    val available = linuxWithDbus
+    onlyIf("Linux with dbus-daemon") { available }
 }
 
 // Non-interactive macOS check: create, update, fire a menu item, close from
@@ -225,16 +259,36 @@ val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("dev.hivens.libtray.macos.MacSmokeCheckKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED", "-XstartOnFirstThread")
-    val isMac = System.getProperty("os.name").lowercase().contains("mac")
+    val isMac = osName.contains("mac")
     onlyIf("macOS") { isMac }
 }
 
+// What Tray.create does next to AWT on macOS, which is what a Compose or Swing
+// app runs into. Reports only, see MacAwtProbe. Run with and without the flag
+// the backend's log recommends, since an app can only pick one. Not part of
+// check: CI runs these on macOS without letting them fail the build.
+listOf(
+    "macAwtProbe" to emptyList(),
+    "macAwtProbeFirstThread" to listOf("-XstartOnFirstThread"),
+).forEach { (taskName, extraArgs) ->
+    tasks.register<JavaExec>(taskName) {
+        group = "verification"
+        description = "Report what Tray.create returns next to AWT, JVM flags: $extraArgs."
+        classpath = sourceSets.test.get().runtimeClasspath
+        mainClass.set("dev.hivens.libtray.macos.MacAwtProbeKt")
+        jvmArgs(listOf("--enable-native-access=ALL-UNNAMED") + extraArgs)
+        val isMac = osName.contains("mac")
+        onlyIf("macOS") { isMac }
+    }
+}
+
 // GraalVM native-image check: the platform's check program built as a native
-// image with only the reachability metadata the jar ships, then run. This is
-// what a consumer's native build sees, so a missing foreign call or upcall
-// target fails here instead. Needs GraalVM: GRAALVM_HOME, or a GraalVM
-// JAVA_HOME. Not part of check, since an image takes a few minutes to build.
-val osName = System.getProperty("os.name").lowercase()
+// image against the library jar, then run. This is what a consumer's native
+// build sees, so a missing foreign call or upcall target or a packaging
+// mistake fails here instead. The only metadata besides the jar's is what the
+// macOS check's own CoreGraphics calls need, under the test resources. Needs
+// GraalVM: GRAALVM_HOME, or a GraalVM JAVA_HOME. Not part of check, since an
+// image takes a few minutes to build.
 val nativeCheckMain = when {
     osName.contains("linux") -> "dev.hivens.libtray.linux.LinuxNativeCheckKt"
     osName.contains("mac") -> "dev.hivens.libtray.macos.MacSmokeCheckKt"
@@ -246,22 +300,36 @@ val nativeCheckImage = layout.buildDirectory.file(
     if (osName.contains("windows")) "native-check/libtray-check.exe" else "native-check/libtray-check",
 )
 
+// What the check programs run on, without the test frameworks, whose jars may
+// carry native-image metadata of their own.
+val nativeCheckRuntime: Configuration = configurations.create("nativeCheckRuntime") {
+    extendsFrom(configurations.runtimeClasspath.get())
+}
+
+dependencies {
+    nativeCheckRuntime(libs.slf4j.simple)
+}
+
 val nativeCheckBuild = tasks.register<Exec>("nativeCheckBuild") {
     group = "verification"
     description = "Build this platform's check program as a GraalVM native image."
     dependsOn(tasks.testClasses)
     // Locals, not script-level vals: the configuration cache cannot carry
     // references to the build script object into a task action.
-    val classpath = sourceSets.test.get().runtimeClasspath
+    val classpath = files(tasks.jar, sourceSets.test.get().output, nativeCheckRuntime)
     val image = nativeCheckImage
     val home = graalHome
     val main = nativeCheckMain
     val windows = osName.contains("windows")
     inputs.files(classpath)
-    outputs.file(image)
+    inputs.property("graalvmHome", home.orElse(""))
+    // The whole directory: the build writes libawt and its companions next to
+    // the executable, and a missing one has to trigger a rebuild.
+    outputs.dir(layout.buildDirectory.dir("native-check"))
     onlyIf("a check program for this OS") { main != null }
     doFirst {
-        val nativeImage = File(home.get(), if (windows) "bin/native-image.cmd" else "bin/native-image")
+        val homeDir = home.orNull ?: throw GradleException("neither GRAALVM_HOME nor JAVA_HOME is set, point GRAALVM_HOME at a GraalVM")
+        val nativeImage = File(homeDir, if (windows) "bin/native-image.cmd" else "bin/native-image")
         check(nativeImage.exists()) { "no native-image at $nativeImage, set GRAALVM_HOME to a GraalVM" }
         (this as Exec).commandLine(
             nativeImage.absolutePath,
@@ -283,9 +351,11 @@ val nativeCheck = tasks.register<Exec>("nativeCheck") {
     usesService(privateSessionBus)
     val bus = privateSessionBus
     val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
     doFirst {
         (this as Exec).commandLine(image.get().asFile.absolutePath)
         if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
             environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
         }
     }
@@ -308,8 +378,12 @@ tasks.register<JavaExec>("nativeAgentRun") {
     usesService(privateSessionBus)
     val bus = privateSessionBus
     val linux = osName.contains("linux")
+    val dbusAvailable = linuxWithDbus
     doFirst {
-        if (linux) (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        if (linux) {
+            check(dbusAvailable) { "the Linux check needs dbus-daemon on PATH for a private session bus" }
+            (this as JavaExec).environment("DBUS_SESSION_BUS_ADDRESS", bus.get().address)
+        }
     }
 }
 

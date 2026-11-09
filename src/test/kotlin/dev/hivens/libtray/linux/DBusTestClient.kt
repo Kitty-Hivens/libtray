@@ -35,6 +35,11 @@ internal class DBusTestClient : AutoCloseable {
         data class UInt32(val value: Int) : Arg
         data class VariantInt32(val value: Int) : Arg
         data object EmptyStringArray : Arg
+        data class Int32Array(val values: List<Int>) : Arg
+        data class Struct(val fields: List<Arg>) : Arg
+
+        /** The `a(isvu)` of a dbusmenu `EventGroup`, one "clicked" event per id. */
+        data class MenuClicks(val ids: List<Int>) : Arg
     }
 
     /**
@@ -155,7 +160,28 @@ internal class DBusTestClient : AutoCloseable {
                 ) as Int
                 bindings.handle("dbus_message_iter_close_container").invokeExact(iter, array) as Int
             }
+            is Arg.Int32Array -> appendArray(arena, iter, "i", arg.values.map { Arg.Int32(it) })
+            is Arg.Struct -> {
+                val struct = arena.allocate(bindings.messageIterLayout)
+                bindings.handle("dbus_message_iter_open_container").invokeExact(
+                    iter, DBusBindings.DBUS_TYPE_STRUCT.toInt(), MemorySegment.NULL, struct,
+                ) as Int
+                for (field in arg.fields) append(arena, struct, field)
+                bindings.handle("dbus_message_iter_close_container").invokeExact(iter, struct) as Int
+            }
+            is Arg.MenuClicks -> appendArray(arena, iter, "(isvu)", arg.ids.map { id ->
+                Arg.Struct(listOf(Arg.Int32(id), Arg.Str("clicked"), Arg.VariantInt32(0), Arg.UInt32(0)))
+            })
         }
+    }
+
+    private fun appendArray(arena: Arena, iter: MemorySegment, elementSignature: String, elements: List<Arg>) {
+        val array = arena.allocate(bindings.messageIterLayout)
+        bindings.handle("dbus_message_iter_open_container").invokeExact(
+            iter, DBusBindings.DBUS_TYPE_ARRAY.toInt(), arena.allocateUtf8(elementSignature), array,
+        ) as Int
+        for (element in elements) append(arena, array, element)
+        bindings.handle("dbus_message_iter_close_container").invokeExact(iter, array) as Int
     }
 
     private fun int(arena: Arena, value: Int): MemorySegment =

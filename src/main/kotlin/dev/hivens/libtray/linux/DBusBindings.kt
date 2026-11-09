@@ -1,5 +1,6 @@
 package dev.hivens.libtray.linux
 
+import dev.hivens.libtray.functionDescriptor
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -11,9 +12,9 @@ import java.lang.invoke.MethodHandle
 
 /**
  * Panama bindings to `libdbus-1` — the reference D-Bus client library
- * shipped on every desktop Linux. Loaded once per process via
- * [DBusBindings.load]; the resulting object holds method handles for the
- * subset of the libdbus API that the SNI backend uses.
+ * shipped on every desktop Linux. Each tray loads its own through
+ * [DBusBindings.load] and closes them with itself. The object holds method
+ * handles for the subset of the libdbus API that the SNI backend uses.
  *
  * Wire-level approach: a polling dispatch loop (`dbus_connection_read_write`
  * + `dbus_connection_pop_message`) so message handling runs on a thread
@@ -40,8 +41,6 @@ internal class DBusBindings internal constructor(
     companion object {
         /** D-Bus bus types from dbus/dbus-shared.h. */
         const val DBUS_BUS_SESSION: Int = 0
-        const val DBUS_BUS_SYSTEM:  Int = 1
-        const val DBUS_BUS_STARTER: Int = 2
 
         /** Message type from dbus/dbus-protocol.h -- only method calls owe a reply. */
         const val DBUS_MESSAGE_TYPE_METHOD_CALL: Int = 1
@@ -81,7 +80,7 @@ internal class DBusBindings internal constructor(
          * the SNI backend uses; expand the set when adding new D-Bus
          * features.
          */
-        private val LOAD_SET: List<Triple<String, java.lang.foreign.MemoryLayout?, List<MemoryLayout>>> = listOf(
+        private val LOAD_SET: List<Triple<String, MemoryLayout?, List<MemoryLayout>>> = listOf(
             // Connection lifecycle
             //
             // We open a PRIVATE connection (dbus_bus_get_private), not the
@@ -185,18 +184,6 @@ internal class DBusBindings internal constructor(
                 ValueLayout.ADDRESS,
                 listOf(ValueLayout.ADDRESS),
             ),
-            Triple("dbus_message_get_destination",
-                ValueLayout.ADDRESS,
-                listOf(ValueLayout.ADDRESS),
-            ),
-            Triple("dbus_message_get_sender",
-                ValueLayout.ADDRESS,
-                listOf(ValueLayout.ADDRESS),
-            ),
-            Triple("dbus_message_get_serial",
-                ValueLayout.JAVA_INT,
-                listOf(ValueLayout.ADDRESS),
-            ),
             Triple("dbus_message_get_no_reply",
                 ValueLayout.JAVA_INT,                          // dbus_bool_t
                 listOf(ValueLayout.ADDRESS),
@@ -274,10 +261,7 @@ internal class DBusBindings internal constructor(
          * source for the GraalVM native-image metadata shipped in the jar.
          */
         internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
-            LOAD_SET.map { (_, ret, args) -> descriptorOf(ret, args) }
-
-        private fun descriptorOf(ret: MemoryLayout?, args: List<MemoryLayout>): FunctionDescriptor =
-            if (ret == null) FunctionDescriptor.ofVoid(*args.toTypedArray()) else FunctionDescriptor.of(ret, *args.toTypedArray())
+            LOAD_SET.map { (_, ret, args) -> functionDescriptor(ret, args) }
 
         /**
          * Load libdbus into a fresh shared arena and bind every symbol in
@@ -296,7 +280,7 @@ internal class DBusBindings internal constructor(
             val linker = Linker.nativeLinker()
             val handles = HashMap<String, MethodHandle>(LOAD_SET.size * 2)
             for ((name, ret, args) in LOAD_SET) {
-                val descriptor = descriptorOf(ret, args)
+                val descriptor = functionDescriptor(ret, args)
                 val symbol = lookup.find(name).orElse(null) ?: run {
                     arena.close()
                     return null

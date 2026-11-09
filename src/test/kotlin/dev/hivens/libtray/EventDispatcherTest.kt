@@ -190,6 +190,21 @@ class EventDispatcherTest {
     }
 
     @Test
+    fun `fire and close work from a thread with its interrupt flag set`() {
+        val received = CountDownLatch(1)
+        dispatcher.subscribe({ received.countDown() })
+
+        Thread.currentThread().interrupt()
+        dispatcher.fire(TrayEvent.Activated)
+        Thread.interrupted() shouldBe true
+        received.await(2, TimeUnit.SECONDS) shouldBe true
+
+        Thread.currentThread().interrupt()
+        dispatcher.close()
+        Thread.interrupted() shouldBe true
+    }
+
+    @Test
     fun `nothing is delivered after close`() {
         val count = AtomicInteger()
         dispatcher.subscribe({ count.incrementAndGet() })

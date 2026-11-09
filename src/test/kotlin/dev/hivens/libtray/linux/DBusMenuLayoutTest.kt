@@ -7,6 +7,7 @@ import io.kotest.matchers.maps.shouldContainExactly
 import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The string-id [TrayMenu] to int-id dbusmenu mapping. Everything the
@@ -117,5 +118,18 @@ class DBusMenuLayoutTest {
         layout.nodeOf(1)!!.label shouldBe "First"
         layout.nodeOf(2)!!.label shouldBe "Second"
         layout.nodeOf(1)!!.originalId shouldBe layout.nodeOf(2)!!.originalId
+    }
+
+    @Test
+    fun `layouts sharing a counter never reuse an id`() {
+        val ids = AtomicInteger(0)
+        val first = DBusMenuLayout(menu, ids)
+        val second = DBusMenuLayout(menu, ids)
+
+        // menu has six items, so the second layout starts at 7.
+        second.childrenOf(0) shouldContainExactly listOf(7, 8, 9, 10)
+        second.nodeOf(1).shouldBeNull()
+        first.nodeOf(7).shouldBeNull()
+        second.nodeOf(7)!!.originalId shouldBe "show"
     }
 }

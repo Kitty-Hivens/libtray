@@ -5,15 +5,16 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.solidPng
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.condition.EnabledOnOs
 import org.junit.jupiter.api.condition.OS
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import javax.imageio.ImageIO
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 /**
  * The Win32 backend on a real Windows session. Clicks are simulated by
@@ -28,7 +29,7 @@ class Win32TrayTest {
         val tray = open()
         try {
             tray.setTooltip("updated") shouldBe true
-            tray.setIcon(icon(16)) shouldBe true
+            tray.setIcon(solidPng(16)) shouldBe true
             tray.setMenu(TrayMenu(TrayMenuItem.Standard("only", "Only"))) shouldBe true
             tray.setMenu(null) shouldBe true
         } finally {
@@ -58,31 +59,74 @@ class Win32TrayTest {
         }
     }
 
-    private fun open(): Tray = Tray.create(
-        TrayBuilder(
-            title = "libtray-win32-test",
-            iconBytes = icon(32),
-            tooltip = "libtray test",
-            menu = TrayMenu(TrayMenuItem.Standard("show", "Show"), TrayMenuItem.Standard("exit", "Exit")),
-        ),
-    ) ?: error("Tray.create returned null: Shell_NotifyIcon is not available in this session")
-
-    /** Post the tray window a callback in the NOTIFYICON_VERSION_4 layout: event in LOWORD(lParam), icon id in HIWORD. */
-    private fun post(tray: Tray, mouseEvent: Int) {
+    @Test
+    fun `close destroys the window and keeps an interrupt flag`() {
+        val tray = open()
         val hwnd = (tray as Win32TrayImpl).windowHandle
+
+        Thread.currentThread().interrupt()
+        tray.close()
+        Thread.interrupted() shouldBe true
+
         val bindings = Win32Bindings.load() ?: error("user32 not loadable")
         try {
-            val lParam = (mouseEvent.toLong() and 0xffff) or (Win32Bindings.TRAY_ICON_UID.toLong() shl 16)
-            val ok = bindings.handle("PostMessageW")
-                .invokeExact(hwnd, Win32Bindings.WM_TRAY_CALLBACK, 0L, lParam) as Int
-            (ok != 0) shouldBe true
+            val posted = bindings.handle("PostMessageW")
+                .invokeExact(hwnd, Win32Bindings.WM_TRAY_CALLBACK, 0L, 0L) as Int
+            posted shouldBe 0
         } finally {
             bindings.arena.close()
         }
     }
 
-    private fun icon(size: Int): ByteArray {
-        val image = BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB)
-        return ByteArrayOutputStream().also { ImageIO.write(image, "PNG", it) }.toByteArray()
+    @Test
+    fun `setters from several threads and a racing close never throw`() {
+        repeat(5) {
+            val tray = open()
+            val failure = AtomicReference<Throwable?>()
+            // One latch per setter: a shared one could be run down by a single
+            // fast setter before the other one had made a call at all.
+            val tooltipStarted = CountDownLatch(1)
+            val iconStarted = CountDownLatch(1)
+            val setters = listOf(
+                thread { hammer(tray, failure, tooltipStarted) { tray.setTooltip("racing") } },
+                thread { hammer(tray, failure, iconStarted) { tray.setIcon(solidPng(16)) } },
+            )
+            try {
+                // close() has to land while both setters are looping, not before they start.
+                tooltipStarted.await(5, TimeUnit.SECONDS) shouldBe true
+                iconStarted.await(5, TimeUnit.SECONDS) shouldBe true
+            } finally {
+                // Also when the wait failed, so the icon and the setters do not
+                // outlive this test.
+                tray.close()
+            }
+            setters.forEach { it.join(5_000) }
+            setters.none { it.isAlive } shouldBe true
+            failure.get() shouldBe null
+        }
+    }
+
+    private fun hammer(tray: Tray, failure: AtomicReference<Throwable?>, started: CountDownLatch, call: () -> Unit) {
+        try {
+            while (tray.isOpen) {
+                call()
+                started.countDown()
+            }
+        } catch (t: Throwable) {
+            failure.set(t)
+        }
+    }
+
+    private fun open(): Tray = Tray.create(
+        TrayBuilder(
+            title = "libtray-win32-test",
+            iconBytes = solidPng(32),
+            tooltip = "libtray test",
+            menu = TrayMenu(TrayMenuItem.Standard("show", "Show"), TrayMenuItem.Standard("exit", "Exit")),
+        ),
+    ) ?: error("Tray.create returned null: Shell_NotifyIcon is not available in this session")
+
+    private fun post(tray: Tray, mouseEvent: Int) {
+        postShellCallback(tray, mouseEvent) shouldBe true
     }
 }

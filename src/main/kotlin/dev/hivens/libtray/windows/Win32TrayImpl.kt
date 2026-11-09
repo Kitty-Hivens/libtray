@@ -9,8 +9,10 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.UpcallTarget
+import dev.hivens.libtray.awaitPastInterrupt
+import dev.hivens.libtray.joinPastInterrupt
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.Linker
 import java.lang.foreign.MemoryLayout
@@ -18,17 +20,13 @@ import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
-import java.lang.invoke.MethodHandles
-import java.lang.invoke.MethodType
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
-import javax.imageio.ImageIO
 
 /**
  * Windows tray backend on top of `Shell_NotifyIcon` + a hidden
@@ -45,11 +43,11 @@ import javax.imageio.ImageIO
  *      presence, no Z-order, but receives `WM_USER+1` dispatches from
  *      Shell_NotifyIcon all the same. Costs nothing visually.
  *   4. Spin a daemon pump thread that drains the window's message queue
- *      via `PeekMessageW` + `DispatchMessageW`.
+ *      via `GetMessageW` + `DispatchMessageW`.
  *   5. WndProc routes `WM_DESTROY` / `WM_USER+1` / `WM_COMMAND` to
  *      Kotlin-side handlers; everything else gets `DefWindowProcW`.
  *   6. `Shell_NotifyIcon` NIM_ADD registers the icon (built from the
- *      builder's PNG via [pngToHicon]), NIM_SETVERSION opts into the
+ *      builder's PNG via [iconPixels] and [createHicon]), NIM_SETVERSION opts into the
  *      v4 mouse-message format, NIM_MODIFY carries later icon / tooltip
  *      changes, and NIM_DELETE removes the entry on [close].
  *
@@ -67,7 +65,7 @@ internal class Win32TrayImpl private constructor(
 
     private val log = LoggerFactory.getLogger("libtray.Win32Tray")
 
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
@@ -111,6 +109,14 @@ internal class Win32TrayImpl private constructor(
     private val notifyIconData: MemorySegment = bindings.arena.allocate(bindings.notifyIconDataLayout)
 
     /**
+     * Guards [notifyIconData], [iconHandle] and the closing of the arena. The
+     * setters may run on any thread and check [open] under it, and close()
+     * clears [open] before taking it, so a setter holding it can rely on the
+     * arena being open.
+     */
+    private val shellLock = Any()
+
+    /**
      * Currently-installed HICON. Replaced atomically when [setIcon]
      * fires; the prior HICON gets DestroyIcon'd on success so we don't
      * leak GDI handles. Initially holds the icon built from the
@@ -132,7 +138,7 @@ internal class Win32TrayImpl private constructor(
      */
     @Volatile private var currentMenu: TrayMenu? = initial.menu
 
-    /** Background pump thread — `PeekMessageW` + `DispatchMessageW` loop. */
+    /** Background pump thread running the `GetMessageW` + `DispatchMessageW` loop. */
     private val pumpThread = Thread({ pumpLoop() }, "libtray-win32-${ProcessHandle.current().pid()}").apply {
         isDaemon = true
     }
@@ -147,37 +153,45 @@ internal class Win32TrayImpl private constructor(
 
     override val isOpen: Boolean get() = open.get()
 
-    override fun setTooltip(text: String): Boolean {
+    override fun setTooltip(text: String): Boolean = synchronized(shellLock) {
         if (!open.get()) return false
         tooltip = text
         writeWideStringField(notifyIconData, "szTip", 128, text)
         notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
-        return shellNotifyIcon(Win32Bindings.NIM_MODIFY)
+        shellNotifyIcon(Win32Bindings.NIM_MODIFY)
     }
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        val newIcon = pngToHicon(IconScaling.fit(iconBytes, initial.maxIconSize, log)) ?: run {
-            log.warn("PNG → HICON conversion returned null; setIcon ignored")
+        // Scaling, decoding and the pixel conversion are plain JVM work and stay
+        // outside the lock. CreateIcon runs under it, so close() cannot free the
+        // arena between creating the HICON and handing it to the shell or
+        // destroying it.
+        val pixels = iconPixels(IconScaling.fit(iconBytes, initial.maxIconSize, log)) ?: run {
+            log.warn("The new icon could not be converted for CreateIcon, setIcon ignored")
             return false
         }
-        // Atomically swap the icon handle; destroy the old one only after
-        // the swap succeeds so we never have the struct pointing at a
-        // freed HICON. CompareAndSet not needed — setIcon serialised by
-        // caller convention (single tray-control path).
-        val prev = iconHandle.getAndSet(newIcon)
-        notifyIconData.set(
-            ValueLayout.ADDRESS,
-            bindings.notifyIconDataLayout.byteOffset(MemoryLayout.PathElement.groupElement("hIcon")),
-            newIcon,
-        )
-        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
-        val ok = shellNotifyIcon(Win32Bindings.NIM_MODIFY)
-        if (prev != null && prev.address() != 0L) {
-            runCatching { bindings.handle("DestroyIcon").invokeExact(prev) as Int }
+        return synchronized(shellLock) {
+            if (!open.get()) return false
+            val newIcon = createHicon(pixels) ?: return false
+            // Destroy the old icon only after the shell has the new one, so
+            // the struct never points at a freed HICON.
+            val prev = iconHandle.getAndSet(newIcon)
+            notifyIconData.set(
+                ValueLayout.ADDRESS,
+                bindings.notifyIconDataLayout.byteOffset(MemoryLayout.PathElement.groupElement("hIcon")),
+                newIcon,
+            )
+            notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
+            val ok = shellNotifyIcon(Win32Bindings.NIM_MODIFY)
+            prev?.let(::destroyIcon)
+            ok
         }
-        return ok
+    }
+
+    private fun destroyIcon(icon: MemorySegment) {
+        if (icon.address() != 0L) runCatching { bindings.handle("DestroyIcon").invokeExact(icon) as Int }
     }
 
     override fun setMenu(menu: TrayMenu?): Boolean {
@@ -198,19 +212,17 @@ internal class Win32TrayImpl private constructor(
         // HWND is destroyed the shell may still hold an entry pointed at
         // a stale handle, which can leave a ghost icon until the next
         // explorer.exe restart. NIM_DELETE first is the documented order.
-        runCatching { shellNotifyIcon(Win32Bindings.NIM_DELETE) }
-        iconHandle.getAndSet(null)?.let { hicon ->
-            if (hicon.address() != 0L) {
-                runCatching { bindings.handle("DestroyIcon").invokeExact(hicon) as Int }
-            }
+        synchronized(shellLock) {
+            runCatching { shellNotifyIcon(Win32Bindings.NIM_DELETE) }
+            iconHandle.getAndSet(null)?.let(::destroyIcon)
         }
-        // Post WM_CLOSE so the pump thread wakes up out of PeekMessage
-        // and exits cleanly. DefWindowProc translates WM_CLOSE → DestroyWindow,
-        // which fires WM_DESTROY on the same thread → PostQuitMessage(0)
-        // in the WndProc → pump sees WM_QUIT → loop exits.
+        // Post WM_CLOSE so the pump thread wakes up out of GetMessage
+        // and exits cleanly. DefWindowProc translates WM_CLOSE -> DestroyWindow,
+        // which fires WM_DESTROY on the same thread -> PostQuitMessage(0)
+        // in the WndProc -> GetMessage returns 0 -> loop exits.
         // If a context menu is open, the pump thread is parked inside
         // TrackPopupMenu's own modal loop and will never see WM_CLOSE, so
-        // pumpThread.join(2_000) below would time out for as long as the user
+        // the join below would time out for as long as the user
         // holds the menu. WM_CANCELMODE posted to the owner window is the
         // documented cross-thread way to cancel a tracked popup menu, so
         // TrackPopupMenu returns and the pump can then process WM_CLOSE.
@@ -234,7 +246,18 @@ internal class Win32TrayImpl private constructor(
                 ) as Int
             }
         }
-        pumpThread.join(2_000)
+        // Everything after the join frees what a live pump thread is still
+        // using: its WndProc looks the instance up in HWND_INSTANCES, the class
+        // cannot be unregistered while its window exists, and the arena cannot
+        // close while GetMessageW holds the MSG buffer. Leak them instead.
+        if (!pumpThread.joinPastInterrupt(PUMP_JOIN_TIMEOUT_MS)) {
+            log.warn(
+                "libtray-win32 did not stop within {} ms. Leaving its window class and native handles " +
+                    "allocated, the icon is gone either way.",
+                PUMP_JOIN_TIMEOUT_MS,
+            )
+            return
+        }
         HWND_INSTANCES.remove(hwnd.address())
         // Class is per-instance; unregister so a fresh Tray.create can
         // re-register the same name without ERROR_CLASS_ALREADY_EXISTS.
@@ -245,8 +268,9 @@ internal class Win32TrayImpl private constructor(
         // NOTIFYICONDATA struct). Safe now that the window is destroyed and the
         // pump thread joined, so no WndProc will dereference these handles
         // again. The process-wide WndProc upcall stub lives in its own arena
-        // (ensureWndProcStub) and is deliberately left open.
-        runCatching { bindings.arena.close() }
+        // (ensureWndProcStub) and is deliberately left open. Under the lock, so
+        // a setter that got past its own open check finishes first.
+        synchronized(shellLock) { runCatching { bindings.arena.close() } }
     }
 
     // ── Shell_NotifyIcon helpers ─────────────────────────────────────────
@@ -255,7 +279,7 @@ internal class Win32TrayImpl private constructor(
         return runCatching {
             (bindings.handle("Shell_NotifyIconW").invokeExact(message, notifyIconData) as Int) != 0
         }.getOrElse { t ->
-            log.warn("Shell_NotifyIcon (msg={}) threw: {}", message, t.message)
+            log.warn("Shell_NotifyIcon (msg={}) threw", message, t)
             false
         }
     }
@@ -319,8 +343,12 @@ internal class Win32TrayImpl private constructor(
     // default only applies to DIBs (CreateDIBitmap with positive height).
     // Feeding bottom-up rows here paints the glyph upside down (issue #4).
 
-    private fun pngToHicon(bytes: ByteArray): MemorySegment? {
-        val img = runCatching { ImageIO.read(ByteArrayInputStream(bytes)) }.getOrNull() ?: run {
+    /** An icon converted to the two bitmaps CreateIcon takes. */
+    private class IconPixels(val width: Int, val height: Int, val xorBytes: ByteArray, val andBytes: ByteArray)
+
+    /** Decode [bytes] and convert them for CreateIcon. JVM work only, no native call. */
+    private fun iconPixels(bytes: ByteArray): IconPixels? {
+        val img = runCatching { IconScaling.decode(bytes) }.getOrNull() ?: run {
             log.warn("ImageIO could not decode PNG ({} bytes)", bytes.size)
             return null
         }
@@ -355,21 +383,25 @@ internal class Win32TrayImpl private constructor(
         // tells Windows "use alpha from XOR bits"; correct on Vista+.
         val maskScanline = ((w + 31) / 32) * 4
         val andBytes = ByteArray(maskScanline * h)
+        return IconPixels(w, h, xorBytes, andBytes)
+    }
 
-        // Confined arena for the bitmap bytes — CreateIcon copies them
+    /** CreateIcon from converted pixels. Callers hold [shellLock], since this uses the arena. */
+    private fun createHicon(pixels: IconPixels): MemorySegment? {
+        // Confined arena for the bitmap bytes. CreateIcon copies them
         // into the icon resource synchronously, so we can free as soon
         // as the call returns. Without this they'd accumulate in
-        // bindings.arena (shared, JVM-lifetime) on every setIcon call —
-        // ~4KB per 32x32 update, which adds up on apps that animate the
-        // tray glyph.
+        // bindings.arena (shared, JVM-lifetime) on every setIcon call,
+        // about 4KB per 32x32 update, which adds up on apps that animate
+        // the tray glyph.
         val createIcon = bindings.handle("CreateIcon")
         val hicon = Arena.ofConfined().use { tmp ->
-            val xorSeg = tmp.allocate(xorBytes.size.toLong())
-            xorSeg.asByteBuffer().put(xorBytes)
-            val andSeg = tmp.allocate(andBytes.size.toLong())
-            andSeg.asByteBuffer().put(andBytes)
+            val xorSeg = tmp.allocate(pixels.xorBytes.size.toLong())
+            xorSeg.asByteBuffer().put(pixels.xorBytes)
+            val andSeg = tmp.allocate(pixels.andBytes.size.toLong())
+            andSeg.asByteBuffer().put(pixels.andBytes)
             createIcon.invokeExact(
-                hInstance, w, h, 1.toByte(), 32.toByte(), andSeg, xorSeg,
+                hInstance, pixels.width, pixels.height, 1.toByte(), 32.toByte(), andSeg, xorSeg,
             ) as MemorySegment
         }
         if (hicon.address() == 0L) {
@@ -397,67 +429,76 @@ internal class Win32TrayImpl private constructor(
         HWND_INSTANCES[createdHwnd.address()] = this
         log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
 
-        val initialIcon = pngToHicon(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
-        if (initialIcon == null) {
-            log.warn("PNG → HICON conversion returned null; tray entry will register without an icon")
-        } else {
-            iconHandle.set(initialIcon)
+        val initialPixels = iconPixels(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
+        // Under the lock and only while open. Once a create() that gave up on a
+        // slow startup has called close(), an icon added here would outlive the
+        // tray close() just tore down, whichever of the two got the lock first.
+        val nimAddOk: Boolean? = synchronized(shellLock) {
+            if (!open.get()) return@synchronized null
+            val initialIcon = initialPixels?.let(::createHicon)
+            if (initialIcon == null) {
+                log.warn("The initial icon could not be created, the tray entry will register without one")
+            } else {
+                iconHandle.set(initialIcon)
+            }
+            initNotifyIconData(initialIcon)
+            val added = shellNotifyIcon(Win32Bindings.NIM_ADD)
+            if (!added) {
+                // Not a reason to stop the pump: the caller sees
+                // creationSucceeded=false from Companion.create and decides
+                // how to degrade.
+                log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
+            } else {
+                log.info("Shell_NotifyIcon NIM_ADD succeeded (uID={})", Win32Bindings.TRAY_ICON_UID)
+            }
+            // NIM_SETVERSION must come AFTER NIM_ADD per MSDN. It switches
+            // the icon entry to NOTIFYICON_VERSION_4 mouse-message format.
+            version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
+            if (!version4) {
+                log.info("Shell_NotifyIcon NIM_SETVERSION failed, legacy mouse messages will be used")
+            }
+            added
         }
-
-        initNotifyIconData(initialIcon)
-        val nimAddOk = shellNotifyIcon(Win32Bindings.NIM_ADD)
-        if (!nimAddOk) {
-            log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
-            // Don't bail — even a failed NIM_ADD shouldn't tear down the
-            // pump; the caller will see creationSucceeded=false from
-            // Companion.create and decide how to degrade.
-        } else {
-            log.info("Shell_NotifyIcon NIM_ADD succeeded (uID={})", Win32Bindings.TRAY_ICON_UID)
-        }
-        // NIM_SETVERSION must come AFTER NIM_ADD per MSDN; it switches
-        // the icon entry to NOTIFYICON_VERSION_4 mouse-message format.
-        version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
-        if (!version4) {
-            log.info("Shell_NotifyIcon NIM_SETVERSION failed; legacy mouse messages will be used")
+        if (nimAddOk == null) {
+            // close() may have run before the window existed and posted nothing
+            // that would end this thread, so take the window down here. Anything
+            // it did post goes away with the window.
+            runCatching { bindings.handle("DestroyWindow").invokeExact(createdHwnd) as Int }
+            HWND_INSTANCES.remove(createdHwnd.address())
+            readyLatch.countDown()
+            return
         }
 
         creationSucceeded = nimAddOk
         readyLatch.countDown()
 
-        // ── Phase 2: drain message queue until close() ────────────────────
+        // ── Phase 2: drain message queue until WM_QUIT ────────────────────
+        // GetMessage sleeps until there is a message, so an idle tray costs no
+        // wakeups. close() ends the loop by destroying the window, whose
+        // WM_DESTROY posts the WM_QUIT that makes GetMessage return 0.
         val msg = bindings.arena.allocate(bindings.msgLayout)
-        val peekMessage = bindings.handle("PeekMessageW")
+        val getMessage = bindings.handle("GetMessageW")
         val translateMessage = bindings.handle("TranslateMessage")
         val dispatchMessage = bindings.handle("DispatchMessageW")
-        val msgOffset = bindings.msgLayout.byteOffset(
-            MemoryLayout.PathElement.groupElement("message"),
-        )
-        while (open.get()) {
+        while (true) {
             try {
-                val gotMessage = peekMessage.invokeExact(
+                val got = getMessage.invokeExact(
                     msg,
                     MemorySegment.NULL,                      // any of this thread's windows
                     0,                                        // wMsgFilterMin
                     0,                                        // wMsgFilterMax
-                    Win32Bindings.PM_REMOVE,
                 ) as Int
-                if (gotMessage == 0) {
-                    // Queue empty — yield rather than spin. 16ms ≈ 60Hz
-                    // wake rate; bursty events still feel instant, idle
-                    // CPU stays in the noise.
-                    Thread.sleep(16)
-                    continue
-                }
-                val msgId = msg.get(ValueLayout.JAVA_INT, msgOffset)
-                if (msgId == Win32Bindings.WM_QUIT) break
+                if (got == 0) return
+                check(got != -1) { "GetMessageW failed (GetLastError=${lastError()})" }
                 translateMessage.invokeExact(msg) as Int
                 dispatchMessage.invokeExact(msg) as Long
             } catch (t: Throwable) {
-                log.warn("Win32 pump iteration threw: {}", t.message)
-                // Back off. Without this a permanently-failing call -- a
-                // closed arena after a failed create, say -- spins this
-                // daemon thread at 100% for the life of the process,
-                // writing a warn line per iteration.
+                log.warn("Win32 pump iteration threw: {}", t.toString())
+                log.debug("Win32 pump iteration threw", t)
+                if (!open.get()) return
+                // Back off. Without this a permanently-failing call spins this
+                // daemon thread at 100% for the life of the process, writing a
+                // warn line per iteration.
                 Thread.sleep(500)
             }
         }
@@ -484,7 +525,7 @@ internal class Win32TrayImpl private constructor(
                 hInstance,                              // hInstance
                 MemorySegment.NULL,                     // lpParam
             ) as MemorySegment
-        }.onFailure { log.warn("CreateWindowExW threw: {}", it.message) }.getOrNull()
+        }.onFailure { log.warn("CreateWindowExW threw", it) }.getOrNull()
     }
 
     // ── WndProc dispatch (called from the upcall stub) ───────────────────
@@ -666,6 +707,15 @@ internal class Win32TrayImpl private constructor(
         private val log = LoggerFactory.getLogger("libtray.Win32Tray")
         private val classCounter = AtomicInteger(0)
 
+        /** How long close() waits for the pump thread before leaving its resources allocated. */
+        private const val PUMP_JOIN_TIMEOUT_MS: Long = 2_000
+
+        /** How long create() waits for the pump thread to bring the window and icon up. */
+        private const val READY_TIMEOUT_MS: Long = 5_000
+
+        /** The one upcall libtray needs on Windows: the OS calls it for every message to our windows. */
+        internal val WND_PROC = UpcallTarget(Win32TrayImpl::class.java, "wndProcEntry", Win32Bindings.WNDPROC_DESCRIPTOR)
+
         /**
          * HWND address → instance map. The WndProc upcall stub gets
          * called by Windows with the HWND as its first argument; we
@@ -700,8 +750,10 @@ internal class Win32TrayImpl private constructor(
                 return try {
                     inst.handleMessage(uMsg, wParam, lParam)
                 } catch (t: Throwable) {
-                    log.warn("WndProc dispatch threw, falling back to DefWindowProc: {}", t.message)
-                    inst.defWindowProc(uMsg, wParam, lParam)
+                    log.warn("WndProc dispatch threw, falling back to DefWindowProc", t)
+                    // Not the instance's handle: that may be what just threw, and
+                    // an exception leaving this upcall ends the JVM.
+                    wndProcDefaultFallback(hwnd, uMsg, wParam, lParam)
                 }
             }
             // No instance recorded yet — happens for the WM_GETMINMAXINFO
@@ -711,7 +763,8 @@ internal class Win32TrayImpl private constructor(
         }
 
         /**
-         * Pre-instance DefWindowProc, resolved onto the same process-lifetime
+         * DefWindowProc for messages with no instance yet, and the fallback when
+         * an instance's dispatch throws. Resolved onto the same process-lifetime
          * arena as the WndProc stub.
          *
          * It must NOT come from a Win32Bindings instance: those arenas are
@@ -741,22 +794,20 @@ internal class Win32TrayImpl private constructor(
                 return null
             }
 
+            var constructed = false
             val tray = runCatching {
-                createInternal(bindings, builder)
+                createInternal(bindings, builder) { constructed = true }
             }.onFailure { t ->
-                log.warn("Win32 tray construction threw: {}", t.message)
+                log.warn("Win32 tray construction threw", t)
             }.getOrNull()
-            if (tray == null) {
-                // No instance owns the arena, so nothing will ever close it.
-                // Win32TrayImpl.close() closes the arena on the paths where an
-                // instance WAS constructed, so a second close here is a no-op
-                // the runCatching swallows.
-                runCatching { bindings.arena.close() }
-            }
+            // Once an instance exists its close() owns the arena, and may have
+            // left it open on purpose for a pump thread that is still running.
+            // Before that, nothing else will ever close it.
+            if (tray == null && !constructed) runCatching { bindings.arena.close() }
             return tray
         }
 
-        private fun createInternal(bindings: Win32Bindings, builder: TrayBuilder): Tray? {
+        private fun createInternal(bindings: Win32Bindings, builder: TrayBuilder, onConstructed: () -> Unit): Tray? {
             val arena = bindings.arena
 
             // hInstance — HMODULE of the calling EXE. Passing NULL to
@@ -770,7 +821,7 @@ internal class Win32TrayImpl private constructor(
             }
 
             // Build the WndProc upcall stub once per JVM, lazily.
-            val (stub, _) = ensureWndProcStub(bindings) ?: run {
+            val (stub, _) = ensureWndProcStub() ?: run {
                 log.warn("Could not create WndProc upcall stub")
                 return null
             }
@@ -808,12 +859,13 @@ internal class Win32TrayImpl private constructor(
             log.info("Win32 window class registered: {}", className)
 
             val instance = Win32TrayImpl(bindings, classNameSeg, hInstance, builder)
-            // Wait for the pump thread to finish window creation +
+            onConstructed()
+            // Wait for the pump thread to finish window creation and
             // NIM_ADD before handing the Tray back to the caller. 5s
-            // is generous — these calls return synchronously from the
+            // is generous, since these calls return synchronously from the
             // shell and complete in the millisecond range when they
             // succeed at all.
-            if (!instance.readyLatch.await(5, TimeUnit.SECONDS)) {
+            if (!instance.readyLatch.awaitPastInterrupt(READY_TIMEOUT_MS)) {
                 log.warn("Win32 tray pump thread did not signal ready within 5s; tearing down")
                 instance.close()
                 return null
@@ -834,35 +886,24 @@ internal class Win32TrayImpl private constructor(
          * the single stub instead of each allocating its own.
          */
         @Synchronized
-        private fun ensureWndProcStub(bindings: Win32Bindings): Pair<MemorySegment, Arena>? {
+        private fun ensureWndProcStub(): Pair<MemorySegment, Arena>? {
             wndProcStub?.let { stub -> wndProcArena?.let { arena -> return stub to arena } }
             return runCatching {
-                val handle = MethodHandles.lookup().findStatic(
-                    Win32TrayImpl::class.java,
-                    "wndProcEntry",
-                    MethodType.methodType(
-                        Long::class.javaPrimitiveType!!,
-                        MemorySegment::class.java,
-                        Int::class.javaPrimitiveType!!,
-                        Long::class.javaPrimitiveType!!,
-                        Long::class.javaPrimitiveType!!,
-                    ),
-                )
                 val arena = Arena.ofShared()
-                val stub = Linker.nativeLinker().upcallStub(handle, bindings.wndProcDescriptor, arena)
+                val stub = WND_PROC.stub(arena)
                 // Same arena, so the fallback stays callable for as long as
                 // the stub the OS holds -- see defWindowProcHandle's KDoc.
                 defWindowProcHandle = SymbolLookup.libraryLookup("user32", arena)
                     .find("DefWindowProcW")
                     .map { symbol ->
-                        Linker.nativeLinker().downcallHandle(symbol, bindings.defWindowProcDescriptor)
+                        Linker.nativeLinker().downcallHandle(symbol, Win32Bindings.WNDPROC_DESCRIPTOR)
                     }
                     .orElse(null)
                 wndProcStub = stub
                 wndProcArena = arena
                 stub to arena
             }.onFailure {
-                log.warn("WndProc upcall stub creation failed: {}", it.message)
+                log.warn("WndProc upcall stub creation failed", it)
             }.getOrNull()
         }
 

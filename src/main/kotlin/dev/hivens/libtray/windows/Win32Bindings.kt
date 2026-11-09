@@ -1,5 +1,6 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.functionDescriptor
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -10,14 +11,14 @@ import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
 
 /**
- * Panama bindings to the three Win32 system DLLs the tray backend needs.
- * Loaded once per process via [Win32Bindings.load]; the resulting object
- * holds method handles for the subset of `user32`/`shell32`/`gdi32`/
+ * Panama bindings to the Win32 system DLLs the tray backend needs. Each tray
+ * loads its own through [Win32Bindings.load] and closes them with itself. The
+ * object holds method handles for the subset of `user32`/`shell32`/`gdi32`/
  * `kernel32` the [Win32TrayImpl] uses.
  *
  * Wire-level approach: a hidden message-only `HWND_MESSAGE` window
  * receives `Shell_NotifyIcon` callbacks (`WM_USER+1` and friends), with a
- * `PeekMessageW`/`DispatchMessageW` pump on a daemon thread we own.
+ * `GetMessageW`/`DispatchMessageW` pump on a daemon thread we own.
  * Unlike the Linux SNI design, Win32 unavoidably needs ONE Panama upcall
  * stub — the WndProc — because Windows calls into the WndProc
  * synchronously to dispatch each message. The single stub routes by
@@ -45,7 +46,6 @@ internal class Win32Bindings private constructor(
 
         const val WM_DESTROY:    Int = 0x0002
         const val WM_CLOSE:      Int = 0x0010
-        const val WM_QUIT:       Int = 0x0012
         // Posted to the menu's owner window to cancel a tracking popup from
         // another thread -- the cross-thread way out of TrackPopupMenu.
         const val WM_CANCELMODE: Int = 0x001F
@@ -64,9 +64,6 @@ internal class Win32Bindings private constructor(
         // window can still receive WM_USER messages from Shell_NotifyIcon.
 
         val HWND_MESSAGE: MemorySegment = MemorySegment.ofAddress(-3L)
-
-        // CW_USEDEFAULT for x/y/width/height. Values are signed 32-bit.
-        const val CW_USEDEFAULT: Int = 0x80000000.toInt()
 
         /**
          * Library names — Win32 system DLLs. JDK's `SymbolLookup.libraryLookup`
@@ -135,14 +132,13 @@ internal class Win32Bindings private constructor(
             ),
 
             // ── user32: message pump ───────────────────────────────────────
-            Triple("PeekMessageW",
-                ValueLayout.JAVA_INT,                                       // BOOL
+            Triple("GetMessageW",
+                ValueLayout.JAVA_INT,                                       // BOOL: 0 for WM_QUIT, -1 on error
                 listOf(
                     ValueLayout.ADDRESS,     // LPMSG
                     ValueLayout.ADDRESS,     // HWND filter (NULL = all)
                     ValueLayout.JAVA_INT,    // UINT wMsgFilterMin
                     ValueLayout.JAVA_INT,    // UINT wMsgFilterMax
-                    ValueLayout.JAVA_INT,    // UINT wRemoveMsg
                 ),
             ),
             Triple("TranslateMessage",
@@ -229,11 +225,9 @@ internal class Win32Bindings private constructor(
         const val MF_POPUP:     Int = 0x00000010
         const val MF_SEPARATOR: Int = 0x00000800
         const val MF_GRAYED:    Int = 0x00000001
-        const val MF_DISABLED:  Int = 0x00000002
 
         const val TPM_RIGHTBUTTON: Int = 0x0002
         const val TPM_RETURNCMD:   Int = 0x0100
-        const val TPM_NONOTIFY:    Int = 0x0080
 
         // ── Shell_NotifyIcon constants from shellapi.h ─────────────────────
 
@@ -245,7 +239,6 @@ internal class Win32Bindings private constructor(
         const val NIF_MESSAGE: Int = 0x00000001
         const val NIF_ICON:    Int = 0x00000002
         const val NIF_TIP:     Int = 0x00000004
-        const val NIF_STATE:   Int = 0x00000008
 
         /**
          * `NIF_SHOWTIP` (Vista+): show the standard tooltip even when the
@@ -274,13 +267,9 @@ internal class Win32Bindings private constructor(
         /** Custom message id Shell_NotifyIcon dispatches to our WndProc. */
         const val WM_TRAY_CALLBACK: Int = WM_USER + 1
 
-        /** PeekMessage flags from winuser.h. */
-        const val PM_NOREMOVE: Int = 0x0000
-        const val PM_REMOVE:   Int = 0x0001
-
         /**
          * `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)`, which is
-         * also the shape of `DefWindowProcW`. See [wndProcDescriptor].
+         * also the shape of `DefWindowProcW`.
          */
         internal val WNDPROC_DESCRIPTOR: FunctionDescriptor = FunctionDescriptor.of(
             ValueLayout.JAVA_LONG,                                  // LRESULT
@@ -289,15 +278,11 @@ internal class Win32Bindings private constructor(
         )
 
         /**
-         * Every downcall shape this backend binds: [LOAD_SET] plus the
-         * pre-instance `DefWindowProcW`. Also the source for the GraalVM
-         * native-image metadata shipped in the jar.
+         * Every downcall shape this backend binds. Also the source for the
+         * GraalVM native-image metadata shipped in the jar.
          */
         internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
-            LOAD_SET.map { (_, ret, args) -> descriptorOf(ret, args) } + WNDPROC_DESCRIPTOR
-
-        private fun descriptorOf(ret: MemoryLayout?, args: List<MemoryLayout>): FunctionDescriptor =
-            if (ret == null) FunctionDescriptor.ofVoid(*args.toTypedArray()) else FunctionDescriptor.of(ret, *args.toTypedArray())
+            LOAD_SET.map { (_, ret, args) -> functionDescriptor(ret, args) }
 
         /**
          * Load the Win32 DLLs into a fresh shared arena and bind every
@@ -320,7 +305,7 @@ internal class Win32Bindings private constructor(
             val linker = Linker.nativeLinker()
             val handles = HashMap<String, MethodHandle>(LOAD_SET.size * 2)
             for ((name, ret, args) in LOAD_SET) {
-                val descriptor = descriptorOf(ret, args)
+                val descriptor = functionDescriptor(ret, args)
                 // Walk the loaded DLL list — symbol could be in any of them
                 // (kernel32 has GetModuleHandle, user32 has the rest, etc).
                 val symbol = combined.firstNotNullOfOrNull { it.find(name).orElse(null) }
@@ -355,7 +340,7 @@ internal class Win32Bindings private constructor(
     )
 
     /**
-     * MSG from winuser.h — populated by PeekMessageW / GetMessageW. POINT
+     * MSG from winuser.h, populated by GetMessageW. POINT
      * is two LONGs; lPrivate is undocumented padding the kernel reserves.
      *
      * ```c
@@ -381,29 +366,6 @@ internal class Win32Bindings private constructor(
         ValueLayout.JAVA_INT.withName("pt_y"),
         ValueLayout.JAVA_INT.withName("lPrivate"),
     )
-
-    // ── Upcall stub: WndProc ───────────────────────────────────────────────
-    //
-    // The single Panama upcall stub libtray needs on Windows. Hands the
-    // callable C function pointer to RegisterClassExW.lpfnWndProc; the
-    // OS calls it synchronously for every message dispatched to our
-    // window. Implementing it as a plain Java MethodHandle keeps the
-    // routing logic in Kotlin where it belongs.
-
-    /**
-     * `LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM)` descriptor —
-     * matches the C calling convention of `WNDPROC` in winuser.h. Used as
-     * the function descriptor for [Linker.upcallStub].
-     */
-    val wndProcDescriptor: FunctionDescriptor = WNDPROC_DESCRIPTOR
-
-    /**
-     * `LRESULT DefWindowProcW(HWND, UINT, WPARAM, LPARAM)` — same shape as
-     * [wndProcDescriptor] minus the callback direction. Declared here so the
-     * pre-instance fallback in [Win32TrayImpl] can bind the symbol onto its
-     * own process-lifetime arena instead of borrowing a per-Tray one.
-     */
-    val defWindowProcDescriptor: FunctionDescriptor = WNDPROC_DESCRIPTOR
 
     /**
      * `NOTIFYICONDATAW` from shellapi.h — the parameter to

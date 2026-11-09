@@ -24,6 +24,7 @@ jobs:
   publish:
     name: Publish to Maven Central
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     environment: maven-central
     # contents: write is what lets the last step create the release page.
     permissions:

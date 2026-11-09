@@ -9,18 +9,16 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.UpcallTarget
+import dev.hivens.libtray.awaitPastInterrupt
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
-import java.lang.foreign.Linker
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
-import java.lang.invoke.MethodHandles
-import java.lang.invoke.MethodType
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -79,22 +77,26 @@ internal class AppKitTrayImpl private constructor(
 
     private val log = LoggerFactory.getLogger("libtray.AppKitTray")
 
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
 
     /** Set by the one [tearDown] that runs, wherever close() ended up running it. */
     private val tornDown = AtomicBoolean(false)
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
-     * Per-item tag → libtray id. Tags grow monotonically from 1 within
-     * an instance and are rebuilt on every [setMenu]; the upcall
-     * handler walks live instances to find the owner.
+     * Per-item tag -> libtray id, rebuilt on every [setMenu]. The upcall
+     * handler walks live instances to find the owner, which works because
+     * [nextTag] is shared by all of them.
      */
     private val tagToId = ConcurrentHashMap<Int, String>()
-    private val nextTag = AtomicInteger(1)
 
     /** Currently-installed NSMenu* (retained), or NULL when no menu set. */
     @Volatile private var currentMenu: MemorySegment = MemorySegment.NULL
+
+    /** For the macOS check, which drives the native objects directly. */
+    internal val currentMenuHandle: MemorySegment get() = currentMenu
+    internal val statusButtonHandle: MemorySegment get() = statusButton
+    internal val statusViewHandle: MemorySegment get() = statusView
 
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
@@ -144,14 +146,14 @@ internal class AppKitTrayImpl private constructor(
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
         return runCatching { applyIcon(iconBytes); true }.getOrElse { t ->
-            log.warn("setIcon threw: {}", t.message); false
+            log.warn("setIcon threw", t); false
         }
     }
 
     override fun setTooltip(text: String): Boolean {
         if (!open.get()) return false
         return runCatching { applyTooltip(text); true }.getOrElse { t ->
-            log.warn("setTooltip threw: {}", t.message); false
+            log.warn("setTooltip threw", t); false
         }
     }
 
@@ -161,7 +163,7 @@ internal class AppKitTrayImpl private constructor(
             if (menu == null) clearMenu() else applyMenu(menu)
             true
         }.getOrElse { t ->
-            log.warn("setMenu threw: {}", t.message); false
+            log.warn("setMenu threw", t); false
         }
     }
 
@@ -177,11 +179,9 @@ internal class AppKitTrayImpl private constructor(
         tearDownOnMainThread()
         // The ObjcBindings arena is deliberately NOT closed here (unlike the
         // Linux / Win32 backends). runOnMainQueue can leave actions queued on
-        // the GCD main queue that still reference this instance's msgSend
-        // handles, and the menu-target class + its upcall stub are already
-        // process-lifetime; closing the arena would risk a use-after-free for a
-        // deferred action. The cost is a one-time set of downcall handles,
-        // reclaimed at process exit.
+        // the GCD main queue that still use the msgSend handles, and the
+        // menu-target class + its upcall stub are already process-lifetime.
+        // All trays share one set of bindings, see sharedBindings.
     }
 
     /**
@@ -194,9 +194,9 @@ internal class AppKitTrayImpl private constructor(
      * item. Waiting keeps close() synchronous: the icon is gone when it
      * returns. The wait is bounded because a main thread that is blocked,
      * or a process that never runs a Cocoa loop, would otherwise hang the
-     * caller. On timeout the teardown runs on the calling thread instead,
-     * since leaving the icon up is worse, and [tornDown] keeps the queued
-     * copy from running it a second time.
+     * caller. On timeout, or when the teardown could not be queued at all, it
+     * runs on the calling thread instead, since leaving the icon up is worse,
+     * and [tornDown] keeps a queued copy from running it a second time.
      */
     private fun tearDownOnMainThread() {
         if (isCocoaMainThread(bindings) || bindings.mainQueue.address() == 0L) {
@@ -211,11 +211,18 @@ internal class AppKitTrayImpl private constructor(
                 done.countDown()
             }
         }
-        if (enqueued && done.await(CLOSE_ON_MAIN_TIMEOUT_MS, TimeUnit.MILLISECONDS)) return
-        log.warn(
-            "Cocoa main queue did not run the tray teardown within {} ms; tearing down on {} instead",
-            CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
-        )
+        if (enqueued && done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) return
+        if (enqueued) {
+            log.warn(
+                "Cocoa main queue did not run the tray teardown within {} ms, tearing down on {} instead",
+                CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
+            )
+        } else {
+            log.warn(
+                "Could not queue the tray teardown on the Cocoa main queue, tearing down on {} instead",
+                Thread.currentThread().name,
+            )
+        }
         tearDown()
     }
 
@@ -554,7 +561,7 @@ internal class AppKitTrayImpl private constructor(
                 ) as Unit
             }
         }.onFailure {
-            log.warn("Installing the status item click handling failed, clicks will not reach the app: {}", it.message)
+            log.warn("Installing the status item click handling failed, clicks will not reach the app", it)
         }
     }
 
@@ -754,6 +761,9 @@ internal class AppKitTrayImpl private constructor(
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
         private val instanceCounter = AtomicInteger(0)
 
+        /** Next `NSMenuItem` tag. Process-wide: the tag alone has to identify the owning tray. */
+        private val nextTag = AtomicInteger(1)
+
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
 
@@ -767,6 +777,11 @@ internal class AppKitTrayImpl private constructor(
          */
         internal val OBJC_METHOD_DESCRIPTOR: FunctionDescriptor =
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
+
+        private val DISPATCH_TRAMPOLINE = UpcallTarget(AppKitTrayImpl::class.java, "dispatchTrampoline", TRAMPOLINE_DESCRIPTOR)
+        private val ON_MENU_ITEM = UpcallTarget(AppKitTrayImpl::class.java, "onMenuItemEntry", OBJC_METHOD_DESCRIPTOR)
+        private val ON_STATUS_ITEM_CLICK = UpcallTarget(AppKitTrayImpl::class.java, "onStatusItemClickEntry", OBJC_METHOD_DESCRIPTOR)
+        private val ON_STATUS_VIEW_MOUSE = UpcallTarget(AppKitTrayImpl::class.java, "onStatusViewMouseEntry", OBJC_METHOD_DESCRIPTOR)
 
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
@@ -794,7 +809,7 @@ internal class AppKitTrayImpl private constructor(
         @JvmStatic
         fun dispatchTrampoline(context: MemorySegment) {
             val action = PENDING.remove(context.address()) ?: return
-            runCatching { action() }.onFailure { log.warn("main-queue action threw: {}", it.message) }
+            runCatching { action() }.onFailure { log.warn("main-queue action threw", it) }
         }
 
         /** The single shared upcall stub bridging GCD to [dispatchTrampoline]. Built once, process-lifetime. */
@@ -802,11 +817,7 @@ internal class AppKitTrayImpl private constructor(
         private fun dispatchTrampolineStub(): MemorySegment {
             trampolineStub?.let { return it }
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java, "dispatchTrampoline",
-                MethodType.methodType(Void.TYPE, MemorySegment::class.java),
-            )
-            val stub = Linker.nativeLinker().upcallStub(handle, TRAMPOLINE_DESCRIPTOR, arena)
+            val stub = DISPATCH_TRAMPOLINE.stub(arena)
             trampolineArena = arena
             trampolineStub = stub
             return stub
@@ -834,17 +845,19 @@ internal class AppKitTrayImpl private constructor(
         @JvmStatic
         @Suppress("unused", "UNUSED_PARAMETER")
         fun onMenuItemEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
-            val bindings = lastBindings ?: return
+            val bindings = sharedBindings ?: return
             val tag = try {
                 (bindings.handle("objc_msgSend_long")
                     .invokeExact(sender, bindings.sel("tag")) as Long).toInt()
             } catch (t: Throwable) {
-                log.warn("onMenuItem: tag read threw: {}", t.message)
+                log.warn("onMenuItem: tag read threw", t)
                 return
             }
             for (inst in INSTANCE_REGISTRY.values) {
                 val id = inst.tagToId[tag] ?: continue
-                inst.fire(TrayEvent.MenuItemSelected(id))
+                // An exception leaving an upcall ends the JVM.
+                runCatching { inst.fire(TrayEvent.MenuItemSelected(id)) }
+                    .onFailure { log.warn("onMenuItem: firing the event threw", it) }
                 return
             }
             // Tag fell through every instance — typically means the
@@ -862,7 +875,7 @@ internal class AppKitTrayImpl private constructor(
         fun onStatusItemClickEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
             val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusButton.address() == sender.address() } ?: return
             runCatching { inst.handleStatusItemAction() }
-                .onFailure { log.warn("onStatusItemClick: handling threw: {}", it.message) }
+                .onFailure { log.warn("onStatusItemClick: handling threw", it) }
         }
 
         /**
@@ -874,7 +887,7 @@ internal class AppKitTrayImpl private constructor(
         fun onStatusViewMouseEntry(self: MemorySegment, cmd: MemorySegment, event: MemorySegment) {
             val inst = INSTANCE_REGISTRY.values.firstOrNull { it.statusView.address() == self.address() } ?: return
             runCatching { inst.handleStatusViewMouse(cmd, event) }
-                .onFailure { log.warn("status view mouse handling threw: {}", it.message) }
+                .onFailure { log.warn("status view mouse handling threw", it) }
         }
 
         /** The `LibtrayStatusView_<pid>` class, built once per JVM. */
@@ -898,17 +911,7 @@ internal class AppKitTrayImpl private constructor(
         private fun ensureStatusViewClass(bindings: ObjcBindings) {
             if (statusViewClass.address() != 0L) return
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onStatusViewMouseEntry",
-                MethodType.methodType(
-                    Void.TYPE,
-                    MemorySegment::class.java,   // self (the overlay)
-                    MemorySegment::class.java,   // _cmd (SEL)
-                    MemorySegment::class.java,   // NSEvent*
-                ),
-            )
-            val stub = Linker.nativeLinker().upcallStub(handle, OBJC_METHOD_DESCRIPTOR, arena)
+            val stub = ON_STATUS_VIEW_MOUSE.stub(arena)
             val className = "LibtrayStatusView_${ProcessHandle.current().pid()}"
             val newClass = bindings.handle("objc_allocateClassPair")
                 .invokeExact(bindings.cls("NSView"), arena.allocateFrom(className), 0L) as MemorySegment
@@ -925,15 +928,22 @@ internal class AppKitTrayImpl private constructor(
             log.info("Registered runtime ObjC class {} for status item clicks", className)
         }
 
-        /** Last-loaded bindings, used by the static upcall handler. */
-        @Volatile private var lastBindings: ObjcBindings? = null
+        /**
+         * The process's one set of bindings, also read by the static upcall
+         * handler. Their arena is never closed (see [close]), so loading per
+         * tray would keep another set of handles alive for every create().
+         */
+        @Volatile private var sharedBindings: ObjcBindings? = null
+
+        @Synchronized
+        private fun loadSharedBindings(): ObjcBindings? =
+            sharedBindings ?: ObjcBindings.load()?.also { sharedBindings = it }
 
         fun create(builder: TrayBuilder): Tray? {
-            val bindings = ObjcBindings.load() ?: run {
+            val bindings = loadSharedBindings() ?: run {
                 log.info("Objective-C runtime / AppKit not loadable — AppKit tray unavailable")
                 return null
             }
-            lastBindings = bindings
 
             // Caller-thread check. NSStatusItem and every NSWindow
             // constructor it delegates to are pinned to OS thread 0
@@ -1007,7 +1017,7 @@ internal class AppKitTrayImpl private constructor(
                 }
                 log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
                 AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
-            }.onFailure { log.warn("AppKit tray construction threw: {}", it.message) }.getOrNull()
+            }.onFailure { log.warn("AppKit tray construction threw", it) }.getOrNull()
         }
 
         /**
@@ -1031,7 +1041,7 @@ internal class AppKitTrayImpl private constructor(
                 // is unspecified, as in isNSAppRunning.
                 (ret and 0xffL) != 0L
             }.getOrElse {
-                log.warn("[NSThread isMainThread] threw: {} — assuming non-main", it.message)
+                log.warn("[NSThread isMainThread] threw, assuming non-main", it)
                 false
             }
         }
@@ -1101,7 +1111,7 @@ internal class AppKitTrayImpl private constructor(
                 }
                 log.info("[create] NSApplication activation policy = Accessory, finishLaunching fired")
             }.onFailure {
-                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw: {}; proceeding anyway", it.message)
+                log.warn("[NSApplication sharedApplication / setActivationPolicy:] threw, proceeding anyway", it)
             }
         }
 
@@ -1122,7 +1132,7 @@ internal class AppKitTrayImpl private constructor(
                     .invokeExact(app, bindings.sel("isRunning")) as Long
                 (ret and 0xffL) != 0L
             }.getOrElse {
-                log.warn("[NSApp isRunning] threw: {}; assuming not running", it.message)
+                log.warn("[NSApp isRunning] threw, assuming not running", it)
                 false
             }
         }
@@ -1133,34 +1143,18 @@ internal class AppKitTrayImpl private constructor(
          * `-onStatusItemClick:(id)`, each mapped to a Panama upcall stub,
          * register, instantiate.
          *
-         * Class name is suffixed with PID so re-loading libtray (e.g.
-         * test harnesses, isolated classloaders) doesn't trip
-         * "class already registered". Idempotent — early-returns when
-         * already built.
+         * The class name carries the PID. That does not help a second copy of
+         * libtray loaded by another classloader in the same process: it gets
+         * the same name, objc_allocateClassPair returns nil and its create()
+         * returns null. Idempotent, it returns early when already built.
          */
         @Synchronized
         private fun ensureMenuTargetClass(bindings: ObjcBindings) {
             if (menuTargetClass != null) return
 
             val arena = Arena.ofShared()
-            val handle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onMenuItemEntry",
-                MethodType.methodType(
-                    Void.TYPE,
-                    MemorySegment::class.java,   // self (id)
-                    MemorySegment::class.java,   // _cmd (SEL)
-                    MemorySegment::class.java,   // sender (id)
-                ),
-            )
-            val descriptor = OBJC_METHOD_DESCRIPTOR
-            val stub = Linker.nativeLinker().upcallStub(handle, descriptor, arena)
-            val clickHandle = MethodHandles.lookup().findStatic(
-                AppKitTrayImpl::class.java,
-                "onStatusItemClickEntry",
-                handle.type(),
-            )
-            val clickStub = Linker.nativeLinker().upcallStub(clickHandle, descriptor, arena)
+            val stub = ON_MENU_ITEM.stub(arena)
+            val clickStub = ON_STATUS_ITEM_CLICK.stub(arena)
             menuActionStub = stub
             statusClickStub = clickStub
             stubArena = arena

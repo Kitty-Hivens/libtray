@@ -43,7 +43,7 @@ read end-to-end in one sitting.
 |----------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Linux    | `org.kde.StatusNotifierItem` over D-Bus + `com.canonical.dbusmenu` for the menu | Talks to the desktop's tray host directly via libdbus. No GTK / GLib runtime dependency. Works on KDE, GNOME with the SNI extension, Hyprland (via waybar / similar), Cinnamon, Budgie. |
 | Windows  | `Shell_NotifyIcon` via `shell32`                                                | Win32 message-pump driven. The classic "balloon notification" surface.                                                                                                                  |
-| macOS    | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend`                      | Menu-bar item top-right. Requires the JVM to be running with a Cocoa main thread (most JVM desktop apps already do).                                                                    |
+| macOS    | `NSStatusBar` / `NSStatusItem` via AppKit + `objc_msgSend`                      | Menu-bar item top-right. `Tray.create` has to run on the Cocoa main thread: it works from the JavaFX application thread, but AWT, Swing and Compose apps currently get `null`.          |
 
 Each backend lives in its own package so consumers can audit / patch the
 one that affects them without grokking the others.
@@ -77,12 +77,24 @@ specifically) to permit the native calls.
 **GraalVM native image.** The jar ships its reachability metadata in
 `META-INF/native-image/dev.hivens/libtray/`, which `native-image` picks up
 from the classpath: every foreign call shape and upcall the three backends
-use, plus the AWT and ImageIO entries libtray's icon handling needs. Pass
+use, plus AWT and ImageIO entries for icon handling. Pass
 `--enable-native-access=ALL-UNNAMED` to `native-image` as well. Icon
-decoding goes through AWT, so the build writes `libawt` and its companion
-libraries next to the executable, and they have to ship with it. CI builds
-and runs a native check program on Linux, Windows and macOS with only that
-metadata.
+decoding goes through AWT, so on Linux and Windows the build writes `libawt`
+and its companion libraries next to the executable, and they have to ship
+with it. CI builds
+and runs a native check program on Linux, Windows and macOS against the jar
+and its metadata, using GraalVM for JDK 25. Older versions are untested, and
+the `SharedArenaSupport` option the jar enables may not exist on them.
+
+On Linux and Windows those entries cover 8-bit RGB, RGBA, gray and
+gray+alpha PNGs. Other images, including palette PNGs such as `pngquant` or
+`optipng` output, 1-bit and 16-bit PNGs, GIF and JPEG, fail to decode in a
+native image, although they work on the JVM. Convert icons to 8-bit RGBA for
+a native build.
+
+On macOS the build writes none of the AWT libraries, so a native image does
+not scale icons. The tray still works: `NSImage` decodes the icon itself and
+shows it at its original size. Pass an icon of 256 pixels or less.
 </details>
 
 <details>

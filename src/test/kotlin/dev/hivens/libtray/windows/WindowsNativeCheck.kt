@@ -5,9 +5,12 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.expect
+import dev.hivens.libtray.fail
 import dev.hivens.libtray.solidPng
+import dev.hivens.libtray.startWatchdog
+import dev.hivens.libtray.step
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 
 /**
@@ -17,6 +20,7 @@ import kotlin.system.exitProcess
  * version 4 callbacks, and close. Exit code 0 means every step passed.
  */
 fun main() {
+    startWatchdog()
     val events = LinkedBlockingQueue<TrayEvent>()
     val tray = Tray.create(
         TrayBuilder(
@@ -30,7 +34,8 @@ fun main() {
     step("created")
 
     if (!tray.setTooltip("updated") || !tray.setIcon(solidPng(16))) fail("update")
-    // Past maxIconSize: decoded, drawn smaller through Java2D and re-encoded.
+    // Past maxIconSize: decoded, averaged down and re-encoded. The backend
+    // rejects anything over 256, so this fails if scaling did not happen.
     if (!tray.setIcon(solidPng(300))) fail("setIcon with an icon that needs scaling")
     step("updated")
 
@@ -46,32 +51,10 @@ fun main() {
     val tookMs = (System.nanoTime() - start) / 1_000_000
     if (tray.isOpen || tookMs >= 2_000) fail("close() took $tookMs ms")
     step("closed in $tookMs ms")
-    println("[native-check] PASS")
+    step("PASS")
     exitProcess(0)
 }
 
-/** A shell callback in the NOTIFYICON_VERSION_4 layout: event in LOWORD(lParam), icon id in HIWORD. */
 private fun post(tray: Tray, mouseEvent: Int) {
-    val hwnd = (tray as Win32TrayImpl).windowHandle
-    val bindings = Win32Bindings.load() ?: fail("user32 not loadable")
-    try {
-        val lParam = (mouseEvent.toLong() and 0xffff) or (Win32Bindings.TRAY_ICON_UID.toLong() shl 16)
-        val ok = bindings.handle("PostMessageW").invokeExact(hwnd, Win32Bindings.WM_TRAY_CALLBACK, 0L, lParam) as Int
-        if (ok == 0) fail("PostMessageW failed")
-    } finally {
-        bindings.arena.close()
-    }
-}
-
-private fun expect(events: LinkedBlockingQueue<TrayEvent>, expected: TrayEvent) {
-    val got = events.poll(3, TimeUnit.SECONDS)
-    if (got != expected) fail("expected $expected, got $got")
-    step("$expected reached the listener")
-}
-
-private fun step(what: String) = println("[native-check] $what")
-
-private fun fail(why: String): Nothing {
-    System.err.println("[native-check] FAIL: $why")
-    exitProcess(1)
+    if (!postShellCallback(tray, mouseEvent)) fail("PostMessageW failed")
 }

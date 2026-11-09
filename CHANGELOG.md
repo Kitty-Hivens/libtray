@@ -14,7 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   created. Consumers no longer maintain their own copy. A test regenerates
   the file from the backends' descriptor lists and fails when the
   committed one drifts, and CI builds and runs a native check program on
-  each platform with only that metadata.
+  each platform against the jar. In a native image only 8-bit RGB, RGBA,
+  gray and gray+alpha PNGs decode so far, see the README.
 - The jar's `native-image.properties` enables `SharedArenaSupport`,
   unlocking experimental options for that option alone. A native image
   only supports closing a shared arena with it, and `close()` releases the
@@ -30,6 +31,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   bilinear draw when the asynchronous image producer had not finished.
   Colour is averaged premultiplied by alpha. Against the previous output,
   alpha matches exactly and colour within one level.
+- Icons decode and encode through in-memory streams. `ImageIO` used to create
+  a temporary file on every call, which a read-only temp directory turned into
+  a lost icon. Scaling also reads the source one row at a time instead of
+  copying the whole frame.
+- A failed `Tray.create` is logged at WARN with its stack trace instead of
+  at INFO with the message only.
+
+### Fixed
+- Linux: a dbusmenu `EventGroup` call with missing or wrongly typed
+  arguments crashed the process inside libdbus. It now gets an `InvalidArgs`
+  error. Any client on the session bus could trigger this.
+- Linux: `setIcon` with bytes that do not decode replaced the visible icon
+  with nothing and returned true. It now keeps the current icon and returns
+  false, as the Windows backend does.
+- Linux: a click on an open menu that `setMenu` had just replaced could
+  fire the new menu's item with the same position. Menu ids are no longer
+  reused within a tray, so such a click is dropped.
+- Linux: `Get`, `GetAll`, `GetProperty` and `Event` calls with missing
+  arguments got an empty reply, which for `Get` and `GetProperty` carried the
+  wrong signature. They now get `InvalidArgs`. A dbusmenu reply is also built
+  from one menu even when `setMenu` replaces it meanwhile.
+- A thread with its interrupt flag set got `InterruptedException` from the
+  setters on Linux, from `close()` on all three platforms and from
+  `Tray.create` on Windows, and `close()` then skipped its teardown. An
+  interrupt arriving during `close()` now no longer cuts its wait short
+  either. On macOS the same flag on the main thread could end the JVM from a
+  menu click.
+- Linux: a setter racing `close()` could throw instead of returning false.
+- Windows: an idle tray woke its thread about 60 times a second. The pump
+  now sleeps in `GetMessageW`. It also processes the `WM_CLOSE` that `close()`
+  posts, which it used to exit before seeing, so the window is destroyed
+  before its class is unregistered.
+- Windows: setters from different threads could interleave on the shared
+  `NOTIFYICONDATA`, and a setter racing `close()` could throw. `close()` also
+  released native handles a pump thread that had not stopped was still using.
+- Windows: when the pump thread was slow to start, `Tray.create` could close
+  the native bindings it was still using, and an icon added after `close()`
+  removed the entry could stay in the notification area.
+- macOS: with more than one tray, a menu click could be delivered to the
+  wrong tray, because menu item tags were only unique within a tray.
+- macOS: each `Tray.create` kept another set of native bindings alive for the
+  life of the process. All trays now share one.
 
 ## [0.2.0]
 

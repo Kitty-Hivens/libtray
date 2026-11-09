@@ -8,8 +8,8 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TraySubscription
+import dev.hivens.libtray.joinPastInterrupt
 import org.slf4j.LoggerFactory
-import java.io.ByteArrayInputStream
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
@@ -18,7 +18,6 @@ import java.util.concurrent.Executor
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import javax.imageio.ImageIO
 
 /**
  * Linux tray backend — `org.kde.StatusNotifierItem` over D-Bus session
@@ -59,9 +58,10 @@ import javax.imageio.ImageIO
  * That one thread owns the connection outright: each iteration sends
  * whatever the public API and the previous iteration's replies left in
  * [outgoing], then polls the socket, then dispatches what arrived. No
- * other thread touches libdbus, which is what keeps reply latency at
- * the bare bus round-trip — see [outgoing] for why a second sender
- * thread cannot.
+ * other thread touches the connection: setters only build messages, under
+ * [nativeLock], and leave them in [outgoing]. That is what keeps reply
+ * latency at the bare bus round-trip. See [outgoing] for why a second
+ * sender thread cannot.
  *
  * Menu: the full DBusMenu (`com.canonical.dbusmenu`) protocol is served
  * from `/MenuBar`, so the desktop's own menu UI renders the [TrayMenu] —
@@ -108,14 +108,12 @@ internal class SniTrayImpl internal constructor(
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 
-    @Volatile private var iconBytes: ByteArray = IconScaling.fit(initial.iconBytes, maxIconSize, log)
-    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(iconBytes)
+    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(IconScaling.fit(initial.iconBytes, maxIconSize, log))
     @Volatile private var tooltip: String = initial.tooltip ?: ""
-    @Volatile private var menu: TrayMenu? = initial.menu
-    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let(::DBusMenuLayout)
+    private val menuIds = AtomicInteger(0)
+    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let { DBusMenuLayout(it, menuIds) }
     private val layoutRevision = AtomicInteger(0)
-    @Volatile private var status: String = "Active"
-    @Volatile private var open = AtomicBoolean(true)
+    private val open = AtomicBoolean(true)
 
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
@@ -175,6 +173,14 @@ internal class SniTrayImpl internal constructor(
     // a live session bus. See SniTrayImplOutgoingTest.
     internal val outgoing = LinkedBlockingQueue<MemorySegment>()
 
+    /**
+     * Held by a setter's libdbus calls and by close() while it frees the
+     * connection and the arena, so a setter never builds a message on bindings
+     * that are going away, and a message it built is always handed on or freed.
+     */
+    private val nativeLock = Any()
+
+    // Last, so the I/O thread never sees a field that is not yet initialised.
     init {
         ioThread.start()
     }
@@ -189,28 +195,41 @@ internal class SniTrayImpl internal constructor(
         // "ToolTip" property branch below for the why), so NewTitle has to
         // fire when tooltip text changes. NewToolTip is kept for hosts
         // that strictly key on the ToolTip-changed signal.
-        emitSignal("NewTitle")
-        emitSignal("NewToolTip")
-        return true
+        return signalling("setTooltip") {
+            emitSignal("NewTitle")
+            emitSignal("NewToolTip")
+        }
     }
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
         require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
-        val fitted = IconScaling.fit(iconBytes, maxIconSize, log)
-        this.iconBytes = fitted
-        this.iconPixmap = pngToPixmaps(fitted)
-        emitSignal("NewIcon")
-        return true
+        val pixmaps = pngToPixmaps(IconScaling.fit(iconBytes, maxIconSize, log))
+        if (pixmaps.isEmpty()) {
+            log.warn("Could not decode the new tray icon ({} bytes), keeping the current one", iconBytes.size)
+            return false
+        }
+        iconPixmap = pixmaps
+        return signalling("setIcon") { emitSignal("NewIcon") }
     }
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
-        this.menu = menu
-        this.menuLayout = menu?.let(::DBusMenuLayout)
+        menuLayout = menu?.let { DBusMenuLayout(it, menuIds) }
         layoutRevision.incrementAndGet()
-        emitLayoutUpdated()
-        return true
+        return signalling("setMenu") { emitLayoutUpdated() }
+    }
+
+    /** The libdbus half of a setter. False once the tray is closed. */
+    private inline fun signalling(what: String, emit: () -> Unit): Boolean = synchronized(nativeLock) {
+        if (!open.get()) return false
+        try {
+            emit()
+            true
+        } catch (t: Throwable) {
+            log.warn("{} could not signal the tray host", what, t)
+            false
+        }
     }
 
     override fun onEvent(listener: TrayEventListener): TraySubscription = events.subscribe(listener)
@@ -226,15 +245,7 @@ internal class SniTrayImpl internal constructor(
         // connection in a weird half-closed state with the watcher still
         // expecting our service, and could abandon a half-built outgoing
         // message mid-FFM call.
-        ioThread.join(JOIN_TIMEOUT_MS)
-        // Final drain: a caller racing close() can enqueue after the loop
-        // did its own last drain, so unref anything still in `outgoing`
-        // rather than leak the libdbus message.
-        val unref = bindings.handle("dbus_message_unref")
-        while (true) {
-            val leftover = outgoing.poll() ?: break
-            runCatching { unref.invokeExact(leftover) as Unit }
-        }
+        ioThread.joinPastInterrupt(JOIN_TIMEOUT_MS)
         // Everything below frees memory the I/O thread may still be reading.
         // Every blocking call it makes is bounded below the join budget, so
         // this is a backstop: if it did not stop in time anyway, unreffing
@@ -249,21 +260,31 @@ internal class SniTrayImpl internal constructor(
             )
             return
         }
-        // Private connection: close (detach from the bus, release the socket)
-        // before the final unref. A shared dbus_bus_get connection must never
-        // be closed, but this backend owns a private one.
-        runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
-            .onFailure { log.warn("dbus_connection_close threw on shutdown: {}", it.message) }
-        try {
-            bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
-        } catch (t: Throwable) {
-            log.warn("dbus_connection_unref threw on shutdown: {}", t.message)
+        synchronized(nativeLock) {
+            // Final drain, a backstop: sendAndUnref already frees what a setter
+            // queues after the I/O thread's last drain, so this normally finds
+            // nothing. Anything it does find would otherwise leak.
+            val unref = bindings.handle("dbus_message_unref")
+            while (true) {
+                val leftover = outgoing.poll() ?: break
+                runCatching { unref.invokeExact(leftover) as Unit }
+            }
+            // Private connection: close (detach from the bus, release the socket)
+            // before the final unref. A shared dbus_bus_get connection must never
+            // be closed, but this backend owns a private one.
+            runCatching { bindings.handle("dbus_connection_close").invokeExact(connection) as Unit }
+                .onFailure { log.warn("dbus_connection_close threw on shutdown", it) }
+            try {
+                bindings.handle("dbus_connection_unref").invokeExact(connection) as Unit
+            } catch (t: Throwable) {
+                log.warn("dbus_connection_unref threw on shutdown", t)
+            }
+            // Release the shared arena (library lookup + every downcall handle).
+            // Safe now that the I/O thread is provably gone. The SNI backend uses
+            // no upcall stubs, so unlike Win32 and macOS there is no separate
+            // long-lived arena that must outlive close().
+            runCatching { bindings.arena.close() }
         }
-        // Release the shared arena (library lookup + every downcall handle).
-        // Safe now that the I/O thread is provably gone; the SNI backend uses no
-        // upcall stubs, so -- unlike Win32 / macOS -- there is no separate
-        // long-lived arena that must outlive close().
-        runCatching { bindings.arena.close() }
     }
 
     // ── D-Bus I/O loop ───────────────────────────────────────────────────
@@ -305,13 +326,15 @@ internal class SniTrayImpl internal constructor(
                     try {
                         dispatchOne(msg)
                     } catch (t: Throwable) {
-                        log.warn("Message dispatch threw, dropping message: {}", t.message)
+                        log.warn("Message dispatch threw, dropping message", t)
                     } finally {
                         runCatching { unref.invokeExact(msg) as Unit }
                     }
                 }
             } catch (t: Throwable) {
-                log.warn("D-Bus I/O iteration threw: {}", t.message)
+                // A broken bus repeats this twice a second, so the stack is debug only.
+                log.warn("D-Bus I/O iteration threw: {}", t.toString())
+                log.debug("D-Bus I/O iteration threw", t)
                 // Sleep briefly so a permanently-broken bus doesn't
                 // burn CPU at 100% logging.
                 Thread.sleep(500)
@@ -347,7 +370,7 @@ internal class SniTrayImpl internal constructor(
                     send.invokeExact(connection, msg, serial) as Int
                 }
             } catch (t: Throwable) {
-                log.warn("send failed, dropping message: {}", t.message)
+                log.warn("send failed, dropping message", t)
             } finally {
                 runCatching { unref.invokeExact(msg) as Unit }
             }
@@ -438,8 +461,12 @@ internal class SniTrayImpl internal constructor(
         }
     }
 
-    /** Send a D-Bus error reply (UnknownMethod / UnknownInterface / ...) in answer to a method call. */
+    /**
+     * Send a D-Bus error reply (UnknownMethod / UnknownInterface / ...) in
+     * answer to a method call. Skipped when the caller set NO_REPLY_EXPECTED.
+     */
     private fun replyError(msg: MemorySegment, errorName: String, errorMessage: String) {
+        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
         Arena.ofConfined().use { call ->
             val nameSeg = call.allocateUtf8(errorName)
             val msgSeg  = call.allocateUtf8(errorMessage)
@@ -453,13 +480,14 @@ internal class SniTrayImpl internal constructor(
      * Answer an unhandled method call with UnknownMethod. Leaving a method
      * call unanswered blocks the caller to its own timeout (~25 s) -- some
      * hosts probe objects before subscribing and would stall on startup.
-     * Skipped when the caller set NO_REPLY_EXPECTED.
      */
     private fun replyUnknownMethod(msg: MemorySegment, iface: String, member: String) {
-        if ((bindings.handle("dbus_message_get_no_reply").invokeExact(msg) as Int) != 0) return
         log.debug("Unhandled method {}.{} -- replying UnknownMethod", iface, member)
         replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No such method $iface.$member")
     }
+
+    private fun replyInvalidArgs(msg: MemorySegment, why: String) =
+        replyError(msg, "org.freedesktop.DBus.Error.InvalidArgs", why)
 
     private fun fire(event: TrayEvent) = events.fire(event)
 
@@ -469,9 +497,9 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
-            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val ifaceName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Get takes (ss)")
             (bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int)
-            val propName  = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val propName  = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Get takes (ss)")
 
             if (ifaceName != "org.kde.StatusNotifierItem") {
                 replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
@@ -490,7 +518,7 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int)
-            val ifaceName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val ifaceName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "GetAll takes (s)")
             if (ifaceName != "org.kde.StatusNotifierItem") {
                 replyError(msg, "org.freedesktop.DBus.Error.UnknownInterface",
                     "No properties for interface $ifaceName")
@@ -533,7 +561,7 @@ internal class SniTrayImpl internal constructor(
             // own; with libtray composing the same prefix the result
             // would be "App — App — status".
             "Title"         -> appendVariantString(call, parent, currentTitle())
-            "Status"        -> appendVariantString(call, parent, status)
+            "Status"        -> appendVariantString(call, parent, "Active")
             "WindowId"      -> appendVariantInt(call, parent, 0)
             "IconName"      -> appendVariantString(call, parent, "")
             "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
@@ -728,13 +756,15 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_append_basic")
                 .invokeExact(replyIter, DBusBindings.DBUS_TYPE_UINT32.toInt(), intBuf) as Int
 
-            // Root struct (ia{sv}av) — recursive subtree from parentId.
-            marshallNode(call, replyIter, parentId, depth)
+            // Root struct (ia{sv}av), the recursive subtree from parentId. One
+            // layout for the whole reply: setMenu can swap it in the meantime,
+            // and mixing the two would pair one menu's ids with another's labels.
+            marshallNode(call, replyIter, menuLayout, parentId, depth)
             sendAndUnref(reply)
         }
     }
 
-    private fun marshallNode(call: Arena, parent: MemorySegment, nodeId: Int, depthRemaining: Int) {
+    private fun marshallNode(call: Arena, parent: MemorySegment, layout: DBusMenuLayout?, nodeId: Int, depthRemaining: Int) {
         val struct = call.allocate(bindings.messageIterLayout)
         openContainer(parent, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
 
@@ -748,7 +778,7 @@ internal class SniTrayImpl internal constructor(
         val dictSig = call.allocateUtf8("{sv}")
         val dictArr = call.allocate(bindings.messageIterLayout)
         openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dictArr)
-        val props = menuLayout?.propertiesOf(nodeId).orEmpty()
+        val props = layout?.propertiesOf(nodeId).orEmpty()
         for ((name, value) in props) {
             appendMenuPropertyEntry(call, dictArr, name, value)
         }
@@ -760,11 +790,11 @@ internal class SniTrayImpl internal constructor(
         openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, childSig, childArr)
         if (depthRemaining != 0) {
             val nextDepth = if (depthRemaining < 0) -1 else depthRemaining - 1
-            for (childId in menuLayout?.childrenOf(nodeId).orEmpty()) {
+            for (childId in layout?.childrenOf(nodeId).orEmpty()) {
                 val variant = call.allocate(bindings.messageIterLayout)
                 val variantSig = call.allocateUtf8("(ia{sv}av)")
                 openContainer(childArr, DBusBindings.DBUS_TYPE_VARIANT, variantSig, variant)
-                marshallNode(call, variant, childId, nextDepth)
+                marshallNode(call, variant, layout, childId, nextDepth)
                 closeContainer(childArr, variant)
             }
         }
@@ -802,6 +832,7 @@ internal class SniTrayImpl internal constructor(
             val arrSig = call.allocateUtf8("(ia{sv})")
             val arr = call.allocate(bindings.messageIterLayout)
             openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
+            val layout = menuLayout  // one layout for the whole reply, as in GetLayout
             for (id in ids) {
                 val struct = call.allocate(bindings.messageIterLayout)
                 openContainer(arr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
@@ -812,7 +843,7 @@ internal class SniTrayImpl internal constructor(
                 val dictSig = call.allocateUtf8("{sv}")
                 val dict = call.allocate(bindings.messageIterLayout)
                 openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dict)
-                for ((name, value) in menuLayout?.propertiesOf(id).orEmpty()) {
+                for ((name, value) in layout?.propertiesOf(id).orEmpty()) {
                     appendMenuPropertyEntry(call, dict, name, value)
                 }
                 closeContainer(struct, dict)
@@ -828,9 +859,9 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
-            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            val id = readInt(call, iter) ?: return replyInvalidArgs(msg, "GetProperty takes (is)")
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
-            val propName = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val propName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "GetProperty takes (is)")
 
             val value = menuLayout?.propertiesOf(id)?.get(propName)
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
@@ -874,26 +905,35 @@ internal class SniTrayImpl internal constructor(
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
-            val id = readInt(call, iter) ?: return replyEmpty(msg)
+            val id = readInt(call, iter) ?: return replyInvalidArgs(msg, "Event takes (isvu)")
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
-            val eventId = readBasicString(call, iter) ?: return replyEmpty(msg)
+            val eventId = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Event takes (isvu)")
             // data + timestamp ignored — we don't expose them as event fields.
             if (eventId == "clicked") fireMenuClick(id)
             replyEmpty(msg)
         }
     }
 
-    /** EventGroup(events: a(isvu)) — batched Event. Reply: a(i) of unhandled ids. */
+    /**
+     * EventGroup(events: a(isvu)), a batched Event. Reply: ai of unhandled ids.
+     *
+     * Types are checked before each recurse. Anything on the session bus can
+     * call this, and `dbus_message_iter_recurse` on a value that is not a
+     * container takes the whole process down inside libdbus.
+     */
     private fun handleMenuEventGroup(msg: MemorySegment) {
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
+            val outerType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(iter) as Int
+            if (outerType.toByte() != DBusBindings.DBUS_TYPE_ARRAY) return replyInvalidArgs(msg, EVENT_GROUP_ARGS)
             val arrIter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_recurse").invokeExact(iter, arrIter) as Unit
             // Walk each (i s v u) tuple — pull id + event_id, ignore data + ts.
             while (true) {
                 val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(arrIter) as Int
                 if (argType.toByte() == DBusBindings.DBUS_TYPE_INVALID) break
+                if (argType.toByte() != DBusBindings.DBUS_TYPE_STRUCT) return replyInvalidArgs(msg, EVENT_GROUP_ARGS)
                 val structIter = call.allocate(bindings.messageIterLayout)
                 bindings.handle("dbus_message_iter_recurse").invokeExact(arrIter, structIter) as Unit
                 val id = readInt(call, structIter) ?: 0
@@ -1077,13 +1117,13 @@ internal class SniTrayImpl internal constructor(
             runCatching { bindings.handle("dbus_message_unref").invokeExact(reply) as Unit }
             return
         }
-        // LinkedBlockingQueue#offer with no capacity bound always succeeds.
-        // Defensive `else` would be dead code; rely on the contract.
-        outgoing.put(reply)
-        // close() can run its final drain between the check above and this
-        // put, which would leave the message queued forever with its ref
-        // held. Re-check and drain what nobody is coming back for; poll() is
-        // atomic, so a message still reaches exactly one unref.
+        // Always succeeds without a capacity bound, and unlike put it does not
+        // throw on a caller whose interrupt flag is set.
+        outgoing.offer(reply)
+        // The I/O thread can run its final drain between the check above and
+        // this offer, which would leave the message queued forever with its
+        // ref held. Re-check and drain what nobody is coming back for. poll()
+        // is atomic, so a message still reaches exactly one unref.
         if (!open.get()) {
             val unref = bindings.handle("dbus_message_unref")
             while (true) {
@@ -1103,7 +1143,7 @@ internal class SniTrayImpl internal constructor(
      */
     private fun pngToPixmaps(bytes: ByteArray): List<Pixmap> {
         return runCatching {
-            val img = ImageIO.read(ByteArrayInputStream(bytes)) ?: return emptyList()
+            val img = IconScaling.decode(bytes) ?: return emptyList()
             val w = img.width
             val h = img.height
             val argb = IntArray(w * h)
@@ -1119,7 +1159,7 @@ internal class SniTrayImpl internal constructor(
             }
             listOf(Pixmap(w, h, out))
         }.getOrElse {
-            log.warn("Icon decode failed: {}", it.message)
+            log.warn("Icon decode failed", it)
             emptyList()
         }
     }
@@ -1130,6 +1170,7 @@ internal class SniTrayImpl internal constructor(
 
         private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
         private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
+        private const val EVENT_GROUP_ARGS = "EventGroup takes a(isvu)"
 
         /**
          * How long `dbus_connection_read_write` blocks per iteration. It
@@ -1339,7 +1380,7 @@ internal class SniTrayImpl internal constructor(
                     // heap-allocates its name / message strings -- the
                     // confined arena does not own them.
                     freeError(bindings, error)
-                }.onFailure { log.warn("AddMatch for NameOwnerChanged failed: {}", it.message) }
+                }.onFailure { log.warn("AddMatch for NameOwnerChanged failed", it) }
 
                 SniTrayImpl(bindings, conn, itemId, builder)
             }
@@ -1387,5 +1428,3 @@ internal class SniTrayImpl internal constructor(
         }
     }
 }
-
-// allocateUtf8 now lives in DBusBindings.kt (shared across the linux package).

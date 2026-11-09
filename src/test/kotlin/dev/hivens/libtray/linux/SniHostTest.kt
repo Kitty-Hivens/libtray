@@ -6,19 +6,22 @@ import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.linux.DBusTestClient.Arg
+import io.kotest.assertions.throwables.shouldThrow
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import io.kotest.matchers.string.shouldStartWith
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
-import java.awt.image.BufferedImage
-import java.io.ByteArrayOutputStream
+import dev.hivens.libtray.solidPng
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
-import javax.imageio.ImageIO
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 /**
  * End-to-end coverage of the SNI backend against a live session bus, with
@@ -88,6 +91,119 @@ class SniHostTest {
 
         take(events) shouldBe TrayEvent.MenuItemSelected("exit")
         events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+    }
+
+    @Test
+    fun `setIcon with undecodable bytes reports failure and keeps the current icon`() {
+        val name = "org.libtray.HostTest.UndecodableIcon"
+        val tray = open(name)
+
+        tray.setIcon(byteArrayOf(1, 2, 3)) shouldBe false
+
+        host.firstIconPixmapSize(name) shouldBe (32 to 32)
+    }
+
+    @Test
+    fun `setters work from a thread with its interrupt flag set`() {
+        val tray = open("org.libtray.HostTest.Interrupted")
+
+        Thread.currentThread().interrupt()
+        val result = tray.setTooltip("while interrupted")
+
+        Thread.interrupted() shouldBe true
+        result shouldBe true
+    }
+
+    @Test
+    fun `setters racing close never throw`() {
+        repeat(20) { round ->
+            val tray = open("org.libtray.HostTest.CloseRace$round")
+            val failure = AtomicReference<Throwable?>()
+            val started = CountDownLatch(1)
+            val setter = thread {
+                try {
+                    while (tray.isOpen) {
+                        tray.setTooltip("racing")
+                        tray.setMenu(null)
+                        started.countDown()
+                    }
+                    tray.setTooltip("after close") shouldBe false
+                } catch (t: Throwable) {
+                    failure.set(t)
+                }
+            }
+            // close() has to land while the setter is looping, not before it starts.
+            started.await(2, TimeUnit.SECONDS) shouldBe true
+            tray.close()
+            setter.join(2_000)
+            setter.isAlive shouldBe false
+            failure.get() shouldBe null
+        }
+    }
+
+    @Test
+    fun `menu clicks in an EventGroup come back by id`() {
+        val name = "org.libtray.HostTest.EventGroup"
+        val events = LinkedBlockingQueue<TrayEvent>()
+        open(name).onEvent { events.add(it) }
+
+        callEventGroup(name, listOf(Arg.MenuClicks(emptyList())))
+        callEventGroup(name, listOf(Arg.MenuClicks(listOf(1, 2, 3))))
+
+        // Item 2 is the separator, which must not surface.
+        take(events) shouldBe TrayEvent.MenuItemSelected("show")
+        take(events) shouldBe TrayEvent.MenuItemSelected("exit")
+        events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+    }
+
+    @Test
+    fun `a malformed EventGroup gets an error and the item keeps serving`() {
+        val name = "org.libtray.HostTest.MalformedEventGroup"
+        open(name)
+
+        for (args in listOf(emptyList(), listOf(Arg.Int32(1)), listOf(Arg.Int32Array(listOf(1))))) {
+            shouldThrow<IllegalStateException> { callEventGroup(name, args) }
+                .message.shouldContain("InvalidArgs")
+        }
+
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
+    fun `property and menu calls with missing arguments get InvalidArgs`() {
+        val name = "org.libtray.HostTest.MissingArguments"
+        open(name)
+
+        // An empty method return would carry the wrong signature for Get and GetProperty.
+        val calls = listOf(
+            Triple(DBusTestClient.ITEM_PATH, "org.freedesktop.DBus.Properties", "Get"),
+            Triple(DBusTestClient.ITEM_PATH, "org.freedesktop.DBus.Properties", "GetAll"),
+            Triple(DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "GetProperty"),
+            Triple(DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "Event"),
+        )
+        for ((path, iface, member) in calls) {
+            shouldThrow<IllegalStateException> { host.callNoResult(name, path, iface, member) }
+                .message.shouldContain("InvalidArgs")
+        }
+
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
+    fun `a click on an item of a replaced menu is dropped`() {
+        val name = "org.libtray.HostTest.ReplacedMenu"
+        val events = LinkedBlockingQueue<TrayEvent>()
+        val tray = open(name)
+        tray.onEvent { events.add(it) }
+
+        tray.setMenu(TrayMenu(TrayMenuItem.Standard("a", "A"), TrayMenuItem.Standard("b", "B"), TrayMenuItem.Standard("c", "C")))
+
+        // Id 3 was "exit" in the menu a host may still have on screen.
+        clickMenu(name, 3)
+        events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+
+        clickMenu(name, 4)
+        take(events) shouldBe TrayEvent.MenuItemSelected("a")
     }
 
     @Test
@@ -166,7 +282,7 @@ class SniHostTest {
         val tray = Tray.create(
             TrayBuilder(
                 title = title,
-                iconBytes = icon32(),
+                iconBytes = solidPng(32),
                 menu = TrayMenu(
                     TrayMenuItem.Standard("show", "Show"),
                     TrayMenuItem.Separator,
@@ -188,6 +304,9 @@ class SniHostTest {
         host.callNoResult(name, DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "Event",
             listOf(Arg.Int32(id), Arg.Str("clicked"), Arg.VariantInt32(0), Arg.UInt32(0)))
 
+    private fun callEventGroup(name: String, args: List<Arg>) =
+        host.callNoResult(name, DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", "EventGroup", args)
+
     private fun xy() = listOf(Arg.Int32(0), Arg.Int32(0))
 
     private fun take(events: LinkedBlockingQueue<TrayEvent>): TrayEvent =
@@ -204,10 +323,6 @@ class SniHostTest {
         return samples[samples.size / 2]
     }
 
-    private fun icon32(): ByteArray {
-        val image = BufferedImage(32, 32, BufferedImage.TYPE_INT_ARGB)
-        return ByteArrayOutputStream().also { ImageIO.write(image, "PNG", it) }.toByteArray()
-    }
 
     private companion object {
         const val LATENCY_BUDGET_MS = 250.0
