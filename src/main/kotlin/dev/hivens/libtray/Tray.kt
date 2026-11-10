@@ -102,6 +102,12 @@ public interface Tray : AutoCloseable {
          * running, or the backend's native libraries can't be resolved.
          * Callers should treat null as "tray UX not available, degrade
          * gracefully" (hide the menu item, don't crash).
+         *
+         * Can be called from any thread. On macOS, off the Cocoa main thread,
+         * it builds the status item on the main queue and waits for it, up
+         * to five seconds. That needs something running the Cocoa loop on the
+         * main thread, as AWT, Swing, Compose and JavaFX apps have, and it
+         * returns null if the main thread does not get to it in time.
          */
         @JvmStatic
         public fun create(builder: TrayBuilder): Tray? {

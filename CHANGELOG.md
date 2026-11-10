@@ -39,6 +39,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   at INFO with the message only.
 
 ### Fixed
+- macOS: `Tray.create` returned null unless called on the Cocoa main thread,
+  so AWT, Swing and Compose apps, whose code never runs there, got no tray.
+  Its log suggested `-XstartOnFirstThread`, which makes AWT hang. It now
+  builds the status item on the main queue and waits for it, so it can be
+  called from any thread of such an app.
 - Linux: a dbusmenu `EventGroup` call with missing or wrongly typed
   arguments crashed the process inside libdbus. It now gets an `InvalidArgs`
   error. Any client on the session bus could trigger this.
