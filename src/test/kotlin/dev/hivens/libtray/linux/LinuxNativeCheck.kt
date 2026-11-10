@@ -1,13 +1,14 @@
 package dev.hivens.libtray.linux
 
+import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
-import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
+import dev.hivens.libtray.iconProblem
 import dev.hivens.libtray.linux.DBusTestClient.Arg
 import dev.hivens.libtray.solidPng
 import dev.hivens.libtray.startWatchdog
@@ -23,11 +24,10 @@ import kotlin.system.exitProcess
  * and `nativeAgentRun` tasks provide.
  *
  * Covers what a native image is most likely to break: loading libdbus and
- * binding every downcall, building the icon pixmap through ImageIO for every
- * kind of icon in [ICON_FIXTURES] and scaling an oversized one, the watcher
- * registration, host clicks and a menu
- * click reaching the listener, and close(). Exit code 0 means every step
- * passed.
+ * binding every downcall, decoding every kind of icon in [ICON_FIXTURES] to
+ * the pixels the JVM gets and showing it at the right size, scaling an
+ * oversized one, the watcher registration, host clicks and a menu click
+ * reaching the listener, and close(). Exit code 0 means every step passed.
  */
 fun main() {
     startWatchdog()
@@ -60,13 +60,16 @@ fun main() {
     if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
     step("oversized icon scaled to 256x256")
 
-    // Every colour model and reader: setIcon keeps the old icon and returns
-    // false for bytes it cannot decode, so both the result and the size count.
-    val undecoded = ICON_FIXTURES.filter { icon ->
-        !tray.setIcon(icon.bytes()) || host.firstIconPixmapSize(name) != (icon.shownSize to icon.shownSize)
+    // Every colour model and reader. Each icon follows a 16 px one, so the
+    // pixmap size only matches when this icon really replaced it.
+    val problems = ICON_FIXTURES.mapNotNull { icon ->
+        if (!tray.setIcon(solidPng(16))) return@mapNotNull "the 16 px baseline was refused"
+        iconProblem(icon) { tray.setIcon(it) }
+            ?: host.firstIconPixmapSize(name).takeIf { it != (icon.shownSize to icon.shownSize) }
+                ?.let { "${icon.name} is shown at $it, expected ${icon.shownSize}" }
     }
-    if (undecoded.isNotEmpty()) fail("icons that did not decode: ${undecoded.map { it.name }}")
-    step("all ${ICON_FIXTURES.size} icon formats decoded")
+    if (problems.isNotEmpty()) fail("icons that did not decode as on the JVM: $problems")
+    step("all ${ICON_FIXTURES.size} icon formats decoded as on the JVM")
 
     host.callNoResult(name, DBusTestClient.ITEM_PATH, DBusTestClient.ITEM_IFACE, "Activate", listOf(Arg.Int32(0), Arg.Int32(0)))
     expect(events, TrayEvent.Activated)
