@@ -87,9 +87,11 @@ versions are untested, and the `SharedArenaSupport` option the jar enables
 may not exist on them.
 
 On Linux and Windows the check sets icons of every kind it knows of and
-requires each to decode: palette PNGs at 1, 4 and 8 bits (as `pngquant` and
-`optipng` write them), gray PNGs at 1, 8 and 16 bits, gray with alpha, RGB
-and RGBA PNGs at 8 and 16 bits, and GIF, JPEG and BMP.
+requires each to decode to the same pixels as on the JVM: palette PNGs at
+1, 4 and 8 bits (as `pngquant` and `optipng` write them), gray PNGs at 1, 8
+and 16 bits, gray with alpha at 8 bits, RGB and RGBA PNGs at 8 and 16 bits,
+and GIF, JPEG and BMP. A PNG and a JPEG among them carry an embedded ICC
+profile, as image editors and phone cameras save them.
 
 On macOS the build writes none of the AWT libraries, so a native image does
 not scale icons. The tray still works: `NSImage` decodes the icon itself and
