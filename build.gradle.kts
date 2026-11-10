@@ -263,23 +263,17 @@ val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     onlyIf("macOS") { isMac }
 }
 
-// What Tray.create does next to AWT on macOS, which is what a Compose or Swing
-// app runs into. Reports only, see MacAwtProbe. Run with and without the flag
-// the backend's log recommends, since an app can only pick one. Not part of
-// check: CI runs these on macOS without letting them fail the build.
-listOf(
-    "macAwtProbe" to emptyList(),
-    "macAwtProbeFirstThread" to listOf("-XstartOnFirstThread"),
-).forEach { (taskName, extraArgs) ->
-    tasks.register<JavaExec>(taskName) {
-        group = "verification"
-        description = "Report what Tray.create returns next to AWT, JVM flags: $extraArgs."
-        classpath = sourceSets.test.get().runtimeClasspath
-        mainClass.set("dev.hivens.libtray.macos.MacAwtProbeKt")
-        jvmArgs(listOf("--enable-native-access=ALL-UNNAMED") + extraArgs)
-        val isMac = osName.contains("mac")
-        onlyIf("macOS") { isMac }
-    }
+// The tray next to AWT on macOS, created from a background thread and from the
+// EDT, which is what a Compose or Swing app does. Deliberately without
+// -XstartOnFirstThread, which such an app does not run with. Skipped off macOS.
+val macAwtCheck = tasks.register<JavaExec>("macAwtCheck") {
+    group = "verification"
+    description = "Create, update and close a macOS status item from AWT's threads."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacAwtCheckKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    val isMac = osName.contains("mac")
+    onlyIf("macOS") { isMac }
 }
 
 // GraalVM native-image check: the platform's check program built as a native
@@ -388,7 +382,7 @@ tasks.register<JavaExec>("nativeAgentRun") {
 }
 
 tasks.check {
-    dependsOn(sniHostTest, macSmokeCheck)
+    dependsOn(sniHostTest, macSmokeCheck, macAwtCheck)
 }
 
 tasks.withType<Jar>().configureEach {

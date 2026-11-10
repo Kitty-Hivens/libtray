@@ -20,8 +20,8 @@ jobs:
     # `check` covers each platform beyond the unit tests: on Linux the SNI
     # backend runs against a private session bus with the test as tray host
     # (sniHostTest), on macOS a status item is created, driven and closed
-    # (macSmokeCheck), and on Windows the Win32 tests post the tray window
-    # the shell's callbacks.
+    # (macSmokeCheck) and created from AWT's threads (macAwtCheck), and on
+    # Windows the Win32 tests post the tray window the shell's callbacks.
     name: Build & test (${{ matrix.name }})
     timeout-minutes: 30
     strategy:
@@ -52,12 +52,6 @@ jobs:
         run: command -v dbus-daemon
       - name: Build + test
         run: ./gradlew build --stacktrace
-      # Reports what Tray.create does next to AWT, for reading in the log. Allowed
-      # to fail because a hang is one of the answers it is looking for.
-      - name: Probe Tray.create next to AWT
-        if: runner.os == 'macOS'
-        continue-on-error: true
-        run: ./gradlew macAwtProbe macAwtProbeFirstThread --continue --stacktrace
       - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v7
