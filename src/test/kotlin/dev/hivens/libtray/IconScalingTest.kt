@@ -159,6 +159,17 @@ class IconScalingTest {
     }
 
     @Test
+    fun `every test icon decodes and fits on the JVM`() {
+        // The native checks expect these sizes. On the JVM every reader is
+        // there, so a mismatch here is the fixture's fault, not the metadata's.
+        for (icon in ICON_FIXTURES) {
+            val fitted = IconScaling.fit(icon.bytes(), IconScaling.DEFAULT_MAX_SIZE, log)
+            val image = IconScaling.decode(fitted) ?: error("${icon.name} did not decode")
+            (image.width to image.height) shouldBe (icon.shownSize to icon.shownSize)
+        }
+    }
+
+    @Test
     fun `the builder scales by default and honours an explicit opt-out`() {
         TrayBuilder(title = "T", iconBytes = png(8, 8)).maxIconSize shouldBe IconScaling.DEFAULT_MAX_SIZE
         TrayBuilder(title = "T", iconBytes = png(8, 8), maxIconSize = null).maxIconSize shouldBe null

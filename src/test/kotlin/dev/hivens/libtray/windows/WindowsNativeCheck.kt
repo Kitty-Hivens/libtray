@@ -5,6 +5,7 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
 import dev.hivens.libtray.solidPng
@@ -38,6 +39,12 @@ fun main() {
     // rejects anything over 256, so this fails if scaling did not happen.
     if (!tray.setIcon(solidPng(300))) fail("setIcon with an icon that needs scaling")
     step("updated")
+
+    // Every colour model and reader. setIcon returns false for bytes it
+    // cannot turn into an HICON.
+    val undecoded = ICON_FIXTURES.filter { !tray.setIcon(it.bytes()) }
+    if (undecoded.isNotEmpty()) fail("icons that did not decode: ${undecoded.map { it.name }}")
+    step("all ${ICON_FIXTURES.size} icon formats decoded")
 
     post(tray, Win32Bindings.WM_LBUTTONUP)
     expect(events, TrayEvent.Activated)

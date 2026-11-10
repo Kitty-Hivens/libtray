@@ -5,6 +5,7 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
 import dev.hivens.libtray.linux.DBusTestClient.Arg
@@ -22,8 +23,9 @@ import kotlin.system.exitProcess
  * and `nativeAgentRun` tasks provide.
  *
  * Covers what a native image is most likely to break: loading libdbus and
- * binding every downcall, building the icon pixmap through ImageIO and
- * scaling an oversized icon, the watcher registration, host clicks and a menu
+ * binding every downcall, building the icon pixmap through ImageIO for every
+ * kind of icon in [ICON_FIXTURES] and scaling an oversized one, the watcher
+ * registration, host clicks and a menu
  * click reaching the listener, and close(). Exit code 0 means every step
  * passed.
  */
@@ -57,6 +59,14 @@ fun main() {
     val scaled = host.firstIconPixmapSize(name)
     if (scaled != (256 to 256)) fail("oversized icon came back as $scaled, expected 256x256")
     step("oversized icon scaled to 256x256")
+
+    // Every colour model and reader: setIcon keeps the old icon and returns
+    // false for bytes it cannot decode, so both the result and the size count.
+    val undecoded = ICON_FIXTURES.filter { icon ->
+        !tray.setIcon(icon.bytes()) || host.firstIconPixmapSize(name) != (icon.shownSize to icon.shownSize)
+    }
+    if (undecoded.isNotEmpty()) fail("icons that did not decode: ${undecoded.map { it.name }}")
+    step("all ${ICON_FIXTURES.size} icon formats decoded")
 
     host.callNoResult(name, DBusTestClient.ITEM_PATH, DBusTestClient.ITEM_IFACE, "Activate", listOf(Arg.Int32(0), Arg.Int32(0)))
     expect(events, TrayEvent.Activated)
