@@ -32,15 +32,9 @@ tasks.register<JavaExec>("runSmoke") {
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("dev.hivens.libtray.SmokeMainKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
-    // macOS pins NSStatusItem (and every NSWindow constructor it
-    // delegates to) to OS thread 0 — the actual process main thread.
-    // Without `-XstartOnFirstThread`, the JVM main thread runs on a
-    // worker thread that AppKit refuses with
-    //   *** NSInternalInconsistencyException: NSWindow should only
-    //       be instantiated on the main thread!
-    // AWT EDT also doesn't fit — it's a separate thread spawned by
-    // CocoaToolkit. The flag makes JVM main == OS thread 0 == AppKit
-    // main thread, so libtray's calls land where Cocoa wants them.
+    // SmokeMain has no UI toolkit, so on macOS it creates the tray on the
+    // main thread and runs [NSApp run] there itself. Both need its main()
+    // on OS thread 0, which is what -XstartOnFirstThread does.
     if (osName.contains("mac")) {
         jvmArgs("-XstartOnFirstThread")
     }
@@ -251,8 +245,8 @@ val sniHostTest = tasks.register<Test>("sniHostTest") {
 }
 
 // Non-interactive macOS check: create, update, fire a menu item, close from
-// another thread. A program rather than a test because the status item has
-// to be created on the Cocoa main thread. Skipped off macOS.
+// another thread. A program rather than a test because it has no UI toolkit
+// and runs the Cocoa loop on the main thread itself. Skipped off macOS.
 val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     group = "verification"
     description = "Create, drive and close a macOS status item without user input."

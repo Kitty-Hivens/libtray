@@ -105,9 +105,11 @@ public interface Tray : AutoCloseable {
          *
          * Can be called from any thread. On macOS, off the Cocoa main thread,
          * it builds the status item on the main queue and waits for it, up
-         * to five seconds. That needs something running the Cocoa loop on the
-         * main thread, as AWT, Swing, Compose and JavaFX apps have, and it
-         * returns null if the main thread does not get to it in time.
+         * to five seconds. That needs a UI toolkit that already runs the Cocoa
+         * application, as an AWT, Swing, Compose or JavaFX app does once its
+         * UI is up. Before that, and when the main thread does not get to it
+         * in time, it returns null rather than take the application over from
+         * the toolkit that is about to start.
          */
         @JvmStatic
         public fun create(builder: TrayBuilder): Tray? {
