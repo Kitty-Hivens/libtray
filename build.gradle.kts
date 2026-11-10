@@ -276,6 +276,20 @@ val macAwtCheck = tasks.register<JavaExec>("macAwtCheck") {
     onlyIf("macOS") { isMac }
 }
 
+// The same check with Tray.create called before AWT starts, as an app does
+// that sets its tray up before its first window. A process of its own, since
+// AWT can only start once per JVM.
+val macAwtCheckBeforeAwt = tasks.register<JavaExec>("macAwtCheckBeforeAwt") {
+    group = "verification"
+    description = "Call Tray.create before AWT starts on macOS and check that AWT still comes up as its own."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacAwtCheckKt")
+    args("before-awt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    val isMac = osName.contains("mac")
+    onlyIf("macOS") { isMac }
+}
+
 // GraalVM native-image check: the platform's check program built as a native
 // image against the library jar, then run. This is what a consumer's native
 // build sees, so a missing foreign call or upcall target or a packaging
@@ -382,7 +396,7 @@ tasks.register<JavaExec>("nativeAgentRun") {
 }
 
 tasks.check {
-    dependsOn(sniHostTest, macSmokeCheck, macAwtCheck)
+    dependsOn(sniHostTest, macSmokeCheck, macAwtCheck, macAwtCheckBeforeAwt)
 }
 
 tasks.withType<Jar>().configureEach {
