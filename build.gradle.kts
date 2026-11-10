@@ -32,15 +32,9 @@ tasks.register<JavaExec>("runSmoke") {
     classpath = sourceSets.test.get().runtimeClasspath
     mainClass.set("dev.hivens.libtray.SmokeMainKt")
     jvmArgs("--enable-native-access=ALL-UNNAMED")
-    // macOS pins NSStatusItem (and every NSWindow constructor it
-    // delegates to) to OS thread 0 — the actual process main thread.
-    // Without `-XstartOnFirstThread`, the JVM main thread runs on a
-    // worker thread that AppKit refuses with
-    //   *** NSInternalInconsistencyException: NSWindow should only
-    //       be instantiated on the main thread!
-    // AWT EDT also doesn't fit — it's a separate thread spawned by
-    // CocoaToolkit. The flag makes JVM main == OS thread 0 == AppKit
-    // main thread, so libtray's calls land where Cocoa wants them.
+    // SmokeMain has no UI toolkit, so on macOS it creates the tray on the
+    // main thread and runs [NSApp run] there itself. Both need its main()
+    // on OS thread 0, which is what -XstartOnFirstThread does.
     if (osName.contains("mac")) {
         jvmArgs("-XstartOnFirstThread")
     }
@@ -251,8 +245,8 @@ val sniHostTest = tasks.register<Test>("sniHostTest") {
 }
 
 // Non-interactive macOS check: create, update, fire a menu item, close from
-// another thread. A program rather than a test because the status item has
-// to be created on the Cocoa main thread. Skipped off macOS.
+// another thread. A program rather than a test because it has no UI toolkit
+// and runs the Cocoa loop on the main thread itself. Skipped off macOS.
 val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     group = "verification"
     description = "Create, drive and close a macOS status item without user input."
@@ -263,23 +257,31 @@ val macSmokeCheck = tasks.register<JavaExec>("macSmokeCheck") {
     onlyIf("macOS") { isMac }
 }
 
-// What Tray.create does next to AWT on macOS, which is what a Compose or Swing
-// app runs into. Reports only, see MacAwtProbe. Run with and without the flag
-// the backend's log recommends, since an app can only pick one. Not part of
-// check: CI runs these on macOS without letting them fail the build.
-listOf(
-    "macAwtProbe" to emptyList(),
-    "macAwtProbeFirstThread" to listOf("-XstartOnFirstThread"),
-).forEach { (taskName, extraArgs) ->
-    tasks.register<JavaExec>(taskName) {
-        group = "verification"
-        description = "Report what Tray.create returns next to AWT, JVM flags: $extraArgs."
-        classpath = sourceSets.test.get().runtimeClasspath
-        mainClass.set("dev.hivens.libtray.macos.MacAwtProbeKt")
-        jvmArgs(listOf("--enable-native-access=ALL-UNNAMED") + extraArgs)
-        val isMac = osName.contains("mac")
-        onlyIf("macOS") { isMac }
-    }
+// The tray next to AWT on macOS, created from a background thread and from the
+// EDT, which is what a Compose or Swing app does. Deliberately without
+// -XstartOnFirstThread, which such an app does not run with. Skipped off macOS.
+val macAwtCheck = tasks.register<JavaExec>("macAwtCheck") {
+    group = "verification"
+    description = "Create, update and close a macOS status item from AWT's threads."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacAwtCheckKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    val isMac = osName.contains("mac")
+    onlyIf("macOS") { isMac }
+}
+
+// The same check with Tray.create called before AWT starts, as an app does
+// that sets its tray up before its first window. A process of its own, since
+// AWT can only start once per JVM.
+val macAwtCheckBeforeAwt = tasks.register<JavaExec>("macAwtCheckBeforeAwt") {
+    group = "verification"
+    description = "Call Tray.create before AWT starts on macOS and check that AWT still comes up as its own."
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.MacAwtCheckKt")
+    args("before-awt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    val isMac = osName.contains("mac")
+    onlyIf("macOS") { isMac }
 }
 
 // GraalVM native-image check: the platform's check program built as a native
@@ -388,7 +390,7 @@ tasks.register<JavaExec>("nativeAgentRun") {
 }
 
 tasks.check {
-    dependsOn(sniHostTest, macSmokeCheck)
+    dependsOn(sniHostTest, macSmokeCheck, macAwtCheck, macAwtCheckBeforeAwt)
 }
 
 tasks.withType<Jar>().configureEach {

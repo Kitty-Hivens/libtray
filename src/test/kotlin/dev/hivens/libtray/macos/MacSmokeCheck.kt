@@ -24,9 +24,10 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.system.exitProcess
 
 /**
- * Non-interactive macOS check for CI, run by `./gradlew macSmokeCheck`. A
- * status item can only be created on the Cocoa main thread, which a JUnit
- * worker is not, so this is a program launched with -XstartOnFirstThread.
+ * Non-interactive macOS check for CI, run by `./gradlew macSmokeCheck`. With
+ * no UI toolkit to run the Cocoa application, it creates its trays on the main
+ * thread and runs `[NSApp run]` there itself, so it is a program launched with
+ * -XstartOnFirstThread rather than a JUnit test.
  *
  * Clicks are built as `NSEvent`s in-process and sent straight to the click
  * overlay's mouse handlers, the path a real click takes once AppKit has hit

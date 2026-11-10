@@ -40,6 +40,11 @@ internal class ObjcBindings private constructor(
     private val selCache:   MutableMap<String, MemorySegment>,
     /** Address of the GCD main queue (`_dispatch_main_q`), or NULL if libdispatch didn't resolve. */
     val mainQueue: MemorySegment,
+    /**
+     * Address of AppKit's `NSApp` global, or NULL if it did not resolve.
+     * Reading it does not create the application, unlike `+sharedApplication`.
+     */
+    val applicationGlobal: MemorySegment,
 ) {
 
     fun handle(name: String): MethodHandle =
@@ -304,7 +309,9 @@ internal class ObjcBindings private constructor(
             // -> NULL, and runOnMainQueue degrades to a direct call.
             val mainQueue = lookups.firstNotNullOfOrNull { it.find("_dispatch_main_q").orElse(null) }
                 ?: MemorySegment.NULL
-            return ObjcBindings(arena, handles, ConcurrentHashMap(), ConcurrentHashMap(), mainQueue)
+            val applicationGlobal = lookups.firstNotNullOfOrNull { it.find("NSApp").orElse(null) }
+                ?: MemorySegment.NULL
+            return ObjcBindings(arena, handles, ConcurrentHashMap(), ConcurrentHashMap(), mainQueue, applicationGlobal)
         }
     }
 }

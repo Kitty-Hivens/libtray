@@ -56,15 +56,17 @@ import java.util.concurrent.atomic.AtomicLong
  *      button's own target-action stays for presses that do not come from
  *      the mouse, such as VoiceOver.
  *
- * **Threading.** Mutating calls (setIcon / setTooltip / setMenu) marshal
- * onto the Cocoa main queue via libdispatch (`dispatch_async_f`, see
- * [runOnMainQueue]): a call already on the main thread runs inline, any other
- * thread enqueues. AppKit therefore always runs where it wants regardless of
- * which thread the consumer calls from, and the public setters still return as
- * soon as the enqueue succeeds. The `onMenuItem:`, `onStatusItemClick:` and
- * status view mouse upcalls already arrive on the main thread by AppKit's
- * contract. [close] queues its teardown on the
- * main queue too, but waits for it, so the icon is gone when close()
+ * **Threading.** [create] off the main thread runs the creation on the Cocoa
+ * main queue and waits for it (see [createThroughMainQueue]), so an AWT, Swing
+ * or Compose app can call it from any thread once its UI is up. Mutating calls
+ * (setIcon / setTooltip / setMenu) marshal onto the same queue via libdispatch
+ * (`dispatch_async_f`, see [runOnMainQueue]): a call already on the main
+ * thread runs inline, any other thread enqueues. AppKit therefore always runs
+ * where it wants regardless of which thread the consumer calls from, and the
+ * public setters still return as soon as the enqueue succeeds. The
+ * `onMenuItem:`, `onStatusItemClick:` and status view mouse upcalls already
+ * arrive on the main thread by AppKit's contract. [close] queues its teardown
+ * on the main queue too, but waits for it, so the icon is gone when close()
  * returns (see [tearDownOnMainThread]).
  */
 internal class AppKitTrayImpl private constructor(
@@ -73,6 +75,8 @@ internal class AppKitTrayImpl private constructor(
     private val statusButton: MemorySegment, // NSStatusBarButton* (owned by statusItem)
     private val instanceId: Int,
     initial: TrayBuilder,
+    /** [initial]'s icon, already scaled by the caller so the main thread does not have to. */
+    initialIcon: ByteArray,
 ) : Tray {
 
     private val log = LoggerFactory.getLogger("libtray.AppKitTray")
@@ -135,7 +139,7 @@ internal class AppKitTrayImpl private constructor(
         // title gets overwritten visually by setImage if the image
         // does succeed; otherwise it stays as the visible fallback.
         applyTitleFallback("●")
-        if (initial.iconBytes.isNotEmpty()) applyIcon(initial.iconBytes)
+        if (initialIcon.isNotEmpty()) showIcon(initialIcon)
         initial.tooltip?.takeIf { it.isNotEmpty() }?.let { applyTooltip(it) }
         initial.menu?.let { applyMenu(it) }
     }
@@ -285,7 +289,11 @@ internal class AppKitTrayImpl private constructor(
         // Scale on the calling thread, before the marshal: it is pure JVM
         // image work with no AppKit involvement, and doing it here keeps
         // the main queue free of a full-resolution decode + re-encode.
-        val pngBytes = IconScaling.fit(rawPngBytes, maxIconSize, log)
+        showIcon(IconScaling.fit(rawPngBytes, maxIconSize, log))
+    }
+
+    /** Install already scaled [pngBytes] on the button, on the main queue. */
+    private fun showIcon(pngBytes: ByteArray) {
         runOnMainQueue {
             autoreleasepool {
                 val nsData = bindings.nsData(pngBytes)
@@ -743,19 +751,7 @@ internal class AppKitTrayImpl private constructor(
         enqueueOnMainQueue { if (open.get()) action() }
     }
 
-    /** `dispatch_async_f` [action] onto the main queue. False when the enqueue itself failed. */
-    private fun enqueueOnMainQueue(action: () -> Unit): Boolean {
-        val id = dispatchCounter.getAndIncrement()
-        PENDING[id] = action
-        val enqueued = runCatching {
-            bindings.handle("dispatch_async_f").invokeExact(
-                bindings.mainQueue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
-            ) as Unit
-            true
-        }.getOrDefault(false)
-        if (!enqueued) PENDING.remove(id)  // never came back; don't strand the entry
-        return enqueued
-    }
+    private fun enqueueOnMainQueue(action: () -> Unit): Boolean = enqueueOnMainQueue(bindings, action) != null
 
     internal companion object {
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
@@ -786,6 +782,9 @@ internal class AppKitTrayImpl private constructor(
         /** How long close() waits for the main queue to run the teardown. Matches the other backends' join budget. */
         private const val CLOSE_ON_MAIN_TIMEOUT_MS: Long = 2_000
 
+        /** How long create() waits for the main queue to build the tray. Matches the Windows backend's startup wait. */
+        private const val CREATE_ON_MAIN_TIMEOUT_MS: Long = 5_000
+
         /** `NSEventModifierFlagControl` from NSEvent.h. */
         private const val NS_EVENT_MODIFIER_FLAG_CONTROL: Long = 1L shl 18
 
@@ -810,6 +809,24 @@ internal class AppKitTrayImpl private constructor(
         fun dispatchTrampoline(context: MemorySegment) {
             val action = PENDING.remove(context.address()) ?: return
             runCatching { action() }.onFailure { log.warn("main-queue action threw", it) }
+        }
+
+        /**
+         * `dispatch_async_f` [action] onto the main queue. Returns the id it
+         * waits under in [PENDING], so a caller that gives up can drop it, or
+         * null when the enqueue itself failed.
+         */
+        private fun enqueueOnMainQueue(bindings: ObjcBindings, action: () -> Unit): Long? {
+            val id = dispatchCounter.getAndIncrement()
+            PENDING[id] = action
+            val enqueued = runCatching {
+                bindings.handle("dispatch_async_f").invokeExact(
+                    bindings.mainQueue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
+                ) as Unit
+                true
+            }.getOrDefault(false)
+            if (!enqueued) PENDING.remove(id)  // never came back, don't strand the entry
+            return if (enqueued) id else null
         }
 
         /** The single shared upcall stub bridging GCD to [dispatchTrampoline]. Built once, process-lifetime. */
@@ -944,26 +961,109 @@ internal class AppKitTrayImpl private constructor(
                 log.info("Objective-C runtime / AppKit not loadable — AppKit tray unavailable")
                 return null
             }
-
-            // Caller-thread check. NSStatusItem and every NSWindow
-            // constructor it delegates to are pinned to OS thread 0
-            // (Cocoa main thread). On a JVM that's the JVM main thread
-            // ONLY when launched with `-XstartOnFirstThread`. Without
-            // it, AppKit will throw `NSInternalInconsistencyException`
-            // mid-construction — surface a clean nullable return + a
-            // pointer at the fix instead, which downstream consumers
-            // can act on. (Also detects calls from worker threads of
-            // a properly-flagged process.)
-            if (!isCocoaMainThread(bindings)) {
+            // NSStatusItem and the NSWindow behind it only work on the Cocoa
+            // main thread (OS thread 0). In an AWT, Swing or Compose app that
+            // thread belongs to AWT, so the caller is never on it.
+            if (isCocoaMainThread(bindings)) {
+                return createOnMainThread(bindings, builder, IconScaling.fit(builder.iconBytes, builder.maxIconSize, log))
+            }
+            if (bindings.mainQueue.address() == 0L) {
                 log.warn(
-                    "AppKit tray must be created on the Cocoa main thread (OS thread 0). " +
-                        "Add `-XstartOnFirstThread` to the JVM launch args, and call Tray.create " +
-                        "from your application's main thread. Current thread: {}",
+                    "libdispatch did not resolve, so the tray can only be created on the Cocoa main thread. " +
+                        "Current thread: {}",
                     Thread.currentThread().name,
                 )
                 return null
             }
+            return createThroughMainQueue(bindings, builder)
+        }
 
+        /**
+         * Run [createOnMainThread] on the Cocoa main queue and wait for it.
+         * The queue is served by whatever runs the main thread's Cocoa loop:
+         * AWT in an AWT, Swing or Compose app, Glass in a JavaFX one.
+         *
+         * Only into an application a UI toolkit already runs. Before AWT
+         * starts, the java launcher's own loop on the main thread serves the
+         * queue too, and creating the tray then would create NSApp as a plain
+         * NSApplication. AWT needs its own NSApplicationAWT there, and finding
+         * the application taken it runs embedded. So that case returns null.
+         *
+         * The wait is bounded, because a main thread that is blocked, or a
+         * process where nothing runs the Cocoa loop, would otherwise hang the
+         * caller. A give-up never leaves a status item nobody owns: a creation
+         * that has not started by then is skipped, and one that finishes
+         * afterwards closes its tray again.
+         */
+        private fun createThroughMainQueue(bindings: ObjcBindings, builder: TrayBuilder): Tray? {
+            // Plain JVM work, kept off the main thread, which in these apps is AWT's.
+            val icon = IconScaling.fit(builder.iconBytes, builder.maxIconSize, log)
+            val handoff = Any()
+            var abandoned = false
+            var finished = false
+            var created: Tray? = null
+            val done = CountDownLatch(1)
+
+            fun createQueued() {
+                try {
+                    if (synchronized(handoff) { abandoned }) return
+                    val tray = if (hostRunsApplication(bindings)) {
+                        createOnMainThread(bindings, builder, icon)
+                    } else {
+                        log.warn(
+                            "No UI toolkit runs the Cocoa application yet, so the tray is not created. " +
+                                "Create it once the app's first window is up, or on the main thread.",
+                        )
+                        null
+                    }
+                    val unwanted = synchronized(handoff) {
+                        finished = true
+                        if (abandoned) tray else {
+                            created = tray
+                            null
+                        }
+                    }
+                    // On the main thread, so this tears down inline.
+                    unwanted?.close()
+                } finally {
+                    done.countDown()
+                }
+            }
+
+            val pendingId = enqueueOnMainQueue(bindings, ::createQueued) ?: run {
+                log.warn("Could not queue the tray creation on the Cocoa main queue")
+                return null
+            }
+            done.awaitPastInterrupt(CREATE_ON_MAIN_TIMEOUT_MS)
+            synchronized(handoff) {
+                if (finished) return created
+                abandoned = true
+            }
+            // Not run yet: drop it, so a main thread that never gets to it does
+            // not keep the builder and its icon for the life of the process.
+            PENDING.remove(pendingId)
+            log.warn(
+                "The Cocoa main queue did not run the tray creation within {} ms. The main thread is " +
+                    "blocked, or nothing runs a Cocoa loop on it.",
+                CREATE_ON_MAIN_TIMEOUT_MS,
+            )
+            return null
+        }
+
+        /**
+         * Whether a UI toolkit already runs NSApp. Reads AppKit's `NSApp`
+         * global instead of `+sharedApplication`, which would create the
+         * application. Main thread, like every other use of NSApp here.
+         */
+        private fun hostRunsApplication(bindings: ObjcBindings): Boolean {
+            val global = bindings.applicationGlobal
+            if (global.address() == 0L) return false
+            val app = global.reinterpret(ValueLayout.ADDRESS.byteSize()).get(ValueLayout.ADDRESS, 0)
+            return app.address() != 0L && isNSAppRunning(bindings, app)
+        }
+
+        /** Build the status item and the tray around it, showing the already scaled [icon]. Cocoa main thread only. */
+        private fun createOnMainThread(bindings: ObjcBindings, builder: TrayBuilder, icon: ByteArray): Tray? {
             return runCatching {
                 log.info("[create] step 1/5: ensure NSApplication is initialised")
                 ensureNSApplicationInitialised(bindings)
@@ -1016,18 +1116,16 @@ internal class AppKitTrayImpl private constructor(
                     ) as Unit
                 }
                 log.info("AppKit status item up: 0x{}", retainedItem.address().toString(16))
-                AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder) as Tray
+                AppKitTrayImpl(bindings, retainedItem, button, instanceCounter.incrementAndGet(), builder, icon) as Tray
             }.onFailure { log.warn("AppKit tray construction threw", it) }.getOrNull()
         }
 
         /**
          * Ask Cocoa whether the caller is on the main thread.
-         * Equivalent to `[NSThread isMainThread]` — returns true only
-         * when the calling thread is OS thread 0, which is what every
-         * AppKit ops MUST run on. Used as a fail-fast guard before any
-         * NSStatusBar interaction, with a clear log pointing at the
-         * `-XstartOnFirstThread` JVM flag for the typical
-         * misconfiguration.
+         * Equivalent to `[NSThread isMainThread]`: true only when the calling
+         * thread is OS thread 0, which is where every AppKit operation has to
+         * run. Decides whether create(), the setters and close() call AppKit
+         * inline or go through the main queue.
          */
         private fun isCocoaMainThread(bindings: ObjcBindings): Boolean {
             return runCatching {
