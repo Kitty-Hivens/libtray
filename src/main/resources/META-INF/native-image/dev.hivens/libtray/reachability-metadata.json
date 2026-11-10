@@ -45,7 +45,8 @@
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageTranscoderSpi"},
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "META-INF/services/javax.imageio.spi.ImageWriterSpi"},
     {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/awt/resources/awt_en.properties", "module": "java.desktop"},
-    {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/awt/resources/awt_en_US.properties", "module": "java.desktop"}
+    {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/awt/resources/awt_en_US.properties", "module": "java.desktop"},
+    {"condition": {"typeReached": "dev.hivens.libtray.IconScaling"}, "glob": "sun/java2d/cmm/profiles/sRGB.pf", "module": "java.desktop"}
   ],
   "foreign": {
     "downcalls": [
