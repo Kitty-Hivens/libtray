@@ -53,6 +53,7 @@
       { "returnType": "jboolean", "parameterTypes": ["void*", "void*", "void*", "void*"] },
       { "returnType": "jint", "parameterTypes": ["jint", "void*"] },
       { "returnType": "jint", "parameterTypes": ["void*", "jint", "jint", "jint", "jint", "void*", "void*"] },
+      { "returnType": "jint", "parameterTypes": ["void*", "jint", "jint", "void*"] },
       { "returnType": "jint", "parameterTypes": ["void*", "jint", "jlong", "jlong"] },
       { "returnType": "jint", "parameterTypes": ["void*", "jint", "jlong", "void*"] },
       { "returnType": "jint", "parameterTypes": ["void*", "jint", "void*", "jint"] },
