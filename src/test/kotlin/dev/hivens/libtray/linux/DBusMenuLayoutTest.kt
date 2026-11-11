@@ -102,6 +102,23 @@ class DBusMenuLayoutTest {
     }
 
     @Test
+    fun `underscores in labels are sent escaped so the host shows them`() {
+        // dbusmenu reads a single underscore as the access key marker and
+        // hides it, so my_server would render as myserver. A doubled one is
+        // shown as one underscore.
+        val layout = DBusMenuLayout(
+            TrayMenu(
+                TrayMenuItem.Standard(id = "a", label = "my_server"),
+                TrayMenuItem.Submenu(id = "b", label = "_dev__", items = listOf(TrayMenuItem.Standard("c", "c"))),
+            ),
+        )
+        layout.propertiesOf(1)["label"] shouldBe DBusMenuLayout.PropertyValue.Str("my__server")
+        layout.propertiesOf(2)["label"] shouldBe DBusMenuLayout.PropertyValue.Str("__dev____")
+        // The node keeps the caller's text, only the wire form is escaped.
+        layout.nodeOf(1)!!.label shouldBe "my_server"
+    }
+
+    @Test
     fun `duplicate caller ids stay distinct nodes`() {
         // TrayMenu deliberately does not enforce unique ids (see its init
         // comment), so two items can share one -- they must still be two
