@@ -1,5 +1,6 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -7,6 +8,7 @@ import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
+import dev.hivens.libtray.iconProblem
 import dev.hivens.libtray.solidPng
 import dev.hivens.libtray.startWatchdog
 import dev.hivens.libtray.step
@@ -38,6 +40,13 @@ fun main() {
     // rejects anything over 256, so this fails if scaling did not happen.
     if (!tray.setIcon(solidPng(300))) fail("setIcon with an icon that needs scaling")
     step("updated")
+
+    // Every colour model and reader, compared with the JVM's pixels. setIcon
+    // also has to accept each one, which it only does for an icon of at most
+    // 256 px, so an oversized one that missed its scaling fails as well.
+    val problems = ICON_FIXTURES.mapNotNull { icon -> iconProblem(icon) { tray.setIcon(it) } }
+    if (problems.isNotEmpty()) fail("icons that did not decode as on the JVM: $problems")
+    step("all ${ICON_FIXTURES.size} icon formats decoded as on the JVM")
 
     post(tray, Win32Bindings.WM_LBUTTONUP)
     expect(events, TrayEvent.Activated)

@@ -1,4 +1,7 @@
 {
+  "resources": [
+    { "glob": "icons/*" }
+  ],
   "foreign": {
     "downcalls": [
       { "returnType": "void", "parameterTypes": ["void*", "jint", "jlong"] },

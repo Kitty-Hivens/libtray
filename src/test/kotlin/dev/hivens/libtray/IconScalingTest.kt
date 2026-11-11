@@ -1,5 +1,6 @@
 package dev.hivens.libtray
 
+import io.kotest.assertions.withClue
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.shouldNotBe
 import org.junit.jupiter.api.Test
@@ -156,6 +157,23 @@ class IconScalingTest {
         // try: some platforms accept formats ImageIO does not read.
         val garbage = byteArrayOf(1, 2, 3, 4, 5)
         IconScaling.fit(garbage, 256, log) shouldBe garbage
+    }
+
+    @Test
+    fun `every test icon is what it claims and decodes as expected on the JVM`() {
+        // The native checks compare against these. On the JVM every reader is
+        // there, so a mismatch here is the fixture's fault, not the metadata's,
+        // and an icon re-saved as another kind would drop its coverage silently.
+        for (icon in ICON_FIXTURES) {
+            val bytes = icon.bytes()
+            withClue(icon.name) {
+                fileKind(bytes) shouldBe icon.kind
+                decodedCentre(bytes) shouldBe icon.centre
+                val fitted = IconScaling.decode(IconScaling.fit(bytes, IconScaling.DEFAULT_MAX_SIZE, log))
+                    ?: error("${icon.name} did not decode after fitting")
+                (fitted.width to fitted.height) shouldBe (icon.shownSize to icon.shownSize)
+            }
+        }
     }
 
     @Test

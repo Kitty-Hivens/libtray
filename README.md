@@ -81,16 +81,17 @@ use, plus AWT and ImageIO entries for icon handling. Pass
 `--enable-native-access=ALL-UNNAMED` to `native-image` as well. Icon
 decoding goes through AWT, so on Linux and Windows the build writes `libawt`
 and its companion libraries next to the executable, and they have to ship
-with it. CI builds
-and runs a native check program on Linux, Windows and macOS against the jar
-and its metadata, using GraalVM for JDK 25. Older versions are untested, and
-the `SharedArenaSupport` option the jar enables may not exist on them.
+with it. CI builds and runs a native check program on Linux, Windows and
+macOS against the jar and its metadata, using GraalVM for JDK 25. Older
+versions are untested, and the `SharedArenaSupport` option the jar enables
+may not exist on them.
 
-On Linux and Windows those entries cover 8-bit RGB, RGBA, gray and
-gray+alpha PNGs. Other images, including palette PNGs such as `pngquant` or
-`optipng` output, 1-bit and 16-bit PNGs, GIF and JPEG, fail to decode in a
-native image, although they work on the JVM. Convert icons to 8-bit RGBA for
-a native build.
+On Linux and Windows the check sets icons of every kind it knows of and
+requires each to decode to the same pixels as on the JVM: palette PNGs at
+1, 4 and 8 bits (as `pngquant` and `optipng` write them), gray PNGs at 1, 8
+and 16 bits, gray with alpha at 8 bits, RGB and RGBA PNGs at 8 and 16 bits,
+and GIF, JPEG and BMP. A PNG and a JPEG among them carry an embedded ICC
+profile, as image editors and phone cameras save them.
 
 On macOS the build writes none of the AWT libraries, so a native image does
 not scale icons. The tray still works: `NSImage` decodes the icon itself and

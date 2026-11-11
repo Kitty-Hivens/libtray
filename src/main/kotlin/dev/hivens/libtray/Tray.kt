@@ -53,8 +53,8 @@ public interface Tray : AutoCloseable {
      * Replace the icon. PNG works on every platform. Linux and Windows decode
      * through ImageIO, so they take what the JDK reads (PNG, JPEG, GIF, BMP)
      * and not ICO or ICNS. macOS passes the bytes to NSImage, which also takes
-     * formats like ICNS. In a GraalVM native image the choice is narrower, see
-     * the README.
+     * formats like ICNS. The README lists what a GraalVM native image is
+     * checked to decode, and what it needs to ship for that.
      *
      * Bytes that do not decode leave the current icon in place on Linux and
      * Windows, which return false. macOS decodes on the main thread, shows a

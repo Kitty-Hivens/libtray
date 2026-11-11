@@ -14,8 +14,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   created. Consumers no longer maintain their own copy. A test regenerates
   the file from the backends' descriptor lists and fails when the
   committed one drifts, and CI builds and runs a native check program on
-  each platform against the jar. In a native image only 8-bit RGB, RGBA,
-  gray and gray+alpha PNGs decode so far, see the README.
+  each platform against the jar. On Linux and Windows that check decodes
+  palette PNGs at 1, 4 and 8 bits, gray at 1, 8 and 16, gray with alpha at
+  8, RGB and RGBA at 8 and 16, and GIF, JPEG and BMP, a PNG and a JPEG
+  among them with an embedded ICC profile, and compares the pixels with
+  the JVM's.
 - The jar's `native-image.properties` enables `SharedArenaSupport`,
   unlocking experimental options for that option alone. A native image
   only supports closing a shared arena with it, and `close()` releases the
