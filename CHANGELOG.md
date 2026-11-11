@@ -79,6 +79,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Windows: when the pump thread was slow to start, `Tray.create` could close
   the native bindings it was still using, and an icon added after `close()`
   removed the entry could stay in the notification area.
+- Windows: the icon disappeared for good when Explorer restarted. The tray
+  window was message-only, and such a window never gets the `TaskbarCreated`
+  broadcast a restarted Explorer sends. It is now a hidden top-level window
+  that adds the icon again on that broadcast, also when the application
+  runs elevated.
+- Windows: a click outside the open menu could leave it open, since its
+  message-only owner window could not take the foreground. The menu's owner
+  is now the hidden top-level window, and the message the `TrackPopupMenu`
+  documentation asks for after the menu closes is posted, without which the
+  next menu could appear and vanish at once.
 - macOS: with more than one tray, a menu click could be delivered to the
   wrong tray, because menu item tags were only unique within a tray.
 - macOS: each `Tray.create` kept another set of native bindings alive for the
