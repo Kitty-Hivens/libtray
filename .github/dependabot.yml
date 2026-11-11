@@ -15,8 +15,10 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
 
-  # The rows that go stale silently: an action pinned to a major that stops
-  # getting security fixes still runs green until it does not.
+  # The rows that go stale silently: an action pinned to a commit that stops
+  # getting security fixes still runs green until it does not. The workflows
+  # pin each action to a commit with its version in a comment, which is what
+  # this reads and moves.
   - package-ecosystem: github-actions
     directory: /
     schedule:
