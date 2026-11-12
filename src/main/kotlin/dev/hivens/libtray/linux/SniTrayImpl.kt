@@ -203,7 +203,10 @@ internal class SniTrayImpl internal constructor(
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
-        require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
+        if (iconBytes.isEmpty()) {
+            log.warn("setIcon got no bytes, keeping the current icon")
+            return false
+        }
         val pixmaps = pngToPixmaps(IconScaling.fit(iconBytes, maxIconSize, log))
         if (pixmaps.isEmpty()) {
             log.warn("Could not decode the new tray icon ({} bytes), keeping the current one", iconBytes.size)

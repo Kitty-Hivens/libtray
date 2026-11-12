@@ -148,7 +148,12 @@ internal class AppKitTrayImpl private constructor(
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
-        require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
+        // Checked here, since NSImage would turn no bytes into the text
+        // placeholder and report success.
+        if (iconBytes.isEmpty()) {
+            log.warn("setIcon got no bytes, keeping the current icon")
+            return false
+        }
         return runCatching { applyIcon(iconBytes); true }.getOrElse { t ->
             log.warn("setIcon threw", t); false
         }

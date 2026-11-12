@@ -40,6 +40,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   copying the whole frame.
 - A failed `Tray.create` is logged at WARN with its stack trace instead of
   at INFO with the message only.
+- `setIcon` with an empty array logs a warning, keeps the current icon and
+  returns false instead of throwing `IllegalArgumentException`, as it does
+  for bytes that do not decode. On macOS it no longer gets that far either,
+  so it does not show the text placeholder. `TrayBuilder` still rejects an
+  empty initial icon.
 
 ### Fixed
 - macOS: `Tray.create` returned null unless called on the Cocoa main thread,

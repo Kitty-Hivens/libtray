@@ -74,6 +74,9 @@ fun main() {
         nativeImage && shownWidth == 300L -> step("oversized icon shown at 300 px, no AWT in a macOS native image")
         else -> fail("the status button shows the oversized icon at $shownWidth px, expected 256")
     }
+    if (tray.setIcon(ByteArray(0))) fail("setIcon with no bytes returned true")
+    if (shownIconWidth(bindings, tray.statusButtonHandle) != shownWidth) fail("setIcon with no bytes replaced the icon")
+    step("setIcon with no bytes refused, icon kept")
     check(tray.setMenu(menu())) { "setMenu" }
 
     // [menu performActionForItemAtIndex:0] sends the item's action to its

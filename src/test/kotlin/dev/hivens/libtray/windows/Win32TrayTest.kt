@@ -35,6 +35,7 @@ class Win32TrayTest {
         try {
             tray.setTooltip("updated") shouldBe true
             tray.setIcon(solidPng(16)) shouldBe true
+            tray.setIcon(ByteArray(0)) shouldBe false
             tray.setMenu(TrayMenu(TrayMenuItem.Standard("only", "Only"))) shouldBe true
             tray.setMenu(null) shouldBe true
         } finally {

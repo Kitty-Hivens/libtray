@@ -99,6 +99,8 @@ class SniHostTest {
         val tray = open(name)
 
         tray.setIcon(byteArrayOf(1, 2, 3)) shouldBe false
+        // No bytes at all are the same case, not a reason to throw.
+        tray.setIcon(ByteArray(0)) shouldBe false
 
         host.firstIconPixmapSize(name) shouldBe (32 to 32)
     }
