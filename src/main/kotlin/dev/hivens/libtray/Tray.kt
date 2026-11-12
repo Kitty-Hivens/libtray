@@ -24,9 +24,7 @@ import java.util.concurrent.Executor
  * mutating call (`setTooltip` / `setIcon` / `setMenu`) returns boolean
  * success rather than throwing, so a transient backend failure
  * (D-Bus daemon restart, AppIndicator service unregister) degrades the
- * tray to "stale visual" instead of taking down the host application. The
- * one exception is an empty array passed to `setIcon`, a programming error
- * that throws IllegalArgumentException.
+ * tray to "stale visual" instead of taking down the host application.
  *
  * What a true return means differs by platform. On Windows the icon and
  * tooltip setters report the result of the shell call, and `setMenu` only
@@ -58,7 +56,8 @@ public interface Tray : AutoCloseable {
      *
      * Bytes that do not decode leave the current icon in place on Linux and
      * Windows, which return false. macOS decodes on the main thread, shows a
-     * text placeholder instead, and can still return true.
+     * text placeholder instead, and can still return true. An empty array
+     * keeps the current icon and returns false on every platform.
      * @return false when the tray is closed or the change failed. See the
      *   class KDoc for what true means on each platform.
      */

@@ -172,7 +172,10 @@ internal class Win32TrayImpl private constructor(
 
     override fun setIcon(iconBytes: ByteArray): Boolean {
         if (!open.get()) return false
-        require(iconBytes.isNotEmpty()) { "iconBytes must be non-empty" }
+        if (iconBytes.isEmpty()) {
+            log.warn("setIcon got no bytes, keeping the current icon")
+            return false
+        }
         // Scaling, decoding and the pixel conversion are plain JVM work and stay
         // outside the lock. CreateIcon runs under it, so close() cannot free the
         // arena between creating the HICON and handing it to the shell or
