@@ -31,7 +31,10 @@ public sealed interface TrayMenuItem {
     /** Stable id surfaced via [TrayEvent.MenuItemSelected] when clicked. */
     public val id: String
 
-    /** Localised label shown in the menu UI. */
+    /**
+     * Localised label shown in the menu UI, as written. `_` and `&` are shown
+     * as themselves and do not mark an access key on any platform.
+     */
     public val label: String
 
     /** When false, the item is rendered greyed-out and ignores clicks. */

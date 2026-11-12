@@ -673,7 +673,7 @@ internal class Win32TrayImpl private constructor(
                 is TrayMenuItem.Standard -> {
                     val cmd = nextCmd.getAndIncrement()
                     cmdToId[cmd] = item.id
-                    val labelSeg = allocateUtf16(tmpArena, item.label)
+                    val labelSeg = allocateUtf16(tmpArena, win32MenuLabel(item.label))
                     var flags = Win32Bindings.MF_STRING
                     if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
                     runCatching {
@@ -686,7 +686,7 @@ internal class Win32TrayImpl private constructor(
                     }.getOrNull()
                     if (child != null && child.address() != 0L) {
                         appendItems(child, item.items, cmdToId, nextCmd, tmpArena)
-                        val labelSeg = allocateUtf16(tmpArena, item.label)
+                        val labelSeg = allocateUtf16(tmpArena, win32MenuLabel(item.label))
                         var flags = Win32Bindings.MF_POPUP or Win32Bindings.MF_STRING
                         if (!item.enabled) flags = flags or Win32Bindings.MF_GRAYED
                         runCatching {
@@ -921,3 +921,10 @@ internal class Win32TrayImpl private constructor(
         }
     }
 }
+
+/**
+ * [label] as `AppendMenuW` text that shows it literally. A single `&` marks
+ * the next character as the access key and is not shown, a doubled one
+ * shows as `&`.
+ */
+internal fun win32MenuLabel(label: String): String = label.replace("&", "&&")

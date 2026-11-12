@@ -87,12 +87,12 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
         val props = LinkedHashMap<String, PropertyValue>()
         when (node.kind) {
             NodeKind.Standard -> {
-                props["label"] = PropertyValue.Str(node.label)
+                props["label"] = PropertyValue.Str(wireLabel(node.label))
                 if (!node.enabled) props["enabled"] = PropertyValue.Bool(false)
             }
             NodeKind.Submenu -> {
                 if (node.id != 0) {
-                    props["label"] = PropertyValue.Str(node.label)
+                    props["label"] = PropertyValue.Str(wireLabel(node.label))
                     if (!node.enabled) props["enabled"] = PropertyValue.Bool(false)
                 }
                 props["children-display"] = PropertyValue.Str("submenu")
@@ -103,6 +103,13 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
         }
         return props
     }
+
+    /**
+     * [label] as dbusmenu text that shows it literally. The spec reads a
+     * single underscore as the access key marker and hides it, and shows a
+     * doubled one as one underscore.
+     */
+    private fun wireLabel(label: String): String = label.replace("_", "__")
 
     internal data class Node(
         val id: Int,

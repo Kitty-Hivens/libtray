@@ -69,6 +69,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   either. On macOS the same flag on the main thread could end the JVM from a
   menu click.
 - Linux: a setter racing `close()` could throw instead of returning false.
+- Linux and Windows: menu labels show `_` and `&` as written. The tray host
+  read a single `_` as an access key marker and hid it, so `my_server`
+  showed as `myserver`, and a Windows menu did the same with `&`. A label
+  that used them to set an access key now shows them literally, as macOS
+  always did.
 - Windows: an idle tray woke its thread about 60 times a second. The pump
   now sleeps in `GetMessageW`. It also processes the `WM_CLOSE` that `close()`
   posts, which it used to exit before seeing, so the window is destroyed
