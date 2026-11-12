@@ -20,9 +20,21 @@ env:
   JAVA_VERSION: '22'
   JAVA_DISTRIBUTION: 'temurin'
 
+# Only the publish job writes, to create the release page.
+permissions:
+  contents: read
+
 jobs:
+  # The tag is what ships, so it goes through all of CI here rather than on the
+  # trust that main was green when it was cut: the build and tests on Linux,
+  # Windows and macOS, and the native image check on each of them.
+  checks:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   publish:
     name: Publish to Maven Central
+    needs: checks
     runs-on: ubuntu-latest
     timeout-minutes: 45
     environment: maven-central
@@ -30,13 +42,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-java@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
           java-version: ${{ env.JAVA_VERSION }}
-      - uses: gradle/actions/setup-gradle@v6
-
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Resolve the version
         id: version
         env:
@@ -70,11 +81,6 @@ jobs:
             exit 1
           fi
           echo "publishing $v"
-
-      # The tag is what ships, so it is tested here rather than on the trust
-      # that main was green when it was cut.
-      - name: Build + test
-        run: ./gradlew build --stacktrace
 
       - name: Publish
         env:
