@@ -29,8 +29,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Windows tray backend on top of `Shell_NotifyIcon` + a hidden
- * `HWND_MESSAGE` window. Project Panama bindings only — no JNA, no
+ * Windows tray backend on top of `Shell_NotifyIcon` + a hidden top-level
+ * window. Project Panama bindings only — no JNA, no
  * COM, no GDI+ — and one Panama upcall stub for the WndProc.
  *
  * Structural mirror of [dev.hivens.libtray.linux.SniTrayImpl]:
@@ -39,13 +39,16 @@ import java.util.concurrent.atomic.AtomicReference
  *   2. Register a unique window class — name suffixed with PID + counter
  *      so multiple Tray instances in the same process don't collide on
  *      `RegisterClassExW`.
- *   3. Create an `HWND_MESSAGE` window. Message-only window: no screen
- *      presence, no Z-order, but receives `WM_USER+1` dispatches from
- *      Shell_NotifyIcon all the same. Costs nothing visually.
+ *   3. Create a top-level window that is never shown. It receives the
+ *      `WM_USER+1` dispatches from Shell_NotifyIcon, and unlike a
+ *      message-only window it also gets the `TaskbarCreated` broadcast a
+ *      restarted Explorer sends and can take the foreground, which the popup
+ *      menu needs to close on a click elsewhere.
  *   4. Spin a daemon pump thread that drains the window's message queue
  *      via `GetMessageW` + `DispatchMessageW`.
- *   5. WndProc routes `WM_DESTROY` / `WM_USER+1` / `WM_COMMAND` to
- *      Kotlin-side handlers; everything else gets `DefWindowProcW`.
+ *   5. WndProc routes `WM_DESTROY` / `WM_USER+1` / `WM_COMMAND` and
+ *      `TaskbarCreated` to Kotlin-side handlers; everything else gets
+ *      `DefWindowProcW`.
  *   6. `Shell_NotifyIcon` NIM_ADD registers the icon (built from the
  *      builder's PNG via [iconPixels] and [createHicon]), NIM_SETVERSION opts into the
  *      v4 mouse-message format, NIM_MODIFY carries later icon / tooltip
@@ -69,7 +72,7 @@ internal class Win32TrayImpl private constructor(
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
-     * The HWND for the message-only window. Set by the pump thread once
+     * The HWND for the hidden window. Set by the pump thread once
      * `CreateWindowExW` returns. Read by the main thread after the
      * [readyLatch] fires; written and read on the pump thread thereafter.
      *
@@ -83,7 +86,7 @@ internal class Win32TrayImpl private constructor(
      */
     @Volatile private var hwnd: MemorySegment = MemorySegment.NULL
 
-    /** The message window, for tests that post it the callbacks the shell would. */
+    /** The hidden window, for tests that post it the callbacks the shell would. */
     internal val windowHandle: MemorySegment get() = hwnd
 
     /**
@@ -99,6 +102,12 @@ internal class Win32TrayImpl private constructor(
 
     /** Whether NIM_SETVERSION took, which decides how a right click arrives. Pump thread only. */
     private var version4: Boolean = false
+
+    /**
+     * The id Windows gave the `TaskbarCreated` message, or 0 when registering
+     * it failed. Pump thread only, set before the window exists.
+     */
+    private var taskbarCreated: Int = 0
 
     /**
      * Reusable NOTIFYICONDATAW struct. Allocated once on the bindings
@@ -419,7 +428,8 @@ internal class Win32TrayImpl private constructor(
         // (the WM_USER+1 callbacks Shell_NotifyIcon dispatches for mouse
         // events) queue up to the *creating* thread. We pump on this
         // thread, so we MUST create the window on this thread too.
-        val createdHwnd = createMessageWindow()
+        taskbarCreated = registerTaskbarCreated()
+        val createdHwnd = createHiddenWindow()
         if (createdHwnd == null || createdHwnd.address() == 0L) {
             log.warn("CreateWindowExW failed on pump thread (GetLastError={})", lastError())
             readyLatch.countDown()
@@ -427,7 +437,8 @@ internal class Win32TrayImpl private constructor(
         }
         hwnd = createdHwnd
         HWND_INSTANCES[createdHwnd.address()] = this
-        log.info("Win32 message window up: hwnd=0x{}", createdHwnd.address().toString(16))
+        log.info("Win32 tray window up: hwnd=0x{}", createdHwnd.address().toString(16))
+        allowTaskbarCreated(createdHwnd)
 
         val initialPixels = iconPixels(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
         // Under the lock and only while open. Once a create() that gave up on a
@@ -505,22 +516,26 @@ internal class Win32TrayImpl private constructor(
     }
 
     /**
-     * Create the message-only HWND. Runs on the pump thread (see
+     * Create the hidden top-level HWND. Runs on the pump thread (see
      * thread-affinity comment on [hwnd]). All other window-init work
      * (class registration, hInstance lookup) happened on the main
      * thread inside [Companion.createInternal] — that work is per-process
      * and thread-safe.
+     *
+     * Without WS_VISIBLE and never passed to ShowWindow, it has no screen
+     * presence. It has no parent, since a message-only window (parent
+     * HWND_MESSAGE) gets no broadcasts and cannot take the foreground.
      */
-    private fun createMessageWindow(): MemorySegment? {
+    private fun createHiddenWindow(): MemorySegment? {
         return runCatching {
             val windowName = allocateUtf16(bindings.arena, initial.title)
             bindings.handle("CreateWindowExW").invokeExact(
-                0,                                      // dwExStyle
+                Win32Bindings.WS_EX_TOOLWINDOW,         // dwExStyle
                 classNameSeg,                           // lpClassName
                 windowName,                             // lpWindowName
-                0,                                      // dwStyle
-                0, 0, 0, 0,                            // x, y, w, h (irrelevant for message-only)
-                Win32Bindings.HWND_MESSAGE,             // hWndParent — message-only
+                0,                                      // dwStyle, not WS_VISIBLE
+                0, 0, 0, 0,                            // x, y, w, h (never shown)
+                MemorySegment.NULL,                     // hWndParent, top-level
                 MemorySegment.NULL,                     // hMenu
                 hInstance,                              // hInstance
                 MemorySegment.NULL,                     // lpParam
@@ -528,12 +543,63 @@ internal class Win32TrayImpl private constructor(
         }.onFailure { log.warn("CreateWindowExW threw", it) }.getOrNull()
     }
 
+    /** The id of the message a restarted Explorer broadcasts, or 0 if Windows did not give one. */
+    private fun registerTaskbarCreated(): Int {
+        val id = runCatching {
+            Arena.ofConfined().use { tmp ->
+                bindings.handle("RegisterWindowMessageW").invokeExact(allocateUtf16(tmp, "TaskbarCreated")) as Int
+            }
+        }.getOrDefault(0)
+        if (id == 0) log.warn("RegisterWindowMessageW(TaskbarCreated) failed, the icon will not come back after an Explorer restart")
+        return id
+    }
+
+    /**
+     * Let TaskbarCreated through when this process runs elevated. Windows
+     * drops messages a lower integrity process such as Explorer sends to it
+     * unless the window allows them.
+     */
+    private fun allowTaskbarCreated(window: MemorySegment) {
+        if (taskbarCreated == 0) return
+        val ok = runCatching {
+            bindings.handle("ChangeWindowMessageFilterEx").invokeExact(
+                window, taskbarCreated, Win32Bindings.MSGFLT_ALLOW, MemorySegment.NULL,
+            ) as Int
+        }.getOrDefault(0)
+        if (ok == 0) log.debug("ChangeWindowMessageFilterEx failed (GetLastError={})", lastError())
+    }
+
+    /**
+     * Add the icon again after Explorer restarted, with the icon, tooltip and
+     * callback the struct already holds. The new shell knows nothing of the
+     * old entry, so it needs NIM_ADD and NIM_SETVERSION as at creation.
+     */
+    private fun addAgainAfterTaskbarRestart(): Unit = synchronized(shellLock) {
+        if (!open.get()) return
+        notifyIconDataFlags(Win32Bindings.NIF_MESSAGE or Win32Bindings.NIF_ICON or Win32Bindings.NIF_TIP or Win32Bindings.NIF_SHOWTIP)
+        val added = shellNotifyIcon(Win32Bindings.NIM_ADD)
+        version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
+        // Windows also sends TaskbarCreated when the display DPI changes,
+        // with the icon still in place, and then NIM_ADD fails harmlessly.
+        if (added) log.info("Taskbar was recreated, icon added again") else log.debug("NIM_ADD after TaskbarCreated failed (GetLastError={})", lastError())
+    }
+
     // ── WndProc dispatch (called from the upcall stub) ───────────────────
     //
     // Returns the LRESULT for the message. Most paths chain to
     // DefWindowProcW; the ones we explicitly handle take the bypass.
 
-    private fun handleMessage(uMsg: Int, wParam: Long, lParam: Long): Long = when (uMsg) {
+    private fun handleMessage(uMsg: Int, wParam: Long, lParam: Long): Long = when {
+        // Compared before anything else, and only when registered: an
+        // unregistered id of 0 would match WM_NULL.
+        taskbarCreated != 0 && uMsg == taskbarCreated -> {
+            addAgainAfterTaskbarRestart()
+            0L
+        }
+        else -> handleFixedMessage(uMsg, wParam, lParam)
+    }
+
+    private fun handleFixedMessage(uMsg: Int, wParam: Long, lParam: Long): Long = when (uMsg) {
         Win32Bindings.WM_DESTROY -> {
             // Window's gone — schedule pump exit. The WM_QUIT this posts
             // is what the pump loop above breaks on.
@@ -628,6 +694,12 @@ internal class Win32TrayImpl private constructor(
                     rootHmenu, flags, x, y, 0, hwnd, MemorySegment.NULL,
                 ) as Int
             }.getOrDefault(0)
+            // The TrackPopupMenu documentation asks for this: without a
+            // message to the owner after the menu closes, the menu shown the
+            // next time can appear and vanish at once.
+            runCatching {
+                bindings.handle("PostMessageW").invokeExact(hwnd, Win32Bindings.WM_NULL, 0L, 0L) as Int
+            }
 
             // DestroyMenu on the root walks any submenus attached via
             // MF_POPUP — that frees the whole HMENU tree in one call.

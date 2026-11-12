@@ -16,9 +16,10 @@ import java.lang.invoke.MethodHandle
  * object holds method handles for the subset of `user32`/`shell32`/`gdi32`/
  * `kernel32` the [Win32TrayImpl] uses.
  *
- * Wire-level approach: a hidden message-only `HWND_MESSAGE` window
- * receives `Shell_NotifyIcon` callbacks (`WM_USER+1` and friends), with a
- * `GetMessageW`/`DispatchMessageW` pump on a daemon thread we own.
+ * Wire-level approach: a hidden top-level window receives `Shell_NotifyIcon`
+ * callbacks (`WM_USER+1` and friends) and the shell's `TaskbarCreated`
+ * broadcast, with a `GetMessageW`/`DispatchMessageW` pump on a daemon thread
+ * we own.
  * Unlike the Linux SNI design, Win32 unavoidably needs ONE Panama upcall
  * stub — the WndProc — because Windows calls into the WndProc
  * synchronously to dispatch each message. The single stub routes by
@@ -44,6 +45,9 @@ internal class Win32Bindings private constructor(
         // ── Window message constants from winuser.h ─────────────────────────
         // We only declare the ones the tray dispatch actually keys on.
 
+        // Does nothing. Posted after TrackPopupMenu so the menu's next
+        // dismissal works, as the TrackPopupMenu documentation asks.
+        const val WM_NULL:       Int = 0x0000
         const val WM_DESTROY:    Int = 0x0002
         const val WM_CLOSE:      Int = 0x0010
         // Posted to the menu's owner window to cancel a tracking popup from
@@ -59,11 +63,16 @@ internal class Win32Bindings private constructor(
         const val WM_CONTEXTMENU: Int = 0x007B
 
         // ── Window-creation constants ───────────────────────────────────────
-        // HWND_MESSAGE = (HWND)-3 — pseudo-parent that puts the new window
-        // in the message-only window manager. No screen presence, but the
-        // window can still receive WM_USER messages from Shell_NotifyIcon.
 
-        val HWND_MESSAGE: MemorySegment = MemorySegment.ofAddress(-3L)
+        // Keeps the hidden window out of the taskbar and Alt+Tab even if
+        // something were to show it.
+        const val WS_EX_TOOLWINDOW: Int = 0x00000080
+
+        // Every top-level window, as the target of a broadcast post.
+        val HWND_BROADCAST: MemorySegment = MemorySegment.ofAddress(0xFFFFL)
+
+        // ChangeWindowMessageFilterEx action that lets a message through.
+        const val MSGFLT_ALLOW: Int = 1
 
         /**
          * Library names — Win32 system DLLs. JDK's `SymbolLookup.libraryLookup`
@@ -75,7 +84,7 @@ internal class Win32Bindings private constructor(
         /**
          * Symbols this binding loads. Each entry: name → (return layout or
          * null for void, arg layouts...). Covers the whole backend:
-         * message-only window + pump, Shell_NotifyIcon, icon construction
+         * hidden window + pump, Shell_NotifyIcon, icon construction
          * and the popup menu. Append here, not at the call site, when
          * reaching for a new Win32 call.
          *
@@ -157,6 +166,19 @@ internal class Win32Bindings private constructor(
             Triple("PostQuitMessage",
                 null,                                                       // void
                 listOf(ValueLayout.JAVA_INT),                               // int nExitCode
+            ),
+            Triple("RegisterWindowMessageW",
+                ValueLayout.JAVA_INT,                                       // UINT, 0 on failure
+                listOf(ValueLayout.ADDRESS),                                // LPCWSTR
+            ),
+            Triple("ChangeWindowMessageFilterEx",
+                ValueLayout.JAVA_INT,                                       // BOOL
+                listOf(
+                    ValueLayout.ADDRESS,    // HWND
+                    ValueLayout.JAVA_INT,   // UINT message
+                    ValueLayout.JAVA_INT,   // DWORD action
+                    ValueLayout.ADDRESS,    // PCHANGEFILTERSTRUCT (NULL)
+                ),
             ),
 
             // ── shell32: tray icon ─────────────────────────────────────────
