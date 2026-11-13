@@ -3,8 +3,8 @@ name: Publish
 # A release is cut from a tag: tag vX.Y.Z, push it, and this signs the
 # artifacts, uploads them to Maven Central and creates the GitHub release page
 # from the version's CHANGELOG section. The version comes from the tag,
-# not from gradle.properties -- the appVersion there is a SNAPSHOT placeholder
-# for local builds and would publish nonsense coordinates. The job runs in the
+# not from gradle.properties -- the appVersion there is a 9.9.9-TEST placeholder
+# for local builds, which the build refuses to publish to Central. The job runs in the
 # maven-central environment, so the credentials sit behind that environment's
 # approval rather than firing on any pushed tag.
 on:
