@@ -1,8 +1,12 @@
 package dev.hivens.libtray.linux
 
 import java.lang.foreign.Arena
+import java.lang.foreign.FunctionDescriptor
+import java.lang.foreign.Linker
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
+import java.lang.invoke.MethodHandle
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -44,19 +48,20 @@ internal class DBusTestClient : AutoCloseable {
 
     /**
      * Call [member] and hand the reply to [read] before it is freed. Throws
-     * with the D-Bus error name when the call fails.
+     * with the D-Bus error name when the call fails. A null [iface] sends the
+     * call without an interface, which D-Bus allows for method calls.
      */
     fun <T> call(
         destination: String,
         path: String,
-        iface: String,
+        iface: String?,
         member: String,
         args: List<Arg> = emptyList(),
         read: (reply: MemorySegment, arena: Arena) -> T,
     ): T = Arena.ofConfined().use { arena ->
         val msg = bindings.handle("dbus_message_new_method_call").invokeExact(
             arena.allocateUtf8(destination), arena.allocateUtf8(path),
-            arena.allocateUtf8(iface), arena.allocateUtf8(member),
+            iface?.let { arena.allocateUtf8(it) } ?: MemorySegment.NULL, arena.allocateUtf8(member),
         ) as MemorySegment
         check(msg.address() != 0L) { "could not build $iface.$member" }
         val iter = arena.allocate(bindings.messageIterLayout)
@@ -75,8 +80,45 @@ internal class DBusTestClient : AutoCloseable {
         }
     }
 
-    fun callNoResult(destination: String, path: String, iface: String, member: String, args: List<Arg> = emptyList()) =
+    fun callNoResult(destination: String, path: String, iface: String?, member: String, args: List<Arg> = emptyList()) =
         call(destination, path, iface, member, args) { _, _ -> }
+
+    /**
+     * Send a signal to [destination] alone. A signal with a destination
+     * reaches that connection whatever its match rules say, which is how any
+     * client on the bus can hand a tray item a signal it did not ask for.
+     */
+    fun sendSignal(destination: String, path: String, iface: String, member: String, args: List<Arg>) {
+        Arena.ofConfined().use { arena ->
+            val msg = bindings.handle("dbus_message_new_signal").invokeExact(
+                arena.allocateUtf8(path), arena.allocateUtf8(iface), arena.allocateUtf8(member),
+            ) as MemorySegment
+            check(msg.address() != 0L) { "could not build $iface.$member" }
+            try {
+                check((setDestination.invokeExact(msg, arena.allocateUtf8(destination)) as Int) != 0) { "set_destination failed" }
+                val iter = arena.allocate(bindings.messageIterLayout)
+                bindings.handle("dbus_message_iter_init_append").invokeExact(msg, iter) as Unit
+                for (arg in args) append(arena, iter, arg)
+                bindings.handle("dbus_connection_send").invokeExact(
+                    connection, msg, arena.allocate(ValueLayout.JAVA_INT),
+                ) as Int
+                bindings.handle("dbus_connection_flush").invokeExact(connection) as Unit
+            } finally {
+                bindings.handle("dbus_message_unref").invokeExact(msg) as Unit
+            }
+        }
+    }
+
+    // Bound here rather than in DBusBindings, since the library never sets a
+    // destination. Lazy, so the native check, which uses this client too, never
+    // needs metadata for it.
+    private val setDestination: MethodHandle by lazy {
+        val symbol = SymbolLookup.libraryLookup("libdbus-1.so.3", bindings.arena)
+            .find("dbus_message_set_destination").orElseThrow()
+        Linker.nativeLinker().downcallHandle(
+            symbol, FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS),
+        )
+    }
 
     /** `Properties.Get` of a string or object path property. */
     fun getStringProperty(destination: String, name: String): String =
