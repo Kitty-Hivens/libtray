@@ -67,6 +67,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   arguments got an empty reply, which for `Get` and `GetProperty` carried the
   wrong signature. They now get `InvalidArgs`. A dbusmenu reply is also built
   from one menu even when `setMenu` replaces it meanwhile.
+- Linux: a method call without an interface, or on the `org.freedesktop.DBus`
+  interface, got no reply, so the caller waited out its whole timeout. It now
+  gets `UnknownMethod`.
+- Linux: the item took a `NameOwnerChanged` signal from any sender. A client
+  could address one to it directly and make it register with the watcher
+  again, blocking its D-Bus thread for up to a second each time. Only the bus
+  daemon's own signal counts now.
 - A thread with its interrupt flag set got `InterruptedException` from the
   setters on Linux, from `close()` on all three platforms and from
   `Tray.create` on Windows, and `close()` then skipped its teardown. An

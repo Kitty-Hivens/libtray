@@ -192,6 +192,40 @@ class SniHostTest {
     }
 
     @Test
+    fun `method calls without an interface or on the bus interface get an error instead of no reply`() {
+        val name = "org.libtray.HostTest.NoInterface"
+        open(name)
+
+        // D-Bus lets a method call leave the interface out, and the bus
+        // interface is where the item only expects signals. Unanswered, the
+        // caller would wait out its whole timeout.
+        for (iface in listOf(null, "org.freedesktop.DBus")) {
+            val start = System.nanoTime()
+            shouldThrow<IllegalStateException> { host.callNoResult(name, DBusTestClient.ITEM_PATH, iface, "NameOwnerChanged") }
+                .message.shouldContain("UnknownMethod")
+            ((System.nanoTime() - start) / 1_000_000 < 1_000) shouldBe true
+        }
+    }
+
+    @Test
+    fun `a NameOwnerChanged that does not come from the bus is ignored`() {
+        val name = "org.libtray.HostTest.ForgedOwnerChange"
+        DBusTestClient.Watcher().use { watcher ->
+            open(name)
+            watcher.registrations.poll(2, TimeUnit.SECONDS) shouldBe name
+
+            // Any client can address this signal to the item. Taken at face
+            // value, each one costs a blocking re-registration on its I/O thread.
+            host.sendSignal(
+                name, "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+                listOf(Arg.Str(DBusTestClient.WATCHER_NAME), Arg.Str(""), Arg.Str(":1.9999")),
+            )
+            watcher.registrations.poll(1, TimeUnit.SECONDS) shouldBe null
+            host.getStringProperty(name, "Status") shouldBe "Active"
+        }
+    }
+
+    @Test
     fun `a click on an item of a replaced menu is dropped`() {
         val name = "org.libtray.HostTest.ReplacedMenu"
         val events = LinkedBlockingQueue<TrayEvent>()

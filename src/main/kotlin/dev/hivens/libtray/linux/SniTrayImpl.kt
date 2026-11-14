@@ -382,19 +382,30 @@ internal class SniTrayImpl internal constructor(
 
     private fun dispatchOne(msg: MemorySegment) {
         val type   = bindings.handle("dbus_message_get_type").invokeExact(msg) as Int
-        val iface  = readMessageString(bindings.handle("dbus_message_get_interface"), msg) ?: return
         val member = readMessageString(bindings.handle("dbus_message_get_member"),    msg) ?: return
         val path   = readMessageString(bindings.handle("dbus_message_get_path"),      msg) ?: ""
-
-        // Bus signals first. NameOwnerChanged tells us the StatusNotifierWatcher
-        // restarted (issue #10); signals never owe a reply, so return after.
-        if (iface == "org.freedesktop.DBus") {
-            if (member == "NameOwnerChanged") handleNameOwnerChanged(msg)
+        val iface  = readMessageString(bindings.handle("dbus_message_get_interface"), msg) ?: run {
+            // Only a method call can leave the interface out. Every member here
+            // is looked up by interface, so it gets an error rather than no reply.
+            if (type == DBusBindings.DBUS_MESSAGE_TYPE_METHOD_CALL) {
+                replyError(msg, "org.freedesktop.DBus.Error.UnknownMethod", "No interface given for $member")
+            }
             return
         }
 
-        // Everything below is a method call we answer. A stray signal that
-        // slips through a match rule is dropped without a (wrongly-typed) reply.
+        // Bus signals first. NameOwnerChanged tells us the StatusNotifierWatcher
+        // restarted (issue #10). Only the bus daemon's own counts: any client can
+        // address a signal to us past the match rule, and each one taken at face
+        // value would block this thread in a re-registration.
+        if (type == DBusBindings.DBUS_MESSAGE_TYPE_SIGNAL) {
+            if (iface == "org.freedesktop.DBus" && member == "NameOwnerChanged" && isFromBus(msg)) {
+                handleNameOwnerChanged(msg)
+            }
+            return
+        }
+
+        // Everything below is a method call we answer. Method returns and
+        // errors are dropped without a (wrongly-typed) reply.
         if (type != DBusBindings.DBUS_MESSAGE_TYPE_METHOD_CALL) return
 
         when (iface) {
@@ -441,6 +452,10 @@ internal class SniTrayImpl internal constructor(
             else -> replyUnknownMethod(msg, iface, member)
         }
     }
+
+    /** Whether [msg] was sent by the bus daemon, the only sender of a genuine NameOwnerChanged. */
+    private fun isFromBus(msg: MemorySegment): Boolean =
+        readMessageString(bindings.handle("dbus_message_get_sender"), msg) == "org.freedesktop.DBus"
 
     /**
      * Re-register the item when a StatusNotifierWatcher (re)appears. A fresh

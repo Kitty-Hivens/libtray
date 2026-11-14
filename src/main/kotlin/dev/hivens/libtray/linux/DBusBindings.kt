@@ -42,8 +42,9 @@ internal class DBusBindings internal constructor(
         /** D-Bus bus types from dbus/dbus-shared.h. */
         const val DBUS_BUS_SESSION: Int = 0
 
-        /** Message type from dbus/dbus-protocol.h -- only method calls owe a reply. */
+        /** Message types from dbus/dbus-protocol.h -- only method calls owe a reply. */
         const val DBUS_MESSAGE_TYPE_METHOD_CALL: Int = 1
+        const val DBUS_MESSAGE_TYPE_SIGNAL: Int = 4
 
         /** Type signatures from dbus/dbus-protocol.h. Single-byte ASCII. */
         const val DBUS_TYPE_INVALID:     Byte = 0
@@ -181,6 +182,12 @@ internal class DBusBindings internal constructor(
                 listOf(ValueLayout.ADDRESS),
             ),
             Triple("dbus_message_get_path",
+                ValueLayout.ADDRESS,
+                listOf(ValueLayout.ADDRESS),
+            ),
+            // The unique name a message came from, or for the bus daemon's own
+            // signals "org.freedesktop.DBus", which no client can take.
+            Triple("dbus_message_get_sender",
                 ValueLayout.ADDRESS,
                 listOf(ValueLayout.ADDRESS),
             ),
