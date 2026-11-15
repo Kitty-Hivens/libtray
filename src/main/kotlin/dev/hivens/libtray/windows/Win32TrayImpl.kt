@@ -615,21 +615,22 @@ internal class Win32TrayImpl private constructor(
         // during init), the dispatch format is:
         //   wParam = (LOWORD = x, HIWORD = y) cursor position in screen pixels
         //   lParam = (LOWORD = mouse event id, HIWORD = our icon uID)
-        // Earlier versions packed mouse events into wParam — we don't
-        // support them; the version negotiation already failed if the
-        // shell can't speak v4.
+        // When NIM_SETVERSION failed, the legacy format applies: lParam is the
+        // mouse message and wParam the icon uID, with no position at all.
         Win32Bindings.WM_TRAY_CALLBACK -> {
-            val event = lowWordSigned(lParam)
-            val x = lowWordSigned(wParam)
-            val y = highWordSigned(wParam)
-            when (event) {
+            when (lowWordSigned(lParam)) {
                 Win32Bindings.WM_LBUTTONUP -> fire(TrayEvent.Activated)
                 Win32Bindings.WM_MBUTTONUP -> fire(TrayEvent.MiddleActivated)
                 // A version 4 shell sends WM_RBUTTONUP and then WM_CONTEXTMENU
                 // for one right click, and WM_CONTEXTMENU alone for Shift+F10
                 // or the menu key. Opening on both would track the popup twice.
-                Win32Bindings.WM_CONTEXTMENU -> if (version4) showContextMenu(x, y)
-                Win32Bindings.WM_RBUTTONUP -> if (!version4) showContextMenu(x, y)
+                Win32Bindings.WM_CONTEXTMENU -> if (version4) showContextMenu(lowWordSigned(wParam), highWordSigned(wParam))
+                Win32Bindings.WM_RBUTTONUP -> if (!version4) {
+                    // Where the cursor was when the shell posted the callback,
+                    // as the legacy format leaves it to the receiver to ask.
+                    val pos = messagePos()
+                    showContextMenu(lowWordSigned(pos), highWordSigned(pos))
+                }
             }
             0L
         }
@@ -642,6 +643,11 @@ internal class Win32TrayImpl private constructor(
 
         else -> defWindowProc(uMsg, wParam, lParam)
     }
+
+    /** `GetMessagePos`: the screen position of the cursor when the message being handled was posted. */
+    private fun messagePos(): Long = runCatching {
+        (bindings.handle("GetMessagePos").invokeExact() as Int).toLong() and 0xffffffffL
+    }.getOrDefault(0L)
 
     private fun lowWordSigned(value: Long): Int = (value and 0xffff).toShort().toInt()
     private fun highWordSigned(value: Long): Int = ((value shr 16) and 0xffff).toShort().toInt()
