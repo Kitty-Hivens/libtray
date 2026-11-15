@@ -328,8 +328,8 @@ internal class Win32TrayImpl private constructor(
 
     /**
      * Write a wide-string into a fixed-size WCHAR array field, NUL-padded
-     * to the field length. Truncates to (maxChars - 1) so there's room
-     * for the terminator. Used for szTip and friends.
+     * to the field length, cut by [win32FieldText] so there's room for the
+     * terminator. Used for szTip and friends.
      */
     private fun writeWideStringField(data: MemorySegment, fieldName: String, maxChars: Int, value: String) {
         val fieldOffset = off(fieldName)
@@ -337,8 +337,7 @@ internal class Win32TrayImpl private constructor(
         for (i in 0 until maxChars) {
             data.set(ValueLayout.JAVA_SHORT, fieldOffset + i * 2L, 0.toShort())
         }
-        val truncated = if (value.length >= maxChars) value.substring(0, maxChars - 1) else value
-        for ((i, ch) in truncated.withIndex()) {
+        for ((i, ch) in win32FieldText(value, maxChars).withIndex()) {
             data.set(ValueLayout.JAVA_SHORT, fieldOffset + i * 2L, ch.code.toShort())
         }
     }
@@ -1003,3 +1002,14 @@ internal class Win32TrayImpl private constructor(
  * shows as `&`.
  */
 internal fun win32MenuLabel(label: String): String = label.replace("&", "&&")
+
+/**
+ * [value] cut to fit a WCHAR array of [maxChars] with its terminator. The
+ * cut backs off by one when it would keep only the high half of a surrogate
+ * pair, which the shell would draw as a stray glyph.
+ */
+internal fun win32FieldText(value: String, maxChars: Int): String {
+    if (value.length < maxChars) return value
+    val end = if (Character.isHighSurrogate(value[maxChars - 2])) maxChars - 2 else maxChars - 1
+    return value.substring(0, end)
+}
