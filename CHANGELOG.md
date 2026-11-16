@@ -110,6 +110,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   broadcast a restarted Explorer sends. It is now a hidden top-level window
   that adds the icon again on that broadcast, also when the application
   runs elevated.
+- Windows: a `WM_CLOSE` posted to the tray window by another process, as
+  `taskkill` without `/F` does, destroyed it and stopped the tray while the
+  icon stayed up and `isOpen` stayed true. The window now ignores it unless
+  `close()` sent it.
 - Windows: a click outside the open menu could leave it open, since its
   message-only owner window could not take the foreground. The menu's owner
   is now the hidden top-level window, and the message the `TrackPopupMenu`

@@ -635,6 +635,12 @@ internal class Win32TrayImpl private constructor(
             0L
         }
 
+        // DefWindowProc turns WM_CLOSE into DestroyWindow, which would end the
+        // pump with the icon still up. The window is top-level, so other
+        // processes can post this (taskkill without /F does). Only close() may
+        // end it, and close() clears open before it posts WM_CLOSE.
+        Win32Bindings.WM_CLOSE -> if (open.get()) 0L else defWindowProc(uMsg, wParam, lParam)
+
         // Menu item clicked via the legacy WM_COMMAND path — only fires
         // if we ever pass TrackPopupMenu without TPM_RETURNCMD. We use
         // TPM_RETURNCMD, so the selection comes back from TrackPopupMenu
