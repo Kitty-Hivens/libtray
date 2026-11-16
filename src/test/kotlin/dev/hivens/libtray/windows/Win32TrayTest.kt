@@ -102,6 +102,29 @@ class Win32TrayTest {
     }
 
     @Test
+    fun `a WM_CLOSE from another process leaves the tray working`() {
+        val tray = open()
+        val events = LinkedBlockingQueue<TrayEvent>()
+        tray.onEvent { events.add(it) }
+        val bindings = Win32Bindings.load() ?: error("user32 not loadable")
+        try {
+            // The tray window is top-level, so anything that closes a process's
+            // windows politely, such as taskkill without /F, reaches it too.
+            val posted = bindings.handle("PostMessageW")
+                .invokeExact((tray as Win32TrayImpl).windowHandle, Win32Bindings.WM_CLOSE, 0L, 0L) as Int
+            (posted != 0) shouldBe true
+            Thread.sleep(300)
+
+            tray.isOpen shouldBe true
+            post(tray, Win32Bindings.WM_LBUTTONUP)
+            events.poll(2, TimeUnit.SECONDS) shouldBe TrayEvent.Activated
+        } finally {
+            bindings.arena.close()
+            tray.close()
+        }
+    }
+
+    @Test
     fun `close destroys the window and keeps an interrupt flag`() {
         val tray = open()
         val hwnd = (tray as Win32TrayImpl).windowHandle
