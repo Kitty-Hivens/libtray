@@ -163,6 +163,10 @@ internal class Win32Bindings private constructor(
                 listOf(ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
                        ValueLayout.JAVA_LONG, ValueLayout.JAVA_LONG),       // HWND, UINT, WPARAM, LPARAM
             ),
+            Triple("GetMessagePos",
+                ValueLayout.JAVA_INT,                                       // DWORD: LOWORD x, HIWORD y
+                emptyList(),
+            ),
             Triple("PostQuitMessage",
                 null,                                                       // void
                 listOf(ValueLayout.JAVA_INT),                               // int nExitCode

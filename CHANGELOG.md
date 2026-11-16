@@ -106,6 +106,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   is now the hidden top-level window, and the message the `TrackPopupMenu`
   documentation asks for after the menu closes is posted, without which the
   next menu could appear and vanish at once.
+- Windows: a tooltip longer than 127 UTF-16 units was cut without regard to
+  surrogate pairs, so an emoji or another character outside the Basic
+  Multilingual Plane at the cut left half of itself behind as a stray glyph.
+  The cut now drops the whole character.
+- Windows: when the shell refused `NOTIFYICON_VERSION_4`, the menu opened at
+  the top left of the screen, since the legacy callback carries the icon id
+  where version 4 carries the cursor position. It now opens at the cursor.
+  Windows 10 and later accept version 4, so this path should not be reached.
 - macOS: with more than one tray, a menu click could be delivered to the
   wrong tray, because menu item tags were only unique within a tray.
 - macOS: each `Tray.create` kept another set of native bindings alive for the
