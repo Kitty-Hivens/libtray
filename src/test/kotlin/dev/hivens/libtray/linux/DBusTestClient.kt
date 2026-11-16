@@ -129,6 +129,12 @@ internal class DBusTestClient : AutoCloseable {
             readString(variant, arena)
         }
 
+    /** The introspection XML [destination] gives for [path]. */
+    fun introspect(destination: String, path: String): String =
+        call(destination, path, "org.freedesktop.DBus.Introspectable", "Introspect") { reply, arena ->
+            readString(firstArg(reply, arena), arena)
+        }
+
     /** Width and height of the first pixmap in `IconPixmap`, or null when the array is empty. */
     fun firstIconPixmapSize(destination: String): Pair<Int, Int>? =
         call(destination, ITEM_PATH, "org.freedesktop.DBus.Properties", "Get",

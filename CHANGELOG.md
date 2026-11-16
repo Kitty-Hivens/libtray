@@ -70,6 +70,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Linux: a method call without an interface, or on the `org.freedesktop.DBus`
   interface, got no reply, so the caller waited out its whole timeout. It now
   gets `UnknownMethod`.
+- Linux: with `maxIconSize = null`, an icon past 4096x4096 made libdbus abort
+  the whole process at the tray host's first `IconPixmap` query, since its
+  pixels exceed the 64 MiB a D-Bus array may hold. Such an icon is now
+  refused like one that does not decode.
+- Linux: `Introspect` answered with the item interface on every path,
+  including `/`, and listed no child objects. A host that walks the object
+  tree from `/` to find items would take `/` for the item, where every method
+  is `UnknownMethod`. Each object is now introspected at its own path, `/`
+  lists both, and other paths get `UnknownObject`.
 - Linux: the item took a `NameOwnerChanged` signal from any sender. A client
   could address one to it directly and make it register with the watcher
   again, blocking its D-Bus thread for up to a second each time. Only the bus
