@@ -729,14 +729,19 @@ internal class SniTrayImpl internal constructor(
     // ── Introspection (for hosts that probe before subscribing) ──────────
 
     private fun handleIntrospect(msg: MemorySegment, path: String) {
+        // Each object only at its own path, and the root listing both, so a
+        // host that walks the tree from / finds the item where its methods
+        // answer.
+        val xml = when (path) {
+            "/StatusNotifierItem" -> INTROSPECTION_XML_ITEM
+            "/MenuBar"            -> INTROSPECTION_XML_MENU
+            "/"                   -> INTROSPECTION_XML_ROOT
+            else -> return replyError(msg, "org.freedesktop.DBus.Error.UnknownObject", "No object at $path")
+        }
         Arena.ofConfined().use { call ->
             val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
             val iter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit)
-            val xml = when (path) {
-                "/MenuBar" -> INTROSPECTION_XML_MENU
-                else       -> INTROSPECTION_XML_ITEM
-            }
             appendBasicString(call, iter, DBusBindings.DBUS_TYPE_STRING, xml)
             sendAndUnref(reply)
         }
@@ -1164,6 +1169,13 @@ internal class SniTrayImpl internal constructor(
             val img = IconScaling.decode(bytes) ?: return emptyList()
             val w = img.width
             val h = img.height
+            // libdbus aborts the process on an array longer than this rather
+            // than failing the append, and the host asks for the pixmap on its
+            // own schedule. Only reachable with scaling off.
+            if (w.toLong() * h * 4 > DBUS_MAXIMUM_ARRAY_LENGTH) {
+                log.warn("Icon {}x{} is too large to send over D-Bus, keep it within 4096x4096 or leave maxIconSize on", w, h)
+                return emptyList()
+            }
             val argb = IntArray(w * h)
             img.getRGB(0, 0, w, h, argb, 0, w)
             val out = ByteArray(w * h * 4)
@@ -1189,6 +1201,9 @@ internal class SniTrayImpl internal constructor(
         private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
         private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
         private const val EVENT_GROUP_ARGS = "EventGroup takes a(isvu)"
+
+        /** `DBUS_MAXIMUM_ARRAY_LENGTH` from dbus-protocol.h: 64 MiB of array data. */
+        private const val DBUS_MAXIMUM_ARRAY_LENGTH: Long = 64L * 1024 * 1024
 
         /**
          * How long `dbus_connection_read_write` blocks per iteration. It
@@ -1281,6 +1296,18 @@ internal class SniTrayImpl internal constructor(
               <interface name="org.freedesktop.DBus.Introspectable">
                 <method name="Introspect"><arg type="s" direction="out"/></method>
               </interface>
+            </node>
+        """.trimIndent()
+
+        private val INTROSPECTION_XML_ROOT = """
+            <!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+              "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+            <node>
+              <interface name="org.freedesktop.DBus.Introspectable">
+                <method name="Introspect"><arg type="s" direction="out"/></method>
+              </interface>
+              <node name="StatusNotifierItem"/>
+              <node name="MenuBar"/>
             </node>
         """.trimIndent()
 

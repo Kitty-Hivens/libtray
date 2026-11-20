@@ -11,6 +11,7 @@ import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import io.kotest.matchers.string.shouldContain
+import io.kotest.matchers.string.shouldNotContain
 import io.kotest.matchers.string.shouldStartWith
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.BeforeEach
@@ -103,6 +104,39 @@ class SniHostTest {
         tray.setIcon(ByteArray(0)) shouldBe false
 
         host.firstIconPixmapSize(name) shouldBe (32 to 32)
+    }
+
+    @Test
+    fun `an icon too large for a D-Bus array is refused instead of aborting the process`() {
+        val name = "org.libtray.HostTest.HugeIcon"
+        val tray = Tray.create(
+            TrayBuilder(title = "huge icon", iconBytes = solidPng(32), maxIconSize = null, linuxBusName = name),
+        ) ?: error("Tray.create returned null on the private bus")
+        trays += tray
+
+        // 4100 x 4100 x 4 bytes is past the 64 MiB libdbus allows in one
+        // array, and libdbus aborts the whole process on that, at the host's
+        // first IconPixmap query. Without scaling nothing else stops it.
+        tray.setIcon(solidPng(4100)) shouldBe false
+        host.firstIconPixmapSize(name) shouldBe (32 to 32)
+    }
+
+    @Test
+    fun `introspection shows each object at its own path`() {
+        val name = "org.libtray.HostTest.Introspection"
+        open(name)
+
+        // Hosts that look for items by walking the tree start at /. The item
+        // interface there would point them at an object whose methods are
+        // all UnknownMethod.
+        val root = host.introspect(name, "/")
+        root.shouldNotContain("org.kde.StatusNotifierItem")
+        root.shouldContain("<node name=\"StatusNotifierItem\"/>")
+        root.shouldContain("<node name=\"MenuBar\"/>")
+        host.introspect(name, DBusTestClient.ITEM_PATH).shouldContain("org.kde.StatusNotifierItem")
+        host.introspect(name, DBusTestClient.MENU_PATH).shouldContain("com.canonical.dbusmenu")
+        shouldThrow<IllegalStateException> { host.introspect(name, "/Elsewhere") }
+            .message.shouldContain("UnknownObject")
     }
 
     @Test

@@ -31,12 +31,13 @@ internal val ICON_FIXTURES = listOf(
     IconFixture("rgba16-iccp-32.png", "png depth=16 colourType=6", 0x807B0084.toInt()),
     // A palette PNG past maxIconSize, so it also goes through scaling.
     IconFixture("pal8-300.png", "png depth=8 colourType=3", 0xFFBB86FC.toInt(), IconScaling.DEFAULT_MAX_SIZE),
-    IconFixture("plain-32.gif", "gif", 0xFF000000.toInt()),
-    IconFixture("plain-32.jpg", "jpeg", 0xFF000000.toInt()),
+    // Not black: a reader that left the raster zeroed would match black.
+    IconFixture("plain-32.gif", "gif", 0xFFBB86FC.toInt()),
+    IconFixture("plain-32.jpg", "jpeg", 0xFFBB86FC.toInt()),
     // A JPEG with an embedded ICC profile, as Photoshop or an iPhone save
     // them. Without the profile its centre would come out as ff7a0086.
     IconFixture("icc-32.jpg", "jpeg", 0xFFB800C0.toInt()),
-    IconFixture("plain-32.bmp", "bmp", 0xFF000000.toInt()),
+    IconFixture("plain-32.bmp", "bmp", 0xFFBB86FC.toInt()),
 )
 
 /** The format of [bytes] from their signature, for PNGs with the bit depth and colour type from IHDR. */
