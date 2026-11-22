@@ -12,6 +12,7 @@ import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.UpcallTarget
 import dev.hivens.libtray.awaitPastInterrupt
 import dev.hivens.libtray.joinPastInterrupt
+import dev.hivens.libtray.snapshot
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.Linker
@@ -145,7 +146,7 @@ internal class Win32TrayImpl private constructor(
      * right-clicks the icon. Avoids the GDI handle leak that comes from
      * holding HMENUs across multiple setMenu calls.
      */
-    @Volatile private var currentMenu: TrayMenu? = initial.menu
+    @Volatile private var currentMenu: TrayMenu? = initial.menu?.snapshot()
 
     /** Background pump thread running the `GetMessageW` + `DispatchMessageW` loop. */
     private val pumpThread = Thread({ pumpLoop() }, "libtray-win32-${ProcessHandle.current().pid()}").apply {
@@ -210,7 +211,12 @@ internal class Win32TrayImpl private constructor(
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
-        currentMenu = menu
+        // A copy, since the pump thread reads it at every right click, long
+        // after the caller may have changed the lists it passed.
+        currentMenu = if (menu == null) null else menu.snapshot() ?: run {
+            log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
+            return false
+        }
         return true
     }
 

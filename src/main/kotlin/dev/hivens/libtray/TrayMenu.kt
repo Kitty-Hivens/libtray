@@ -3,10 +3,11 @@ package dev.hivens.libtray
 /**
  * Static description of the right-click menu attached to a tray icon.
  *
- * Immutable by design: to update the menu, build a new [TrayMenu] and call
- * [Tray.setMenu]. Each backend rebuilds its native menu from it whole (a new
- * DBusMenu layout on Linux, a new NSMenu on macOS, a new HMENU on Windows at
- * every right click).
+ * To update the menu, build a new [TrayMenu] and call [Tray.setMenu]. Each
+ * backend rebuilds its native menu from it whole (a new DBusMenu layout on
+ * Linux, a new NSMenu on macOS, a new HMENU on Windows at every right click).
+ * libtray copies the lists when it takes a menu, so changing a list passed
+ * in here afterwards does not change a menu already set.
  */
 public data class TrayMenu(
     val items: List<TrayMenuItem>,
@@ -21,6 +22,17 @@ public data class TrayMenu(
         require(items.isNotEmpty()) { "menu must have at least one item; pass null to setMenu to remove the menu instead" }
     }
 }
+
+/**
+ * A copy of this menu down to every submenu, or null when the caller emptied
+ * one of its lists after construction. Backends keep the snapshot, so
+ * changing a list passed to [TrayMenu] or [TrayMenuItem.Submenu] afterwards
+ * does not reach a menu already handed to libtray.
+ */
+internal fun TrayMenu.snapshot(): TrayMenu? = runCatching { TrayMenu(items.map(TrayMenuItem::snapshot)) }.getOrNull()
+
+private fun TrayMenuItem.snapshot(): TrayMenuItem =
+    if (this is TrayMenuItem.Submenu) copy(items = items.map(TrayMenuItem::snapshot)) else this
 
 /**
  * One item in a [TrayMenu]. Each subclass models a distinct rendering

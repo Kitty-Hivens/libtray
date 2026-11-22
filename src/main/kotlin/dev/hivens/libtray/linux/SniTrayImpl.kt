@@ -9,6 +9,7 @@ import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.joinPastInterrupt
+import dev.hivens.libtray.snapshot
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
@@ -115,7 +116,7 @@ internal class SniTrayImpl internal constructor(
         IconScaling.fit(initial.iconBytes, maxIconSize, log, subsampleOversized)?.let(::pngToPixmaps).orEmpty()
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     private val menuIds = AtomicInteger(0)
-    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let { DBusMenuLayout(it, menuIds) }
+    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.snapshot()?.let { DBusMenuLayout(it, menuIds) }
     private val layoutRevision = AtomicInteger(0)
     private val open = AtomicBoolean(true)
 
@@ -224,7 +225,13 @@ internal class SniTrayImpl internal constructor(
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
-        menuLayout = menu?.let { DBusMenuLayout(it, menuIds) }
+        menuLayout = if (menu == null) null else DBusMenuLayout(
+            menu.snapshot() ?: run {
+                log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
+                return false
+            },
+            menuIds,
+        )
         layoutRevision.incrementAndGet()
         return signalling("setMenu") { emitLayoutUpdated() }
     }

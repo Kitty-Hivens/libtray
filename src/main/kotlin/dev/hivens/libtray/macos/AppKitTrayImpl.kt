@@ -11,6 +11,7 @@ import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.UpcallTarget
 import dev.hivens.libtray.awaitPastInterrupt
+import dev.hivens.libtray.snapshot
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
@@ -144,7 +145,7 @@ internal class AppKitTrayImpl private constructor(
         applyTitleFallback("●")
         if (initialIcon.isNotEmpty()) showIcon(initialIcon)
         initial.tooltip?.takeIf { it.isNotEmpty() }?.let { applyTooltip(it) }
-        initial.menu?.let { applyMenu(it) }
+        initial.menu?.snapshot()?.let { applyMenu(it) }
     }
 
     override val isOpen: Boolean get() = open.get()
@@ -172,7 +173,17 @@ internal class AppKitTrayImpl private constructor(
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
         return runCatching {
-            if (menu == null) clearMenu() else applyMenu(menu)
+            // A copy, since the main queue builds the NSMenu after this returns.
+            if (menu == null) {
+                clearMenu()
+            } else {
+                applyMenu(
+                    menu.snapshot() ?: run {
+                        log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
+                        return false
+                    },
+                )
+            }
             true
         }.getOrElse { t ->
             log.warn("setMenu threw", t); false
@@ -299,7 +310,9 @@ internal class AppKitTrayImpl private constructor(
         // the main queue free of a full-resolution decode + re-encode.
         // Null when the icon is past the pixel budget, which fit has already logged.
         val fitted = IconScaling.fit(rawPngBytes, maxIconSize, log, subsampleOversized) ?: return false
-        showIcon(fitted)
+        // An icon that already fits comes back as the caller's own array, and
+        // the main queue reads it after this returns.
+        showIcon(if (fitted === rawPngBytes) fitted.copyOf() else fitted)
         return true
     }
 

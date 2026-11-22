@@ -60,4 +60,37 @@ class TrayMenuTest {
         )
         menu.items shouldHaveSize 5
     }
+
+    @Test
+    fun `a snapshot does not follow later changes to the caller's lists`() {
+        // A backend keeps the menu past setMenu (until the next right click
+        // on Windows, until the main queue gets to it on macOS), so it works
+        // on a snapshot rather than on lists the caller can still change.
+        val children = mutableListOf<TrayMenuItem>(TrayMenuItem.Standard("eu", "EU"))
+        val top = mutableListOf<TrayMenuItem>(
+            TrayMenuItem.Standard("show", "Show"),
+            TrayMenuItem.Submenu("servers", "Servers", children),
+        )
+        val snapshot = TrayMenu(top).snapshot() ?: error("no snapshot")
+
+        top.add(TrayMenuItem.Standard("late", "Late"))
+        children.add(TrayMenuItem.Standard("us", "US"))
+
+        snapshot.items shouldHaveSize 2
+        (snapshot.items[1] as TrayMenuItem.Submenu).items shouldHaveSize 1
+    }
+
+    @Test
+    fun `a menu whose list was emptied after construction has no snapshot`() {
+        // The constructor checked the list while it still had items.
+        val top = mutableListOf<TrayMenuItem>(TrayMenuItem.Standard("show", "Show"))
+        val menu = TrayMenu(top)
+        top.clear()
+        menu.snapshot() shouldBe null
+
+        val children = mutableListOf<TrayMenuItem>(TrayMenuItem.Standard("eu", "EU"))
+        val nested = TrayMenu(TrayMenuItem.Submenu("servers", "Servers", children))
+        children.clear()
+        nested.snapshot() shouldBe null
+    }
 }
