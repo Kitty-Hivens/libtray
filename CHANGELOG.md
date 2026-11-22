@@ -94,6 +94,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   tree from `/` to find items would take `/` for the item, where every method
   is `UnknownMethod`. Each object is now introspected at its own path, `/`
   lists both, and other paths get `UnknownObject`.
+- Linux: `Properties.Get` answered an empty string for any property it did
+  not know, on any object path, including `AttentionIconPixmap` and
+  `OverlayIconPixmap`, which the StatusNotifierItem spec types as `a(iiay)`.
+  Those two and `AttentionMovieName` now have their spec types, an unknown
+  property gets `UnknownProperty`, and a path other than the item's two
+  objects gets `UnknownObject`.
 - Linux: the item took a `NameOwnerChanged` signal from any sender. A client
   could address one to it directly and make it register with the watcher
   again, blocking its D-Bus thread for up to a second each time. Only the bus

@@ -422,10 +422,13 @@ internal class SniTrayImpl internal constructor(
         if (type != DBusBindings.DBUS_MESSAGE_TYPE_METHOD_CALL) return
 
         when (iface) {
-            "org.freedesktop.DBus.Properties" -> when (member) {
-                "Get"     -> handlePropertiesGet(msg)
-                "GetAll"  -> handlePropertiesGetAll(msg)
-                else      -> replyUnknownMethod(msg, iface, member)
+            "org.freedesktop.DBus.Properties" -> when {
+                // Only the two objects this item serves have properties to ask about.
+                path != "/StatusNotifierItem" && path != "/MenuBar" ->
+                    replyError(msg, "org.freedesktop.DBus.Error.UnknownObject", "No object at $path")
+                member == "Get"    -> handlePropertiesGet(msg)
+                member == "GetAll" -> handlePropertiesGetAll(msg)
+                else               -> replyUnknownMethod(msg, iface, member)
             }
             "org.kde.StatusNotifierItem" -> {
                 // SNI methods exist only on /StatusNotifierItem; a call routed
@@ -537,6 +540,10 @@ internal class SniTrayImpl internal constructor(
                     "No properties for interface $ifaceName")
                 return
             }
+            if (propName !in PROPERTY_NAMES) {
+                replyError(msg, "org.freedesktop.DBus.Error.UnknownProperty", "No property $propName")
+                return
+            }
             val reply = (bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment)
             val replyIter = call.allocate(bindings.messageIterLayout)
             (bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit)
@@ -598,6 +605,10 @@ internal class SniTrayImpl internal constructor(
             "IconPixmap"    -> appendVariantIconPixmap(call, parent, iconPixmap)
             "OverlayIconName"   -> appendVariantString(call, parent, "")
             "AttentionIconName" -> appendVariantString(call, parent, "")
+            // Typed a(iiay) by the spec even though libtray never sets them.
+            "OverlayIconPixmap"   -> appendVariantIconPixmap(call, parent, emptyList())
+            "AttentionIconPixmap" -> appendVariantIconPixmap(call, parent, emptyList())
+            "AttentionMovieName"  -> appendVariantString(call, parent, "")
             // ToolTip deliberately empty — see [currentTitle] for the
             // single-source-of-truth rationale. Sending an empty struct
             // (rather than dropping the property) keeps the variant well-
@@ -610,7 +621,9 @@ internal class SniTrayImpl internal constructor(
             // (KDE plasmashell drops the icon on the toggle).
             "Menu"          -> appendVariantObjectPath(call, parent, "/MenuBar")
             "ItemIsMenu"    -> appendVariantBoolean(call, parent, false)
-            else -> appendVariantString(call, parent, "")
+            // Get checks the name against PROPERTY_NAMES and GetAll walks that
+            // list, so only a property added there without a branch here lands on this.
+            else -> error("no value for property $propName")
         }
     }
 
@@ -1280,7 +1293,8 @@ internal class SniTrayImpl internal constructor(
         private val PROPERTY_NAMES = listOf(
             "Category", "Id", "Title", "Status", "WindowId",
             "IconName", "IconPixmap",
-            "OverlayIconName", "AttentionIconName",
+            "OverlayIconName", "OverlayIconPixmap",
+            "AttentionIconName", "AttentionIconPixmap", "AttentionMovieName",
             "ToolTip", "Menu", "ItemIsMenu",
         )
 
