@@ -122,6 +122,25 @@ class SniHostTest {
     }
 
     @Test
+    fun `properties have their spec types, and unknown ones and other paths get errors`() {
+        val name = "org.libtray.HostTest.Properties.Types"
+        open(name)
+
+        // The spec types these as a(iiay). An empty string in their place breaks
+        // a host that reads them with a typed proxy.
+        host.propertyType(name, "AttentionIconPixmap") shouldBe DBusBindings.DBUS_TYPE_ARRAY
+        host.propertyType(name, "OverlayIconPixmap") shouldBe DBusBindings.DBUS_TYPE_ARRAY
+        host.propertyType(name, "AttentionMovieName") shouldBe DBusBindings.DBUS_TYPE_STRING
+
+        shouldThrow<IllegalStateException> { host.getStringProperty(name, "NoSuchProperty") }
+            .message.shouldContain("UnknownProperty")
+        shouldThrow<IllegalStateException> {
+            host.callNoResult(name, "/Elsewhere", "org.freedesktop.DBus.Properties", "Get",
+                listOf(Arg.Str(DBusTestClient.ITEM_IFACE), Arg.Str("Title")))
+        }.message.shouldContain("UnknownObject")
+    }
+
+    @Test
     fun `introspection shows each object at its own path`() {
         val name = "org.libtray.HostTest.Introspection"
         open(name)

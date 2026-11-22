@@ -129,6 +129,13 @@ internal class DBusTestClient : AutoCloseable {
             readString(variant, arena)
         }
 
+    /** The D-Bus type code of the value inside the variant `Properties.Get` returns for [name]. */
+    fun propertyType(destination: String, name: String): Byte =
+        call(destination, ITEM_PATH, "org.freedesktop.DBus.Properties", "Get",
+            listOf(Arg.Str(ITEM_IFACE), Arg.Str(name))) { reply, arena ->
+            argType(recurse(firstArg(reply, arena), arena))
+        }
+
     /** The introspection XML [destination] gives for [path]. */
     fun introspect(destination: String, path: String): String =
         call(destination, path, "org.freedesktop.DBus.Introspectable", "Introspect") { reply, arena ->
