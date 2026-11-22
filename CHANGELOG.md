@@ -25,7 +25,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   arenas the backends bind their native calls in, which otherwise failed
   quietly and leaked.
 
+- `TrayBuilder.subsampleOversizedIcons`: an icon past 4096x4096 pixels is
+  decoded subsampled to that size, with a warning, instead of refused. Off
+  by default.
+
 ### Changed
+- An icon that would decode to more than 4096x4096 pixels (64 MiB as ARGB)
+  is refused before it is decoded, with a warning, and `setIcon` returns
+  false. The size comes from the image header, so a small file that declares
+  huge dimensions can no longer make libtray allocate a raster for them.
+  Scaling also reads only the header for an icon that already fits instead
+  of decoding it in full. With `maxIconSize = null`, macOS hands the bytes to
+  `NSImage` untouched as before.
+- **Binary-incompatible:** `TrayBuilder` gained `subsampleOversizedIcons`,
+  so its constructor and generated `copy` changed shape. Kotlin source is
+  unaffected, recompile against this version. Java callers on
+  `TrayBuilder.of` are unaffected.
 - Oversized icons are scaled by area averaging on the pixel array instead
   of through `Image.getScaledInstance(SCALE_SMOOTH)` and a `Graphics2D`
   draw. The old path went through the AWT Toolkit image pipeline and

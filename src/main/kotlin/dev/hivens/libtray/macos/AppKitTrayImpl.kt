@@ -105,6 +105,9 @@ internal class AppKitTrayImpl private constructor(
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 
+    /** See [dev.hivens.libtray.TrayBuilder.subsampleOversizedIcons]. */
+    private val subsampleOversized: Boolean = initial.subsampleOversizedIcons
+
     /** See [dev.hivens.libtray.TrayBuilder.macosMenuOnPrimaryClick]. */
     private val menuOnPrimaryClick: Boolean = initial.macosMenuOnPrimaryClick
 
@@ -154,7 +157,7 @@ internal class AppKitTrayImpl private constructor(
             log.warn("setIcon got no bytes, keeping the current icon")
             return false
         }
-        return runCatching { applyIcon(iconBytes); true }.getOrElse { t ->
+        return runCatching { applyIcon(iconBytes) }.getOrElse { t ->
             log.warn("setIcon threw", t); false
         }
     }
@@ -290,11 +293,14 @@ internal class AppKitTrayImpl private constructor(
      * PNG is universally supported. Released to autorelease pool —
      * the button retains the image when set.
      */
-    private fun applyIcon(rawPngBytes: ByteArray) {
+    private fun applyIcon(rawPngBytes: ByteArray): Boolean {
         // Scale on the calling thread, before the marshal: it is pure JVM
         // image work with no AppKit involvement, and doing it here keeps
         // the main queue free of a full-resolution decode + re-encode.
-        showIcon(IconScaling.fit(rawPngBytes, maxIconSize, log))
+        // Null when the icon is past the pixel budget, which fit has already logged.
+        val fitted = IconScaling.fit(rawPngBytes, maxIconSize, log, subsampleOversized) ?: return false
+        showIcon(fitted)
+        return true
     }
 
     /** Install already scaled [pngBytes] on the button, on the main queue. */
@@ -970,7 +976,7 @@ internal class AppKitTrayImpl private constructor(
             // main thread (OS thread 0). In an AWT, Swing or Compose app that
             // thread belongs to AWT, so the caller is never on it.
             if (isCocoaMainThread(bindings)) {
-                return createOnMainThread(bindings, builder, IconScaling.fit(builder.iconBytes, builder.maxIconSize, log))
+                return createOnMainThread(bindings, builder, initialIcon(builder))
             }
             if (bindings.mainQueue.address() == 0L) {
                 log.warn(
@@ -982,6 +988,14 @@ internal class AppKitTrayImpl private constructor(
             }
             return createThroughMainQueue(bindings, builder)
         }
+
+        /**
+         * The builder's icon scaled for the status item, or no bytes when it is
+         * past the pixel budget. The tray then keeps the text placeholder the
+         * constructor puts up before any icon.
+         */
+        private fun initialIcon(builder: TrayBuilder): ByteArray =
+            IconScaling.fit(builder.iconBytes, builder.maxIconSize, log, builder.subsampleOversizedIcons) ?: ByteArray(0)
 
         /**
          * Run [createOnMainThread] on the Cocoa main queue and wait for it.
@@ -1002,7 +1016,7 @@ internal class AppKitTrayImpl private constructor(
          */
         private fun createThroughMainQueue(bindings: ObjcBindings, builder: TrayBuilder): Tray? {
             // Plain JVM work, kept off the main thread, which in these apps is AWT's.
-            val icon = IconScaling.fit(builder.iconBytes, builder.maxIconSize, log)
+            val icon = initialIcon(builder)
             val handoff = Any()
             var abandoned = false
             var finished = false

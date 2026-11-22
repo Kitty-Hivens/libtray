@@ -108,7 +108,11 @@ internal class SniTrayImpl internal constructor(
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 
-    @Volatile private var iconPixmap: List<Pixmap> = pngToPixmaps(IconScaling.fit(initial.iconBytes, maxIconSize, log))
+    /** See [dev.hivens.libtray.TrayBuilder.subsampleOversizedIcons]. */
+    private val subsampleOversized: Boolean = initial.subsampleOversizedIcons
+
+    @Volatile private var iconPixmap: List<Pixmap> =
+        IconScaling.fit(initial.iconBytes, maxIconSize, log, subsampleOversized)?.let(::pngToPixmaps).orEmpty()
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     private val menuIds = AtomicInteger(0)
     @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.let { DBusMenuLayout(it, menuIds) }
@@ -207,7 +211,9 @@ internal class SniTrayImpl internal constructor(
             log.warn("setIcon got no bytes, keeping the current icon")
             return false
         }
-        val pixmaps = pngToPixmaps(IconScaling.fit(iconBytes, maxIconSize, log))
+        // Null when the icon is past the pixel budget, which fit has already logged.
+        val fitted = IconScaling.fit(iconBytes, maxIconSize, log, subsampleOversized) ?: return false
+        val pixmaps = pngToPixmaps(fitted)
         if (pixmaps.isEmpty()) {
             log.warn("Could not decode the new tray icon ({} bytes), keeping the current one", iconBytes.size)
             return false
@@ -1166,7 +1172,7 @@ internal class SniTrayImpl internal constructor(
      */
     private fun pngToPixmaps(bytes: ByteArray): List<Pixmap> {
         return runCatching {
-            val img = IconScaling.decode(bytes) ?: return emptyList()
+            val img = IconScaling.decode(bytes, subsampleOversized, log) ?: return emptyList()
             val w = img.width
             val h = img.height
             // libdbus aborts the process on an array longer than this rather

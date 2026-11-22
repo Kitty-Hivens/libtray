@@ -6,11 +6,14 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.imageio.ImageIO
+import javax.imageio.ImageReader
 import javax.imageio.stream.MemoryCacheImageInputStream
 import javax.imageio.stream.MemoryCacheImageOutputStream
+import kotlin.math.ceil
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /**
  * Shrinks oversized icons before a backend hands them to the OS.
@@ -44,18 +47,32 @@ internal object IconScaling {
 
     /**
      * Return [bytes] unchanged, or a PNG re-encoding scaled to fit a
-     * [maxSize]-square box with the aspect ratio preserved.
+     * [maxSize]-square box with the aspect ratio preserved, or null when the
+     * icon is past [MAX_DECODED_PIXELS] and [subsampleOversized] is off.
      *
-     * Never throws and never returns empty: an undecodable image, a
-     * missing PNG writer, or any other failure yields the original bytes,
-     * because a backend that can still try to render something is better
-     * than one that has lost the icon. `null` [maxSize] disables scaling
-     * entirely.
+     * Null is the only refusal. An undecodable image, a missing PNG writer,
+     * or any other failure yields the original bytes, because a backend that
+     * can still try to render something is better than one that has lost the
+     * icon. An oversized icon is the exception, since handing it on would
+     * only move the huge decode into the backend or the OS. `null` [maxSize]
+     * disables scaling and this check entirely, and the bytes go out
+     * untouched.
      */
-    fun fit(bytes: ByteArray, maxSize: Int?, log: Logger): ByteArray {
+    fun fit(bytes: ByteArray, maxSize: Int?, log: Logger, subsampleOversized: Boolean = false): ByteArray? {
         if (maxSize == null) return bytes
+        // The header says whether there is anything to do, so an icon that
+        // already fits is never decoded here.
+        val size = runCatching { headerSize(bytes) }.getOrNull()
+        if (size != null) {
+            val (headerWidth, headerHeight) = size
+            if (headerWidth.toLong() * headerHeight > MAX_DECODED_PIXELS && !subsampleOversized) {
+                refuse(headerWidth, headerHeight, log)
+                return null
+            }
+            if (headerWidth in 1..maxSize && headerHeight in 1..maxSize) return bytes
+        }
         val image = try {
-            decode(bytes)
+            decode(bytes, subsampleOversized, log)
         } catch (t: Throwable) {
             // Bytes ImageIO cannot read are expected, the OS may still take
             // them. An Error is not: a native image missing its metadata ends
@@ -101,13 +118,67 @@ internal object IconScaling {
     }
 
     /**
-     * Decode an icon, or null when no ImageIO reader takes the bytes. Reads
-     * through a memory cache: `ImageIO.read(InputStream)` backs its stream with
-     * a temporary file, one per call by default, which an animated icon would
-     * create on every frame and a read-only temp directory would fail on.
+     * Decode an icon, or null when no ImageIO reader takes the bytes or the
+     * icon is past [MAX_DECODED_PIXELS] and [subsampleOversized] is off.
+     *
+     * The size comes from the header first, before the reader allocates a
+     * raster for it: a PNG of a few dozen bytes can declare 8000 x 8000 and
+     * cost a quarter of a gigabyte. With [subsampleOversized] such an icon
+     * is read at every n-th pixel and row instead, small enough to fit.
+     *
+     * Reads through a memory cache: `ImageIO.read(InputStream)` backs its
+     * stream with a temporary file, one per call by default, which an
+     * animated icon would create on every frame and a read-only temp
+     * directory would fail on.
      */
-    internal fun decode(bytes: ByteArray): BufferedImage? =
-        ImageIO.read(MemoryCacheImageInputStream(ByteArrayInputStream(bytes)))
+    internal fun decode(bytes: ByteArray, subsampleOversized: Boolean = false, log: Logger? = null): BufferedImage? =
+        withReader(bytes) { reader ->
+            val width = reader.getWidth(0)
+            val height = reader.getHeight(0)
+            val param = reader.defaultReadParam
+            val pixels = width.toLong() * height
+            if (pixels > MAX_DECODED_PIXELS) {
+                if (!subsampleOversized) {
+                    refuse(width, height, log)
+                    return@withReader null
+                }
+                val step = ceil(sqrt(pixels.toDouble() / MAX_DECODED_PIXELS)).toInt()
+                param.setSourceSubsampling(step, step, 0, 0)
+                log?.warn(
+                    "Tray icon is {}x{}, past the {} pixel budget. Decoding every {}th pixel, as " +
+                        "TrayBuilder.subsampleOversizedIcons asks, so detail is lost. Pass a smaller icon.",
+                    width, height, MAX_DECODED_PIXELS, step,
+                )
+            }
+            reader.read(0, param)
+        }
+
+    /** Width and height from the image header, without decoding it. Null when no reader takes the bytes. */
+    private fun headerSize(bytes: ByteArray): Pair<Int, Int>? =
+        withReader(bytes) { reader -> reader.getWidth(0) to reader.getHeight(0) }
+
+    /** Run [block] with the first ImageIO reader that takes [bytes], or return null when none does. */
+    private inline fun <T> withReader(bytes: ByteArray, block: (ImageReader) -> T?): T? =
+        MemoryCacheImageInputStream(ByteArrayInputStream(bytes)).use { input ->
+            val reader = ImageIO.getImageReaders(input).asSequence().firstOrNull() ?: return null
+            try {
+                reader.setInput(input, true, true)
+                block(reader)
+            } finally {
+                reader.dispose()
+            }
+        }
+
+    private fun refuse(width: Int, height: Int, log: Logger?) {
+        log?.warn(
+            "Tray icon is {}x{}, past the {} pixel budget, so it is not used. Pass a smaller icon, " +
+                "or set TrayBuilder.subsampleOversizedIcons to decode it at lower quality.",
+            width, height, MAX_DECODED_PIXELS,
+        )
+    }
+
+    /** Most pixels an icon may decode to: 4096 x 4096, 64 MiB as ARGB. */
+    const val MAX_DECODED_PIXELS: Long = 4096L * 4096
 
     internal fun areaAverage(
         source: IntArray,

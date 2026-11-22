@@ -57,6 +57,7 @@ class TrayBuilderTest {
             .maxIconSize(null)
             .linuxBusName("com.example.App.Tray")
             .macosMenuOnPrimaryClick(false)
+            .subsampleOversizedIcons(true)
             .build()
 
         built shouldBe TrayBuilder(
@@ -67,7 +68,16 @@ class TrayBuilderTest {
             maxIconSize = null,
             linuxBusName = "com.example.App.Tray",
             macosMenuOnPrimaryClick = false,
+            subsampleOversizedIcons = true,
         )
+    }
+
+    @Test
+    fun `equals distinguishes the oversized icon setting`() {
+        val a = TrayBuilder(title = "MyApp", iconBytes = sampleIcon)
+        val b = TrayBuilder(title = "MyApp", iconBytes = sampleIcon, subsampleOversizedIcons = true)
+        a.subsampleOversizedIcons shouldBe false
+        (a == b) shouldBe false
     }
 
     @Test
