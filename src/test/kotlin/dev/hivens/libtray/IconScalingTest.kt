@@ -216,10 +216,12 @@ class IconScalingTest {
             val bytes = icon.bytes()
             withClue(icon.name) {
                 fileKind(bytes) shouldBe icon.kind
-                decodedCentre(bytes) shouldBe icon.centre
+                decodedSamples(bytes) shouldBe listOf(icon.corner, icon.opposite)
                 val fitted = IconScaling.decode(fitted(bytes, IconScaling.DEFAULT_MAX_SIZE))
                     ?: error("${icon.name} did not decode after fitting")
                 (fitted.width to fitted.height) shouldBe (icon.shownSize to icon.shownSize)
+                // Scaling keeps the quadrants where they were.
+                samples(fitted) shouldBe listOf(icon.corner, icon.opposite)
             }
         }
     }
