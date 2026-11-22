@@ -142,6 +142,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the top left of the screen, since the legacy callback carries the icon id
   where version 4 carries the cursor position. It now opens at the cursor.
   Windows 10 and later accept version 4, so this path should not be reached.
+- A menu passed to `setMenu`, or to `TrayBuilder`, kept the caller's lists.
+  Windows reads them at every right click on its message pump thread and
+  macOS builds the `NSMenu` later on the main queue, so changing a list
+  afterwards changed the menu shown, raced those threads, and could leave a
+  menu with no items despite the check in its constructor. libtray now copies
+  the lists when it takes the menu, and `setMenu` with a menu whose list was
+  emptied after it was built returns false. On macOS the icon bytes are
+  copied the same way before the main queue reads them.
 - macOS: with more than one tray, a menu click could be delivered to the
   wrong tray, because menu item tags were only unique within a tray.
 - macOS: each `Tray.create` kept another set of native bindings alive for the
