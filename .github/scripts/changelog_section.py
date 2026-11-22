@@ -2,10 +2,11 @@
 
 Usage: changelog_section.py CHANGELOG.md 0.2.0
 
-The changelog is hard-wrapped, and GitHub renders every newline in a release
-body as a line break, so each paragraph and list item is joined back onto one
-line. Exits non-zero when the version has no section, so a release cannot go
-out with empty notes.
+The section header is `## [0.2.0]`, optionally followed by ` - <date>` as Keep
+a Changelog writes it. The changelog is hard-wrapped, and GitHub renders every
+newline in a release body as a line break, so each paragraph and list item,
+nested items included, is joined back onto one line. Exits non-zero when the
+version has no section, so a release cannot go out with empty notes.
 """
 import sys
 
@@ -14,7 +15,10 @@ def section(text: str, version: str) -> list[str]:
     lines = text.split("\n")
     header = f"## [{version}]"
     try:
-        start = next(i for i, line in enumerate(lines) if line.strip() == header) + 1
+        start = next(
+            i for i, line in enumerate(lines)
+            if line.strip() == header or line.startswith(header + " - ")
+        ) + 1
     except StopIteration:
         sys.exit(f"CHANGELOG has no section {header}")
     end = next((i for i in range(start, len(lines)) if lines[i].startswith("## [")), len(lines))
@@ -25,9 +29,10 @@ def unwrap(lines: list[str]) -> str:
     out: list[str] = []
     for line in lines:
         previous = out[-1] if out else ""
-        if line.startswith("  ") and previous.startswith("- "):
-            out[-1] = previous + " " + line.strip()
-        elif line and previous and not line.startswith(("- ", "#")) and not previous.startswith("#"):
+        # An item starts a line of its own at any depth. Matching only an
+        # unindented "- " folded a nested list into its parent item.
+        starts_item = line.lstrip().startswith("- ")
+        if line and previous and not starts_item and not line.startswith("#") and not previous.startswith("#"):
             out[-1] = previous + " " + line.strip()
         else:
             out.append(line)

@@ -43,6 +43,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The job's token can write to the repository, and Gradle runs
+          # plugin code below. Nothing here pushes, and the release page step
+          # gets the token through GH_TOKEN, so it stays out of .git/config.
+          persist-credentials: false
       - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
@@ -82,6 +87,16 @@ jobs:
           fi
           echo "publishing $v"
 
+      # The notes are rendered before anything is built, because the upload
+      # cannot be undone: a tag whose version has no CHANGELOG section stops
+      # here instead of leaving a published version without a release page,
+      # which a rerun could not fix, since the guard above refuses the version.
+      - name: Release notes
+        if: github.event_name == 'push'
+        env:
+          VERSION: ${{ steps.version.outputs.v }}
+        run: python3 .github/scripts/changelog_section.py CHANGELOG.md "$VERSION" > release-notes.md
+
       - name: Publish
         env:
           ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
@@ -107,7 +122,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.version.outputs.v }}
         run: |
-          python3 .github/scripts/changelog_section.py CHANGELOG.md "$VERSION" > release-notes.md
           gh release create "$GITHUB_REF_NAME" \
             --title "libtray $VERSION" \
             --notes-file release-notes.md \
