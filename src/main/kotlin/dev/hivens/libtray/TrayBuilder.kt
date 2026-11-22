@@ -47,6 +47,14 @@ package dev.hivens.libtray
  *   a primary click fires [TrayEvent.Activated] either way. A VoiceOver
  *   press on the status item counts as a primary click, so with false
  *   VoiceOver has no way to open the menu. Ignored on Linux and Windows.
+ * @property subsampleOversizedIcons What happens to an icon that would
+ *   decode to more than 4096x4096 pixels (64 MiB as ARGB). By default it is
+ *   refused before it is decoded: [Tray.setIcon] returns false and a warning
+ *   is logged, so bytes from an untrusted source cannot make libtray
+ *   allocate gigabytes. Set to true to decode such an icon subsampled to fit
+ *   that budget instead, at lower quality, also with a warning. With
+ *   [maxIconSize] set to null, macOS hands the bytes to `NSImage` untouched,
+ *   so the budget only applies where libtray decodes the icon itself.
  */
 public data class TrayBuilder(
     val title: String,
@@ -56,6 +64,7 @@ public data class TrayBuilder(
     val maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE,
     val linuxBusName: String? = null,
     val macosMenuOnPrimaryClick: Boolean = true,
+    val subsampleOversizedIcons: Boolean = false,
 ) {
     init {
         require(title.isNotBlank()) { "title must be non-blank" }
@@ -80,6 +89,7 @@ public data class TrayBuilder(
             maxIconSize == other.maxIconSize &&
             linuxBusName == other.linuxBusName &&
             macosMenuOnPrimaryClick == other.macosMenuOnPrimaryClick &&
+            subsampleOversizedIcons == other.subsampleOversizedIcons &&
             iconBytes.contentEquals(other.iconBytes)
     }
 
@@ -91,6 +101,7 @@ public data class TrayBuilder(
         result = 31 * result + (maxIconSize ?: 0)
         result = 31 * result + (linuxBusName?.hashCode() ?: 0)
         result = 31 * result + macosMenuOnPrimaryClick.hashCode()
+        result = 31 * result + subsampleOversizedIcons.hashCode()
         return result
     }
 
@@ -110,6 +121,7 @@ public data class TrayBuilder(
         private var maxIconSize: Int? = IconScaling.DEFAULT_MAX_SIZE
         private var linuxBusName: String? = null
         private var macosMenuOnPrimaryClick: Boolean = true
+        private var subsampleOversizedIcons: Boolean = false
 
         /** See [TrayBuilder.tooltip]. */
         public fun tooltip(tooltip: String?): Builder = apply { this.tooltip = tooltip }
@@ -127,9 +139,14 @@ public data class TrayBuilder(
         public fun macosMenuOnPrimaryClick(macosMenuOnPrimaryClick: Boolean): Builder =
             apply { this.macosMenuOnPrimaryClick = macosMenuOnPrimaryClick }
 
+        /** See [TrayBuilder.subsampleOversizedIcons]. */
+        public fun subsampleOversizedIcons(subsampleOversizedIcons: Boolean): Builder =
+            apply { this.subsampleOversizedIcons = subsampleOversizedIcons }
+
         /** @throws IllegalArgumentException on the same invalid input the constructor rejects. */
-        public fun build(): TrayBuilder =
-            TrayBuilder(title, iconBytes, tooltip, menu, maxIconSize, linuxBusName, macosMenuOnPrimaryClick)
+        public fun build(): TrayBuilder = TrayBuilder(
+            title, iconBytes, tooltip, menu, maxIconSize, linuxBusName, macosMenuOnPrimaryClick, subsampleOversizedIcons,
+        )
     }
 
     public companion object {

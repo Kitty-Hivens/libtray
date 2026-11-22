@@ -180,7 +180,9 @@ internal class Win32TrayImpl private constructor(
         // outside the lock. CreateIcon runs under it, so close() cannot free the
         // arena between creating the HICON and handing it to the shell or
         // destroying it.
-        val pixels = iconPixels(IconScaling.fit(iconBytes, initial.maxIconSize, log)) ?: run {
+        // Null when the icon is past the pixel budget, which fit has already logged.
+        val fitted = IconScaling.fit(iconBytes, initial.maxIconSize, log, initial.subsampleOversizedIcons) ?: return false
+        val pixels = iconPixels(fitted) ?: run {
             log.warn("The new icon could not be converted for CreateIcon, setIcon ignored")
             return false
         }
@@ -359,7 +361,7 @@ internal class Win32TrayImpl private constructor(
 
     /** Decode [bytes] and convert them for CreateIcon. JVM work only, no native call. */
     private fun iconPixels(bytes: ByteArray): IconPixels? {
-        val img = runCatching { IconScaling.decode(bytes) }.getOrNull() ?: run {
+        val img = runCatching { IconScaling.decode(bytes, initial.subsampleOversizedIcons, log) }.getOrNull() ?: run {
             log.warn("ImageIO could not decode PNG ({} bytes)", bytes.size)
             return null
         }
@@ -442,7 +444,8 @@ internal class Win32TrayImpl private constructor(
         log.info("Win32 tray window up: hwnd=0x{}", createdHwnd.address().toString(16))
         allowTaskbarCreated(createdHwnd)
 
-        val initialPixels = iconPixels(IconScaling.fit(initial.iconBytes, initial.maxIconSize, log))
+        val initialPixels = IconScaling.fit(initial.iconBytes, initial.maxIconSize, log, initial.subsampleOversizedIcons)
+            ?.let(::iconPixels)
         // Under the lock and only while open. Once a create() that gave up on a
         // slow startup has called close(), an icon added here would outlive the
         // tray close() just tore down, whichever of the two got the lock first.

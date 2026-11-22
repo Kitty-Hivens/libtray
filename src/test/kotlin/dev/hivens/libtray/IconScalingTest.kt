@@ -30,6 +30,10 @@ class IconScalingTest {
     private fun sizeOf(bytes: ByteArray): Pair<Int, Int> =
         ImageIO.read(ByteArrayInputStream(bytes)).let { it.width to it.height }
 
+    /** [IconScaling.fit] for an icon within the pixel budget, which it never refuses. */
+    private fun fitted(bytes: ByteArray, maxSize: Int?): ByteArray =
+        IconScaling.fit(bytes, maxSize, log) ?: error("fit refused an icon within the pixel budget")
+
     @Test
     fun `an icon already within the limit is passed through untouched`() {
         val bytes = png(32, 32)
@@ -47,7 +51,7 @@ class IconScalingTest {
     @Test
     fun `an oversized icon is scaled to the limit`() {
         val bytes = png(1024, 1024)
-        val fitted = IconScaling.fit(bytes, 256, log)
+        val fitted = fitted(bytes, 256)
 
         fitted shouldNotBe bytes
         sizeOf(fitted) shouldBe (256 to 256)
@@ -59,7 +63,7 @@ class IconScalingTest {
     fun `the scaled icon still carries the picture`() {
         // Dimensions alone would also pass for a fully blank result, so this
         // checks the pixels that come back through averaging and the PNG encoder.
-        val img = ImageIO.read(ByteArrayInputStream(IconScaling.fit(png(1024, 1024), 64, log)))
+        val img = ImageIO.read(ByteArrayInputStream(fitted(png(1024, 1024), 64)))
 
         val centre = img.getRGB(32, 32)
         (centre ushr 24 and 0xFF) shouldBe 0xFF          // opaque inside the circle
@@ -71,7 +75,7 @@ class IconScalingTest {
     fun `a non-square icon keeps its aspect ratio`() {
         // The long edge sets the bound; the short one follows, and neither
         // may exceed the limit or the Win32 backend would still reject it.
-        val fitted = IconScaling.fit(png(1000, 500), 100, log)
+        val fitted = fitted(png(1000, 500), 100)
         sizeOf(fitted) shouldBe (100 to 50)
     }
 
@@ -79,7 +83,7 @@ class IconScalingTest {
     fun `a very lopsided icon never collapses an edge to zero`() {
         // 4000x3 at a 256 bound rounds the short edge to 0.192 px; a zero
         // dimension would throw out of BufferedImage rather than degrade.
-        val fitted = IconScaling.fit(png(4000, 3), 256, log)
+        val fitted = fitted(png(4000, 3), 256)
         val (w, h) = sizeOf(fitted)
         w shouldBe 256
         h shouldBe 1
@@ -151,6 +155,50 @@ class IconScalingTest {
         IconScaling.fit(bytes, null, log) shouldBe bytes
     }
 
+    /**
+     * A 5000 x 5000 PNG, past the pixel budget. One bit per pixel keeps the
+     * test's own raster at 3 MB, while the budget counts pixels, so it stands
+     * for a full colour icon that would decode to 100 MB.
+     */
+    private fun oversizedPng(): ByteArray {
+        val img = BufferedImage(5000, 5000, BufferedImage.TYPE_BYTE_BINARY)
+        val g = img.createGraphics()
+        try {
+            g.color = Color.WHITE
+            g.fillRect(0, 0, 5000, 5000)
+        } finally {
+            g.dispose()
+        }
+        return ByteArrayOutputStream().also { ImageIO.write(img, "PNG", it) }.toByteArray()
+    }
+
+    @Test
+    fun `an icon past the pixel budget is refused before it is decoded`() {
+        val bytes = oversizedPng()
+        // Refused, not handed back: the original bytes would reach the OS
+        // decoder on macOS, or be decoded again by the Linux and Windows backends.
+        IconScaling.fit(bytes, 256, log) shouldBe null
+        IconScaling.decode(bytes, log = log) shouldBe null
+    }
+
+    @Test
+    fun `with subsampling on, an icon past the budget is decoded smaller and then scaled`() {
+        val bytes = oversizedPng()
+        val decoded = IconScaling.decode(bytes, subsampleOversized = true, log = log) ?: error("not decoded")
+        (decoded.width.toLong() * decoded.height <= IconScaling.MAX_DECODED_PIXELS) shouldBe true
+        (decoded.getRGB(decoded.width / 2, decoded.height / 2) and 0xFFFFFF) shouldBe 0xFFFFFF
+
+        val fitted = IconScaling.fit(bytes, 256, log, subsampleOversized = true) ?: error("refused")
+        sizeOf(fitted) shouldBe (256 to 256)
+    }
+
+    @Test
+    fun `an icon exactly at the budget still decodes in full`() {
+        val img = BufferedImage(4096, 4096, BufferedImage.TYPE_BYTE_BINARY)
+        val bytes = ByteArrayOutputStream().also { ImageIO.write(img, "PNG", it) }.toByteArray()
+        IconScaling.decode(bytes, log = log)?.let { it.width to it.height } shouldBe (4096 to 4096)
+    }
+
     @Test
     fun `undecodable bytes are handed back rather than dropped`() {
         // Losing the icon outright would be worse than letting the backend
@@ -169,7 +217,7 @@ class IconScalingTest {
             withClue(icon.name) {
                 fileKind(bytes) shouldBe icon.kind
                 decodedCentre(bytes) shouldBe icon.centre
-                val fitted = IconScaling.decode(IconScaling.fit(bytes, IconScaling.DEFAULT_MAX_SIZE, log))
+                val fitted = IconScaling.decode(fitted(bytes, IconScaling.DEFAULT_MAX_SIZE))
                     ?: error("${icon.name} did not decode after fitting")
                 (fitted.width to fitted.height) shouldBe (icon.shownSize to icon.shownSize)
             }
