@@ -43,6 +43,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The job's token can write to the repository, and Gradle runs
+          # plugin code below. Nothing here pushes, and the release page step
+          # gets the token through GH_TOKEN, so it stays out of .git/config.
+          persist-credentials: false
       - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v6.2.0
         with:
           distribution: ${{ env.JAVA_DISTRIBUTION }}
