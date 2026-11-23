@@ -3,9 +3,10 @@ package dev.hivens.libtray
 /**
  * Static description of the right-click menu attached to a tray icon.
  *
- * To update the menu, build a new [TrayMenu] and call [Tray.setMenu]. Each
- * backend rebuilds its native menu from it whole (a new DBusMenu layout on
- * Linux, a new NSMenu on macOS, a new HMENU on Windows at every right click).
+ * To update the menu, build a new [TrayMenu] and call [Tray.setMenu]. An item
+ * at the same place among the items of its kind and id stays the same native
+ * item, so Linux tray hosts and macOS update the menu they show instead of
+ * rebuilding it, and Windows builds a new HMENU at every right click anyway.
  * libtray copies the lists when it takes a menu, so changing a list passed
  * in here afterwards does not change a menu already set.
  */

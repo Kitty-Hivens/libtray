@@ -192,6 +192,49 @@ internal class DBusTestClient : AutoCloseable {
             Pixmap(width, height, IntArray(width * height) { i -> bytes.get(ARGB_NETWORK_ORDER, i * 4L) })
         }
 
+    /** The `label` dbusmenu reports for menu item [id]. */
+    fun menuItemLabel(destination: String, id: Int): String =
+        call(destination, MENU_PATH, "com.canonical.dbusmenu", "GetProperty",
+            listOf(Arg.Int32(id), Arg.Str("label"))) { reply, arena ->
+            readString(recurse(firstArg(reply, arena), arena), arena)
+        }
+
+    /** Start receiving the dbusmenu signals tray items send, for [menuSignals]. */
+    fun watchMenu() = Arena.ofConfined().use { arena ->
+        val error = newError(arena)
+        bindings.handle("dbus_bus_add_match").invokeExact(
+            connection, arena.allocateUtf8("type='signal',interface='com.canonical.dbusmenu'"), error,
+        ) as Unit
+        check((bindings.handle("dbus_error_is_set").invokeExact(error) as Int) == 0) { "AddMatch failed: ${errorText(error)}" }
+    }
+
+    /** The members of the dbusmenu signals that arrive within [waitMs], in order. */
+    fun menuSignals(waitMs: Long): List<String> {
+        val members = mutableListOf<String>()
+        val deadline = System.nanoTime() + waitMs * 1_000_000
+        while (System.nanoTime() < deadline) {
+            bindings.handle("dbus_connection_read_write").invokeExact(connection, 50) as Int
+            while (true) {
+                val msg = bindings.handle("dbus_connection_pop_message").invokeExact(connection) as MemorySegment
+                if (msg.address() == 0L) break
+                try {
+                    val type = bindings.handle("dbus_message_get_type").invokeExact(msg) as Int
+                    val iface = bindings.handle("dbus_message_get_interface").invokeExact(msg) as MemorySegment
+                    val member = bindings.handle("dbus_message_get_member").invokeExact(msg) as MemorySegment
+                    // The bus also sends this connection its own NameAcquired.
+                    val fromMenu = iface.address() != 0L &&
+                        iface.reinterpret(Long.MAX_VALUE).getString(0) == "com.canonical.dbusmenu"
+                    if (type == DBusBindings.DBUS_MESSAGE_TYPE_SIGNAL && fromMenu && member.address() != 0L) {
+                        members += member.reinterpret(Long.MAX_VALUE).getString(0)
+                    }
+                } finally {
+                    bindings.handle("dbus_message_unref").invokeExact(msg) as Unit
+                }
+            }
+        }
+        return members
+    }
+
     /** Number of top-level children in the root of a dbusmenu `GetLayout` reply. */
     fun menuRootChildCount(destination: String): Int =
         call(destination, MENU_PATH, "com.canonical.dbusmenu", "GetLayout",

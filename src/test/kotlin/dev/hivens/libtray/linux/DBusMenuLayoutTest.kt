@@ -138,15 +138,65 @@ class DBusMenuLayoutTest {
     }
 
     @Test
-    fun `layouts sharing a counter never reuse an id`() {
+    fun `an item keeps its id in the next layout`() {
+        // Hosts match menu items by id, so an item that is still there after
+        // setMenu, relabelled or not, has to keep the id the host already has.
         val ids = AtomicInteger(0)
         val first = DBusMenuLayout(menu, ids)
-        val second = DBusMenuLayout(menu, ids)
+        val relabelled = TrayMenu(
+            TrayMenuItem.Standard(id = "show", label = "Show window"),
+            TrayMenuItem.Separator,
+            TrayMenuItem.Standard(id = "busy", label = "Busy", enabled = false),
+            TrayMenuItem.Submenu(id = "servers", label = "Servers", items = listOf(
+                TrayMenuItem.Standard(id = "eu", label = "EU"),
+                TrayMenuItem.Standard(id = "us", label = "US"),
+            )),
+        )
+        val second = DBusMenuLayout(relabelled, ids, first)
 
-        // menu has six items, so the second layout starts at 7.
-        second.childrenOf(0) shouldContainExactly listOf(7, 8, 9, 10)
-        second.nodeOf(1).shouldBeNull()
-        first.nodeOf(7).shouldBeNull()
-        second.nodeOf(7)!!.originalId shouldBe "show"
+        second.childrenOf(0) shouldContainExactly listOf(1, 2, 3, 4)
+        second.childrenOf(4) shouldContainExactly listOf(5, 6)
+        second.nodeOf(1)!!.label shouldBe "Show window"
+        second.sameStructureAs(first) shouldBe true
+    }
+
+    @Test
+    fun `an item new to the menu takes an id no earlier layout used`() {
+        val ids = AtomicInteger(0)
+        val first = DBusMenuLayout(menu, ids)
+        // "busy" (3) goes away and "idle" arrives in its place.
+        val changed = TrayMenu(
+            TrayMenuItem.Standard(id = "show", label = "Show"),
+            TrayMenuItem.Separator,
+            TrayMenuItem.Standard(id = "idle", label = "Idle"),
+            TrayMenuItem.Submenu(id = "servers", label = "Servers", items = listOf(
+                TrayMenuItem.Standard(id = "eu", label = "EU"),
+                TrayMenuItem.Standard(id = "us", label = "US"),
+            )),
+        )
+        val second = DBusMenuLayout(changed, ids, first)
+
+        second.childrenOf(0) shouldContainExactly listOf(1, 2, 7, 4)
+        second.nodeOf(3).shouldBeNull()
+        second.sameStructureAs(first) shouldBe false
+        // A click on "busy" from a menu still on screen resolves to it.
+        second.clickTarget(3)!!.originalId shouldBe "busy"
+        second.clickTarget(7)!!.originalId shouldBe "idle"
+        second.clickTarget(999).shouldBeNull()
+    }
+
+    @Test
+    fun `items sharing an id and separators keep their ids by position among their kind`() {
+        val ids = AtomicInteger(0)
+        val twice = TrayMenu(
+            TrayMenuItem.Standard(id = "same", label = "First"),
+            TrayMenuItem.Separator,
+            TrayMenuItem.Standard(id = "same", label = "Second"),
+            TrayMenuItem.Separator,
+        )
+        val first = DBusMenuLayout(twice, ids)
+        val second = DBusMenuLayout(twice, ids, first)
+        second.childrenOf(0) shouldContainExactly first.childrenOf(0)
+        second.nodeOf(3)!!.label shouldBe "Second"
     }
 }

@@ -116,7 +116,10 @@ internal class SniTrayImpl internal constructor(
         IconScaling.fit(initial.iconBytes, maxIconSize, log, subsampleOversized)?.let(::pngToPixmaps).orEmpty()
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     private val menuIds = AtomicInteger(0)
-    @Volatile private var menuLayout: DBusMenuLayout? = initial.menu?.snapshot()?.let { DBusMenuLayout(it, menuIds) }
+    @Volatile private var menuLayout: DBusMenuLayout = DBusMenuLayout(initial.menu?.snapshot(), menuIds)
+
+    /** One setMenu at a time, since each layout is built from the one before it. */
+    private val menuLock = Any()
     private val layoutRevision = AtomicInteger(0)
     private val open = AtomicBoolean(true)
 
@@ -225,15 +228,24 @@ internal class SniTrayImpl internal constructor(
 
     override fun setMenu(menu: TrayMenu?): Boolean {
         if (!open.get()) return false
-        menuLayout = if (menu == null) null else DBusMenuLayout(
-            menu.snapshot() ?: run {
-                log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
-                return false
-            },
-            menuIds,
-        )
-        layoutRevision.incrementAndGet()
-        return signalling("setMenu") { emitLayoutUpdated() }
+        val snapshot = if (menu == null) null else menu.snapshot() ?: run {
+            log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
+            return false
+        }
+        synchronized(menuLock) {
+            val previous = menuLayout
+            val next = DBusMenuLayout(snapshot, menuIds, previous)
+            menuLayout = next
+            // Same items in the same places: hosts keep the menu they built and
+            // take the new labels and flags, which also leaves an open submenu open.
+            if (next.sameStructureAs(previous)) {
+                val (updated, removed) = next.propertyChangesSince(previous)
+                if (updated.isEmpty()) return true
+                return signalling("setMenu") { emitItemsPropertiesUpdated(next, updated, removed) }
+            }
+            layoutRevision.incrementAndGet()
+            return signalling("setMenu") { emitLayoutUpdated() }
+        }
     }
 
     /** The libdbus half of a setter. False once the tray is closed. */
@@ -790,6 +802,10 @@ internal class SniTrayImpl internal constructor(
             val parentId = readInt(call, iter) ?: 0
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
             val depth = readInt(call, iter) ?: -1
+            // One layout for the whole reply: setMenu can swap it in the meantime,
+            // and mixing the two would pair one menu's ids with another's labels.
+            val layout = menuLayout
+            if (layout.nodeOf(parentId) == null) return replyInvalidArgs(msg, "No menu item $parentId")
             // We ignore propertyNames and just send everything we know —
             // the protocol allows unrequested properties in the response,
             // and our property set is small enough that filtering would
@@ -805,10 +821,8 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_append_basic")
                 .invokeExact(replyIter, DBusBindings.DBUS_TYPE_UINT32.toInt(), intBuf) as Int
 
-            // Root struct (ia{sv}av), the recursive subtree from parentId. One
-            // layout for the whole reply: setMenu can swap it in the meantime,
-            // and mixing the two would pair one menu's ids with another's labels.
-            marshallNode(call, replyIter, menuLayout, parentId, depth)
+            // Root struct (ia{sv}av), the recursive subtree from parentId.
+            marshallNode(call, replyIter, layout, parentId, depth)
             sendAndUnref(reply)
         }
     }
@@ -882,7 +896,9 @@ internal class SniTrayImpl internal constructor(
             val arr = call.allocate(bindings.messageIterLayout)
             openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
             val layout = menuLayout  // one layout for the whole reply, as in GetLayout
-            for (id in ids) {
+            // An id this menu does not have is left out rather than answered
+            // with no properties, which a host would read as a blank item.
+            for (id in ids.filter { layout.nodeOf(it) != null }) {
                 val struct = call.allocate(bindings.messageIterLayout)
                 openContainer(arr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
                 val intBuf = call.allocate(ValueLayout.JAVA_INT)
@@ -892,7 +908,7 @@ internal class SniTrayImpl internal constructor(
                 val dictSig = call.allocateUtf8("{sv}")
                 val dict = call.allocate(bindings.messageIterLayout)
                 openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, dictSig, dict)
-                for ((name, value) in layout?.propertiesOf(id).orEmpty()) {
+                for ((name, value) in layout.propertiesOf(id)) {
                     appendMenuPropertyEntry(call, dict, name, value)
                 }
                 closeContainer(struct, dict)
@@ -912,7 +928,9 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
             val propName = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "GetProperty takes (is)")
 
-            val value = menuLayout?.propertiesOf(id)?.get(propName)
+            val layout = menuLayout
+            if (layout.nodeOf(id) == null) return replyInvalidArgs(msg, "No menu item $id")
+            val value = layout.propertiesOf(id)[propName]
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
             val replyIter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
@@ -937,12 +955,18 @@ internal class SniTrayImpl internal constructor(
      * host sends outside that set — nothing stops it, the node ids are
      * public over the bus — is dropped rather than handed to a consumer
      * that would never see it on Windows or macOS.
+     *
+     * An item setMenu removed still counts, as the host may show the menu it
+     * fetched before and the user clicked what they saw, which is what the
+     * other two backends deliver as well. False when no recent layout knows
+     * [nodeId] at all.
      */
-    private fun fireMenuClick(nodeId: Int) {
-        val node = menuLayout?.nodeOf(nodeId) ?: return
-        if (node.kind != DBusMenuLayout.NodeKind.Standard) return  // separator, submenu parent, or the root
-        if (!node.enabled) return
-        fire(TrayEvent.MenuItemSelected(node.originalId))
+    private fun fireMenuClick(layout: DBusMenuLayout, nodeId: Int): Boolean {
+        val node = layout.clickTarget(nodeId) ?: return false
+        if (node.kind == DBusMenuLayout.NodeKind.Standard && node.enabled) {
+            fire(TrayEvent.MenuItemSelected(node.originalId))
+        }
+        return true
     }
 
     /**
@@ -958,13 +982,17 @@ internal class SniTrayImpl internal constructor(
             bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
             val eventId = readBasicString(call, iter) ?: return replyInvalidArgs(msg, "Event takes (isvu)")
             // data + timestamp ignored — we don't expose them as event fields.
-            if (eventId == "clicked") fireMenuClick(id)
+            val layout = menuLayout
+            if (layout.clickTarget(id) == null) return replyInvalidArgs(msg, "No menu item $id")
+            if (eventId == "clicked") fireMenuClick(layout, id)
             replyEmpty(msg)
         }
     }
 
     /**
-     * EventGroup(events: a(isvu)), a batched Event. Reply: ai of unhandled ids.
+     * EventGroup(events: a(isvu)), a batched Event. Reply: ai of the ids no
+     * recent layout knows, or an error when that is all of them, as the spec
+     * asks.
      *
      * Types are checked before each recurse. Anything on the session bus can
      * call this, and `dbus_message_iter_recurse` on a value that is not a
@@ -978,6 +1006,9 @@ internal class SniTrayImpl internal constructor(
             if (outerType.toByte() != DBusBindings.DBUS_TYPE_ARRAY) return replyInvalidArgs(msg, EVENT_GROUP_ARGS)
             val arrIter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_recurse").invokeExact(iter, arrIter) as Unit
+            val layout = menuLayout
+            val unknown = mutableListOf<Int>()
+            var events = 0
             // Walk each (i s v u) tuple — pull id + event_id, ignore data + ts.
             while (true) {
                 val argType = bindings.handle("dbus_message_iter_get_arg_type").invokeExact(arrIter) as Int
@@ -988,18 +1019,20 @@ internal class SniTrayImpl internal constructor(
                 val id = readInt(call, structIter) ?: 0
                 bindings.handle("dbus_message_iter_next").invokeExact(structIter) as Int
                 val eventId = readBasicString(call, structIter) ?: ""
-                if (eventId == "clicked") fireMenuClick(id)
+                events++
+                if (layout.clickTarget(id) == null) {
+                    unknown += id
+                } else if (eventId == "clicked") {
+                    fireMenuClick(layout, id)
+                }
                 bindings.handle("dbus_message_iter_next").invokeExact(arrIter) as Int
             }
+            if (events > 0 && unknown.size == events) return replyInvalidArgs(msg, "None of the menu items $unknown exist")
 
-            // Reply: empty array of int (no unhandled events).
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
             val replyIter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init_append").invokeExact(reply, replyIter) as Unit
-            val arrSig = call.allocateUtf8("i")
-            val replyArr = call.allocate(bindings.messageIterLayout)
-            openContainer(replyIter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, replyArr)
-            closeContainer(replyIter, replyArr)
+            appendIntArray(call, replyIter, unknown)
             sendAndUnref(reply)
         }
     }
@@ -1007,6 +1040,10 @@ internal class SniTrayImpl internal constructor(
     /** AboutToShow(id) → bool needsUpdate. We never need a layout refresh on demand. */
     private fun handleMenuAboutToShow(msg: MemorySegment) {
         Arena.ofConfined().use { call ->
+            val args = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, args) as Int
+            val id = readInt(call, args) ?: return replyInvalidArgs(msg, "AboutToShow takes (i)")
+            if (menuLayout.nodeOf(id) == null) return replyInvalidArgs(msg, "No menu item $id")
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit
@@ -1018,19 +1055,93 @@ internal class SniTrayImpl internal constructor(
         }
     }
 
-    /** AboutToShowGroup(ids) → (a(i) updatesNeeded, a(i) idErrors). Both empty. */
+    /**
+     * AboutToShowGroup(ids) → (ai updatesNeeded, ai idErrors). No update is
+     * ever needed. idErrors lists the ids this menu does not have, and when
+     * that is all of them the spec asks for an error instead.
+     */
     private fun handleMenuAboutToShowGroup(msg: MemorySegment) {
         Arena.ofConfined().use { call ->
+            val args = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init").invokeExact(msg, args) as Int
+            val ids = readIntArray(call, args)
+            val layout = menuLayout
+            val unknown = ids.filter { layout.nodeOf(it) == null }
+            if (ids.isNotEmpty() && unknown.size == ids.size) return replyInvalidArgs(msg, "None of the menu items $unknown exist")
             val reply = bindings.handle("dbus_message_new_method_return").invokeExact(msg) as MemorySegment
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init_append").invokeExact(reply, iter) as Unit
-            val arrSig = call.allocateUtf8("i")
-            for (i in 0 until 2) {
-                val arr = call.allocate(bindings.messageIterLayout)
-                openContainer(iter, DBusBindings.DBUS_TYPE_ARRAY, arrSig, arr)
-                closeContainer(iter, arr)
-            }
+            appendIntArray(call, iter, emptyList())
+            appendIntArray(call, iter, unknown)
             sendAndUnref(reply)
+        }
+    }
+
+    private fun appendIntArray(call: Arena, parent: MemorySegment, values: List<Int>) {
+        val arr = call.allocate(bindings.messageIterLayout)
+        openContainer(parent, DBusBindings.DBUS_TYPE_ARRAY, call.allocateUtf8("i"), arr)
+        val intBuf = call.allocate(ValueLayout.JAVA_INT)
+        for (value in values) {
+            intBuf.set(ValueLayout.JAVA_INT, 0, value)
+            bindings.handle("dbus_message_iter_append_basic")
+                .invokeExact(arr, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+        }
+        closeContainer(parent, arr)
+    }
+
+    /**
+     * ItemsPropertiesUpdated(a(ia{sv}) updatedProps, a(ias) removedProps): the
+     * new properties of the items in [updated], and for each item in
+     * [removed] the properties it no longer sets, which hosts reset to their
+     * spec default. Hosts apply it to the menu they built, keyed by id.
+     */
+    private fun emitItemsPropertiesUpdated(
+        layout: DBusMenuLayout,
+        updated: Map<Int, Map<String, DBusMenuLayout.PropertyValue>>,
+        removed: Map<Int, List<String>>,
+    ) {
+        Arena.ofConfined().use { call ->
+            val sig = bindings.handle("dbus_message_new_signal").invokeExact(
+                call.allocateUtf8("/MenuBar"), call.allocateUtf8("com.canonical.dbusmenu"),
+                call.allocateUtf8("ItemsPropertiesUpdated"),
+            ) as MemorySegment
+            if (sig.address() == 0L) return
+            val iter = call.allocate(bindings.messageIterLayout)
+            bindings.handle("dbus_message_iter_init_append").invokeExact(sig, iter) as Unit
+            val intBuf = call.allocate(ValueLayout.JAVA_INT)
+
+            val updatedArr = call.allocate(bindings.messageIterLayout)
+            openContainer(iter, DBusBindings.DBUS_TYPE_ARRAY, call.allocateUtf8("(ia{sv})"), updatedArr)
+            for ((id, props) in updated) {
+                val struct = call.allocate(bindings.messageIterLayout)
+                openContainer(updatedArr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+                intBuf.set(ValueLayout.JAVA_INT, 0, id)
+                bindings.handle("dbus_message_iter_append_basic")
+                    .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+                val dict = call.allocate(bindings.messageIterLayout)
+                openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, call.allocateUtf8("{sv}"), dict)
+                for ((name, value) in props) appendMenuPropertyEntry(call, dict, name, value)
+                closeContainer(struct, dict)
+                closeContainer(updatedArr, struct)
+            }
+            closeContainer(iter, updatedArr)
+
+            val removedArr = call.allocate(bindings.messageIterLayout)
+            openContainer(iter, DBusBindings.DBUS_TYPE_ARRAY, call.allocateUtf8("(ias)"), removedArr)
+            for ((id, names) in removed) {
+                val struct = call.allocate(bindings.messageIterLayout)
+                openContainer(removedArr, DBusBindings.DBUS_TYPE_STRUCT, MemorySegment.NULL, struct)
+                intBuf.set(ValueLayout.JAVA_INT, 0, id)
+                bindings.handle("dbus_message_iter_append_basic")
+                    .invokeExact(struct, DBusBindings.DBUS_TYPE_INT32.toInt(), intBuf) as Int
+                val nameArr = call.allocate(bindings.messageIterLayout)
+                openContainer(struct, DBusBindings.DBUS_TYPE_ARRAY, call.allocateUtf8("s"), nameArr)
+                for (name in names) appendBasicString(call, nameArr, DBusBindings.DBUS_TYPE_STRING, name)
+                closeContainer(struct, nameArr)
+                closeContainer(removedArr, struct)
+            }
+            closeContainer(iter, removedArr)
+            sendAndUnref(sig)
         }
     }
 

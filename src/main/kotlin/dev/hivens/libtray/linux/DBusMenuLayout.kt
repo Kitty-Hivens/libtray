@@ -1,7 +1,9 @@
 package dev.hivens.libtray.linux
 
+import dev.hivens.libtray.MenuItemKey
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.menuItemKeys
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -13,17 +15,20 @@ import java.util.concurrent.atomic.AtomicInteger
  * caller-supplied string id and surface that via
  * [dev.hivens.libtray.TrayEvent.MenuItemSelected].
  *
- * One [DBusMenuLayout] per [TrayMenu] snapshot — calling
- * [SniTrayImpl.setMenu] swaps in a fresh layout and emits the
- * `LayoutUpdated` signal so the host re-fetches.
+ * One [DBusMenuLayout] per [TrayMenu] snapshot, built from the [previous]
+ * one. Every host matches the items it shows by id, so an item that is still
+ * in the menu, by its [MenuItemKey], keeps the id it had. An item new to the
+ * menu takes the next number from [ids], which a tray shares across all its
+ * layouts, so an id never comes back with another meaning. A layout whose
+ * shape matches the previous one ([sameStructureAs]) only needs its changed
+ * properties sent, so hosts update the menu they built instead of rebuilding
+ * it.
  *
- * IDs are sequential ints drawn from [ids] (root is the reserved 0). A tray
- * passes the same counter for every layout it builds, so an id never comes
- * back with another meaning. A host can still click an item of the menu it
- * has on screen after [SniTrayImpl.setMenu] replaced it, and that click has
- * to find nothing rather than land on whichever new item reused the id.
+ * Items dropped from the menu stay resolvable through [clickTarget] for a
+ * while, since a host can still have the previous menu on screen and the user
+ * may click one of them.
  */
-internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger(0)) {
+internal class DBusMenuLayout(menu: TrayMenu?, ids: AtomicInteger = AtomicInteger(0), previous: DBusMenuLayout? = null) {
 
     /** Exposed for property dispatch — caller iterates by int id. */
     val nodesById: Map<Int, Node>
@@ -31,9 +36,16 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
     /** Children of each node (parent int id → list of child int ids). */
     val childrenByParent: Map<Int, List<Int>>
 
+    /** The id of each item by its key, for the next layout to carry over. */
+    private val idsByKey: Map<MenuItemKey, Int>
+
+    /** Nodes earlier layouts had and this one dropped, oldest first, at most [MAX_RETIRED]. */
+    private val retired: Map<Int, Node>
+
     init {
         val nodes = HashMap<Int, Node>()
         val children = HashMap<Int, MutableList<Int>>()
+        val keyed = HashMap<MenuItemKey, Int>()
 
         // Root node — id 0, holds the top-level items as children.
         nodes[0] = Node(
@@ -43,9 +55,10 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
         )
         children[0] = mutableListOf()
 
-        fun walk(items: List<TrayMenuItem>, parentId: Int) {
-            for (item in items) {
-                val id = ids.incrementAndGet()
+        fun walk(items: List<TrayMenuItem>, parentId: Int, parentKey: MenuItemKey?) {
+            for ((item, key) in items.zip(menuItemKeys(items, parentKey))) {
+                val id = previous?.idsByKey?.get(key) ?: ids.incrementAndGet()
+                keyed[key] = id
                 val kind = when (item) {
                     is TrayMenuItem.Standard -> NodeKind.Standard
                     is TrayMenuItem.Submenu  -> NodeKind.Submenu
@@ -58,21 +71,62 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
                 )
                 children.getOrPut(parentId) { mutableListOf() }.add(id)
                 if (item is TrayMenuItem.Submenu) {
-                    walk(item.items, id)
+                    walk(item.items, id, key)
                 }
             }
         }
-        walk(menu.items, 0)
+        if (menu != null) walk(menu.items, 0, null)
 
         nodesById = nodes
         childrenByParent = children
+        idsByKey = keyed
+        retired = LinkedHashMap<Int, Node>().apply {
+            if (previous != null) {
+                for ((id, node) in previous.retired) if (id !in nodes) put(id, node)
+                for ((id, node) in previous.nodesById) if (id != 0 && id !in nodes) put(id, node)
+            }
+            val excess = size - MAX_RETIRED
+            if (excess > 0) keys.take(excess).forEach(::remove)
+        }
     }
 
     /** Look up by host-supplied int id. */
     fun nodeOf(id: Int): Node? = nodesById[id]
 
+    /**
+     * The item a click on [id] means: one of this layout, or one an earlier
+     * layout had, as a host may still show the menu it fetched before. Null for
+     * an id no recent layout knows.
+     */
+    fun clickTarget(id: Int): Node? = nodesById[id] ?: retired[id]
+
     /** Children of [parent] — empty list when leaf or unknown id. */
     fun childrenOf(parent: Int): List<Int> = childrenByParent[parent] ?: emptyList()
+
+    /** Whether [other] has the same items, of the same kinds, in the same places, so only properties can differ. */
+    fun sameStructureAs(other: DBusMenuLayout): Boolean =
+        childrenByParent == other.childrenByParent &&
+            nodesById.all { (id, node) -> other.nodesById[id]?.kind == node.kind }
+
+    /**
+     * What changed since [previous], which has the same structure: for each
+     * item whose properties differ, its full new set, and the names of the
+     * properties it no longer has (back to their spec default). The two parts
+     * of an `ItemsPropertiesUpdated` signal.
+     */
+    fun propertyChangesSince(previous: DBusMenuLayout): Pair<Map<Int, Map<String, PropertyValue>>, Map<Int, List<String>>> {
+        val updated = LinkedHashMap<Int, Map<String, PropertyValue>>()
+        val removed = LinkedHashMap<Int, List<String>>()
+        for (id in nodesById.keys.sorted()) {
+            val now = propertiesOf(id)
+            val before = previous.propertiesOf(id)
+            if (now == before) continue
+            updated[id] = now
+            val gone = before.keys - now.keys
+            if (gone.isNotEmpty()) removed[id] = gone.toList()
+        }
+        return updated to removed
+    }
 
     /**
      * Properties for [id] in the form the dbusmenu protocol expects —
@@ -131,5 +185,15 @@ internal class DBusMenuLayout(menu: TrayMenu, ids: AtomicInteger = AtomicInteger
     internal sealed interface PropertyValue {
         data class Str(val value: String) : PropertyValue
         data class Bool(val value: Boolean) : PropertyValue
+    }
+
+    private companion object {
+        /**
+         * How many dropped items stay clickable. A host shows at most the
+         * menu it fetched last, so this only has to outlast a few quick
+         * setMenu calls while one is open, and it caps the memory an app that
+         * churns item ids can pin.
+         */
+        const val MAX_RETIRED = 256
     }
 }

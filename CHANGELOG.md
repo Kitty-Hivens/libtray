@@ -55,6 +55,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   copying the whole frame.
 - A failed `Tray.create` is logged at WARN with its stack trace instead of
   at INFO with the message only.
+- Menu items keep their identity across `setMenu`: an item at the same place
+  among items of its kind and id stays the same native item. On Linux it keeps
+  its dbusmenu id, and a change of labels or enabled flags alone goes out as
+  `ItemsPropertiesUpdated` instead of `LayoutUpdated`, so tray hosts update the
+  menu they built rather than rebuild it, and an open submenu stays open. On
+  macOS the `NSMenu` and its items are updated in place, so an open menu shows
+  the change. A click on an item `setMenu` removed while the menu was open is
+  now delivered on every platform, as Windows already did. Linux and macOS
+  dropped it.
 - `setIcon` with an empty array logs a warning, keeps the current icon and
   returns false instead of throwing `IllegalArgumentException`, as it does
   for bytes that do not decode. On macOS it no longer gets that far either,
@@ -77,7 +86,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   false, as the Windows backend does.
 - Linux: a click on an open menu that `setMenu` had just replaced could
   fire the new menu's item with the same position. Menu ids are no longer
-  reused within a tray, so such a click is dropped.
+  reused for another item within a tray, so such a click reaches the item
+  that was clicked.
+- Linux: dbusmenu calls with an id the menu never had (`Event`, `EventGroup`,
+  `AboutToShow`, `AboutToShowGroup`, `GetLayout`, `GetProperty`) succeeded
+  with an empty answer. They now reply `InvalidArgs`, or list the id in
+  `idErrors` where the method has one, as the dbusmenu spec asks, and
+  `GetGroupProperties` leaves such ids out instead of answering with no
+  properties.
 - Linux: `Get`, `GetAll`, `GetProperty` and `Event` calls with missing
   arguments got an empty reply, which for `Get` and `GetProperty` carried the
   wrong signature. They now get `InvalidArgs`. A dbusmenu reply is also built
