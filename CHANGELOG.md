@@ -69,6 +69,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   for bytes that do not decode. On macOS it no longer gets that far either,
   so it does not show the text placeholder. `TrayBuilder` still rejects an
   empty initial icon.
+- Windows: the tray menu is owned by the hidden top-level window instead of a
+  message-only one, and a `WM_NULL` is posted after it closes, as the
+  `TrackPopupMenu` documentation asks for a notification icon's menu.
+  Windows only dismisses such a menu on an outside click when its owner is
+  the foreground window, which a message-only window cannot become. Windows
+  11 dismissed it either way.
 
 ### Fixed
 - macOS: `Tray.create` returned null unless called on the Cocoa main thread,
@@ -159,11 +165,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `taskkill` without `/F` does, destroyed it and stopped the tray while the
   icon stayed up and `isOpen` stayed true. The window now ignores it unless
   `close()` sent it.
-- Windows: a click outside the open menu could leave it open, since its
-  message-only owner window could not take the foreground. The menu's owner
-  is now the hidden top-level window, and the message the `TrackPopupMenu`
-  documentation asks for after the menu closes is posted, without which the
-  next menu could appear and vanish at once.
 - Windows: a tooltip longer than 127 UTF-16 units was cut without regard to
   surrogate pairs, so an emoji or another character outside the Basic
   Multilingual Plane at the cut left half of itself behind as a stray glyph.
