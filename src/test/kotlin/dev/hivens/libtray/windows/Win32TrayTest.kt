@@ -201,7 +201,27 @@ class Win32TrayTest {
         data.set(ValueLayout.JAVA_INT, off("cbSize"), layout.byteSize().toInt())
         data.set(ValueLayout.ADDRESS, off("hWnd"), hwnd)
         data.set(ValueLayout.JAVA_INT, off("uID"), Win32Bindings.TRAY_ICON_UID)
-        (bindings.handle("Shell_NotifyIconW").invokeExact(Win32Bindings.NIM_DELETE, data) as Int) != 0
+        val state = tmp.allocate(Win32Bindings.CALL_STATE_LAYOUT)
+        (bindings.handle("Shell_NotifyIconW").invokeExact(state, Win32Bindings.NIM_DELETE, data) as Int) != 0
+    }
+
+    @Test
+    fun `a failed call reports its own last error`() {
+        // cbSize 0 is the documented way to make RegisterClassExW fail with
+        // ERROR_INVALID_PARAMETER. Read from the captured state, the code is
+        // the one the call left, whatever the JVM did on the thread afterwards.
+        val bindings = Win32Bindings.load() ?: error("user32 not loadable")
+        try {
+            Arena.ofConfined().use { tmp ->
+                val wc = tmp.allocate(bindings.wndClassExWLayout)
+                val state = tmp.allocate(Win32Bindings.CALL_STATE_LAYOUT)
+                val atom = bindings.handle("RegisterClassExW").invokeExact(state, wc) as Short
+                atom.toInt() shouldBe 0
+                Win32Bindings.lastError(state) shouldBe ERROR_INVALID_PARAMETER
+            }
+        } finally {
+            bindings.arena.close()
+        }
     }
 
     @Test
@@ -237,6 +257,10 @@ class Win32TrayTest {
 
     private fun post(tray: Tray, mouseEvent: Int) {
         postShellCallback(tray, mouseEvent) shouldBe true
+    }
+
+    private companion object {
+        const val ERROR_INVALID_PARAMETER = 87
     }
 }
 

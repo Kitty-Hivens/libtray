@@ -126,6 +126,12 @@ internal class Win32TrayImpl private constructor(
      */
     private val shellLock = Any()
 
+    /** Call state for Shell_NotifyIconW and CreateIcon, which only run under [shellLock]. */
+    private val shellCallState: MemorySegment = bindings.arena.allocate(Win32Bindings.CALL_STATE_LAYOUT)
+
+    /** Call state for the calls only the pump thread makes. */
+    private val pumpCallState: MemorySegment = bindings.arena.allocate(Win32Bindings.CALL_STATE_LAYOUT)
+
     /**
      * Currently-installed HICON. Replaced atomically when [setIcon]
      * fires; the prior HICON gets DestroyIcon'd on success so we don't
@@ -298,18 +304,15 @@ internal class Win32TrayImpl private constructor(
 
     // ── Shell_NotifyIcon helpers ─────────────────────────────────────────
 
+    /** Callers hold [shellLock], which guards the struct and [shellCallState]. */
     private fun shellNotifyIcon(message: Int): Boolean {
         return runCatching {
-            (bindings.handle("Shell_NotifyIconW").invokeExact(message, notifyIconData) as Int) != 0
+            (bindings.handle("Shell_NotifyIconW").invokeExact(shellCallState, message, notifyIconData) as Int) != 0
         }.getOrElse { t ->
             log.warn("Shell_NotifyIcon (msg={}) threw", message, t)
             false
         }
     }
-
-    private fun lastError(): Int = runCatching {
-        bindings.handle("GetLastError").invokeExact() as Int
-    }.getOrDefault(0)
 
     private fun initNotifyIconData(initialIcon: MemorySegment?) {
         val data = notifyIconData
@@ -423,11 +426,11 @@ internal class Win32TrayImpl private constructor(
             val andSeg = tmp.allocate(pixels.andBytes.size.toLong())
             andSeg.asByteBuffer().put(pixels.andBytes)
             createIcon.invokeExact(
-                hInstance, pixels.width, pixels.height, 1.toByte(), 32.toByte(), andSeg, xorSeg,
+                shellCallState, hInstance, pixels.width, pixels.height, 1.toByte(), 32.toByte(), andSeg, xorSeg,
             ) as MemorySegment
         }
         if (hicon.address() == 0L) {
-            log.warn("CreateIcon returned NULL (GetLastError={})", lastError())
+            log.warn("CreateIcon returned NULL (GetLastError={})", Win32Bindings.lastError(shellCallState))
             return null
         }
         return hicon
@@ -444,7 +447,7 @@ internal class Win32TrayImpl private constructor(
         taskbarCreated = registerTaskbarCreated()
         val createdHwnd = createHiddenWindow()
         if (createdHwnd == null || createdHwnd.address() == 0L) {
-            log.warn("CreateWindowExW failed on pump thread (GetLastError={})", lastError())
+            log.warn("CreateWindowExW failed on pump thread (GetLastError={})", Win32Bindings.lastError(pumpCallState))
             readyLatch.countDown()
             return
         }
@@ -472,7 +475,7 @@ internal class Win32TrayImpl private constructor(
                 // Not a reason to stop the pump: the caller sees
                 // creationSucceeded=false from Companion.create and decides
                 // how to degrade.
-                log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", lastError())
+                log.warn("Shell_NotifyIcon NIM_ADD failed (GetLastError={})", Win32Bindings.lastError(shellCallState))
             } else {
                 log.info("Shell_NotifyIcon NIM_ADD succeeded (uID={})", Win32Bindings.TRAY_ICON_UID)
             }
@@ -508,13 +511,14 @@ internal class Win32TrayImpl private constructor(
         while (true) {
             try {
                 val got = getMessage.invokeExact(
+                    pumpCallState,
                     msg,
                     MemorySegment.NULL,                      // any of this thread's windows
                     0,                                        // wMsgFilterMin
                     0,                                        // wMsgFilterMax
                 ) as Int
                 if (got == 0) return
-                check(got != -1) { "GetMessageW failed (GetLastError=${lastError()})" }
+                check(got != -1) { "GetMessageW failed (GetLastError=${Win32Bindings.lastError(pumpCallState)})" }
                 translateMessage.invokeExact(msg) as Int
                 dispatchMessage.invokeExact(msg) as Long
             } catch (t: Throwable) {
@@ -544,6 +548,7 @@ internal class Win32TrayImpl private constructor(
         return runCatching {
             val windowName = allocateUtf16(bindings.arena, initial.title)
             bindings.handle("CreateWindowExW").invokeExact(
+                pumpCallState,
                 Win32Bindings.WS_EX_TOOLWINDOW,         // dwExStyle
                 classNameSeg,                           // lpClassName
                 windowName,                             // lpWindowName
@@ -577,10 +582,10 @@ internal class Win32TrayImpl private constructor(
         if (taskbarCreated == 0) return
         val ok = runCatching {
             bindings.handle("ChangeWindowMessageFilterEx").invokeExact(
-                window, taskbarCreated, Win32Bindings.MSGFLT_ALLOW, MemorySegment.NULL,
+                pumpCallState, window, taskbarCreated, Win32Bindings.MSGFLT_ALLOW, MemorySegment.NULL,
             ) as Int
         }.getOrDefault(0)
-        if (ok == 0) log.debug("ChangeWindowMessageFilterEx failed (GetLastError={})", lastError())
+        if (ok == 0) log.debug("ChangeWindowMessageFilterEx failed (GetLastError={})", Win32Bindings.lastError(pumpCallState))
     }
 
     /**
@@ -595,7 +600,11 @@ internal class Win32TrayImpl private constructor(
         version4 = shellNotifyIcon(Win32Bindings.NIM_SETVERSION)
         // Windows also sends TaskbarCreated when the display DPI changes,
         // with the icon still in place, and then NIM_ADD fails harmlessly.
-        if (added) log.info("Taskbar was recreated, icon added again") else log.debug("NIM_ADD after TaskbarCreated failed (GetLastError={})", lastError())
+        if (added) {
+            log.info("Taskbar was recreated, icon added again")
+        } else {
+            log.debug("NIM_ADD after TaskbarCreated failed (GetLastError={})", Win32Bindings.lastError(shellCallState))
+        }
     }
 
     // ── WndProc dispatch (called from the upcall stub) ───────────────────
@@ -948,10 +957,10 @@ internal class Win32TrayImpl private constructor(
             wc.set(ValueLayout.ADDRESS, off("lpszClassName"), classNameSeg)
             wc.set(ValueLayout.ADDRESS, off("hIconSm"), MemorySegment.NULL)
 
-            val atom = bindings.handle("RegisterClassExW").invokeExact(wc) as Short
+            val callState = arena.allocate(Win32Bindings.CALL_STATE_LAYOUT)
+            val atom = bindings.handle("RegisterClassExW").invokeExact(callState, wc) as Short
             if (atom.toInt() == 0) {
-                val err = bindings.handle("GetLastError").invokeExact() as Int
-                log.warn("RegisterClassExW failed (GetLastError={})", err)
+                log.warn("RegisterClassExW failed (GetLastError={})", Win32Bindings.lastError(callState))
                 return null
             }
             log.info("Win32 window class registered: {}", className)

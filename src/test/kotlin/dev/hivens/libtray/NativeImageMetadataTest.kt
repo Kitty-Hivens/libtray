@@ -87,8 +87,12 @@ class NativeImageMetadataTest {
     }
 
     private fun render(): String {
-        val downcalls = (DBusBindings.DOWNCALL_DESCRIPTORS + Win32Bindings.DOWNCALL_DESCRIPTORS + ObjcBindings.DOWNCALL_DESCRIPTORS)
-            .map(::signature).distinct().sorted()
+        val plain = (DBusBindings.DOWNCALL_DESCRIPTORS + Win32Bindings.DOWNCALL_DESCRIPTORS + ObjcBindings.DOWNCALL_DESCRIPTORS)
+            .map { signature(it) }
+        // The schema leaves which states are captured to run time, so the flag alone is enough.
+        val capturing = Win32Bindings.CAPTURING_DOWNCALL_DESCRIPTORS
+            .map { signature(it, """"options": { "captureCallState": true }""") }
+        val downcalls = (plain + capturing).distinct().sorted()
         val upcalls = UPCALL_TARGETS.map { signature(it.descriptor) }.distinct().sorted()
 
         val (jdkReflection, jdkResources) = jdkEntries()
@@ -129,10 +133,11 @@ class NativeImageMetadataTest {
         return sections["REFLECTION"].orEmpty() to sections["RESOURCES"].orEmpty()
     }
 
-    private fun signature(descriptor: FunctionDescriptor): String {
+    private fun signature(descriptor: FunctionDescriptor, options: String? = null): String {
         val returnType = descriptor.returnLayout().map(::typeName).orElse("void")
         val parameters = descriptor.argumentLayouts().joinToString(", ") { "\"${typeName(it)}\"" }
-        return """{ "returnType": "$returnType", "parameterTypes": [$parameters] }"""
+        val extra = if (options == null) "" else ", $options"
+        return """{ "returnType": "$returnType", "parameterTypes": [$parameters]$extra }"""
     }
 
     private fun typeName(layout: MemoryLayout): String = when {
