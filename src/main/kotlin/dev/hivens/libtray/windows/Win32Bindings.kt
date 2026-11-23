@@ -6,6 +6,7 @@ import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
 import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.StructLayout
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
@@ -98,10 +99,6 @@ internal class Win32Bindings private constructor(
             Triple("GetModuleHandleW",
                 ValueLayout.ADDRESS,                                        // HMODULE
                 listOf(ValueLayout.ADDRESS),                                // LPCWSTR (NULL = current)
-            ),
-            Triple("GetLastError",
-                ValueLayout.JAVA_INT,                                       // DWORD
-                emptyList(),
             ),
 
             // ── user32: window class + window ──────────────────────────────
@@ -304,11 +301,42 @@ internal class Win32Bindings private constructor(
         )
 
         /**
-         * Every downcall shape this backend binds. Also the source for the
-         * GraalVM native-image metadata shipped in the jar.
+         * The calls whose failure libtray logs with its error code. They are
+         * bound with `captureCallState("GetLastError")`, so their handles take
+         * a [CALL_STATE_LAYOUT] segment first and the code is saved the moment
+         * the call returns. A separate GetLastError downcall would run after
+         * whatever the JVM does on the thread in between, which may reset it.
+         */
+        private val CAPTURES_LAST_ERROR = setOf(
+            "RegisterClassExW", "CreateWindowExW", "GetMessageW", "ChangeWindowMessageFilterEx",
+            "Shell_NotifyIconW", "CreateIcon",
+        )
+
+        // This and the offset below are lazy: only Windows has a GetLastError
+        // state, and the metadata test loads this class on every platform.
+        private val CAPTURE_LAST_ERROR: Linker.Option by lazy { Linker.Option.captureCallState("GetLastError") }
+
+        /** The segment a [CAPTURES_LAST_ERROR] handle takes first. Read it with [lastError]. */
+        val CALL_STATE_LAYOUT: StructLayout = Linker.Option.captureStateLayout()
+
+        private val LAST_ERROR_OFFSET: Long by lazy {
+            CALL_STATE_LAYOUT.byteOffset(MemoryLayout.PathElement.groupElement("GetLastError"))
+        }
+
+        /** The GetLastError value [state] captured from the last call it was passed to. */
+        fun lastError(state: MemorySegment): Int = state.get(ValueLayout.JAVA_INT, LAST_ERROR_OFFSET)
+
+        /**
+         * Every downcall shape this backend binds without options. With
+         * [CAPTURING_DOWNCALL_DESCRIPTORS], the source for the GraalVM
+         * native-image metadata shipped in the jar.
          */
         internal val DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
-            LOAD_SET.map { (_, ret, args) -> functionDescriptor(ret, args) }
+            LOAD_SET.filter { it.first !in CAPTURES_LAST_ERROR }.map { (_, ret, args) -> functionDescriptor(ret, args) }
+
+        /** The shapes bound with `captureCallState`, which a native image registers separately. */
+        internal val CAPTURING_DOWNCALL_DESCRIPTORS: List<FunctionDescriptor> =
+            LOAD_SET.filter { it.first in CAPTURES_LAST_ERROR }.map { (_, ret, args) -> functionDescriptor(ret, args) }
 
         /**
          * Load the Win32 DLLs into a fresh shared arena and bind every
@@ -339,7 +367,11 @@ internal class Win32Bindings private constructor(
                         arena.close()
                         return null
                     }
-                handles[name] = linker.downcallHandle(symbol, descriptor)
+                handles[name] = if (name in CAPTURES_LAST_ERROR) {
+                    linker.downcallHandle(symbol, descriptor, CAPTURE_LAST_ERROR)
+                } else {
+                    linker.downcallHandle(symbol, descriptor)
+                }
             }
             return Win32Bindings(arena, handles)
         }
@@ -348,7 +380,7 @@ internal class Win32Bindings private constructor(
     // ── Struct layouts ──────────────────────────────────────────────────────
     //
     // WNDCLASSEXW from winuser.h. cbSize MUST equal the struct size or
-    // RegisterClassExW returns 0 with GetLastError() == ERROR_INVALID_PARAMETER.
+    // RegisterClassExW returns 0 with ERROR_INVALID_PARAMETER as its last error.
 
     val wndClassExWLayout: MemoryLayout = MemoryLayout.structLayout(
         ValueLayout.JAVA_INT.withName("cbSize"),

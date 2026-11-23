@@ -7,6 +7,7 @@ import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayEventListener
 import dev.hivens.libtray.TrayMenu
+import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.joinPastInterrupt
 import dev.hivens.libtray.snapshot
@@ -22,7 +23,8 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Linux tray backend — `org.kde.StatusNotifierItem` over D-Bus session
- * bus, registered with `org.kde.StatusNotifierWatcher`. Pure libdbus via
+ * bus, registered with `org.kde.StatusNotifierWatcher`, or with
+ * `org.freedesktop.StatusNotifierWatcher` where only that one is owned. Pure libdbus via
  * Project Panama (see [DBusBindings]); no GTK / GLib / libayatana
  * transitive dependencies.
  *
@@ -116,7 +118,8 @@ internal class SniTrayImpl internal constructor(
         IconScaling.fit(initial.iconBytes, maxIconSize, log, subsampleOversized)?.let(::pngToPixmaps).orEmpty()
     @Volatile private var tooltip: String = initial.tooltip ?: ""
     private val menuIds = AtomicInteger(0)
-    @Volatile private var menuLayout: DBusMenuLayout = DBusMenuLayout(initial.menu?.snapshot(), menuIds)
+    @Volatile private var menuLayout: DBusMenuLayout =
+        DBusMenuLayout(initial.menu?.snapshot()?.takeIf(::fitsOneMessage), menuIds)
 
     /**
      * One setMenu at a time, since each layout is built from the one before
@@ -239,6 +242,7 @@ internal class SniTrayImpl internal constructor(
             log.warn("setMenu got a menu with a list emptied after it was built, keeping the current menu")
             return false
         }
+        if (snapshot != null && !fitsOneMessage(snapshot)) return false
         synchronized(menuLock) {
             val previous = menuLayout
             val next = DBusMenuLayout(snapshot, menuIds, previous)
@@ -253,6 +257,18 @@ internal class SniTrayImpl internal constructor(
             layoutRevision.incrementAndGet()
             return signalling("setMenu") { emitLayoutUpdated() }
         }
+    }
+
+    /**
+     * Whether a GetLayout reply for [menu] stays within the nesting libdbus
+     * allows. Past it, the bus daemon disconnects the item at the host's
+     * first GetLayout, and the tray is gone while [isOpen] stays true.
+     */
+    private fun fitsOneMessage(menu: TrayMenu): Boolean {
+        val depth = submenuDepth(menu.items)
+        if (depth <= MAX_SUBMENU_DEPTH) return true
+        log.warn("Menu is {} submenus deep, past the {} one D-Bus message can carry, so it is not used", depth, MAX_SUBMENU_DEPTH)
+        return false
     }
 
     /** The libdbus half of a setter. False once the tray is closed. */
@@ -1345,6 +1361,8 @@ internal class SniTrayImpl internal constructor(
 
         private const val WATCHER_NAME_KDE = "org.kde.StatusNotifierWatcher"
         private const val WATCHER_NAME_FDO = "org.freedesktop.StatusNotifierWatcher"
+        private const val SERVICE_UNKNOWN = "org.freedesktop.DBus.Error.ServiceUnknown"
+        private const val NAME_HAS_NO_OWNER = "org.freedesktop.DBus.Error.NameHasNoOwner"
         private const val EVENT_GROUP_ARGS = "EventGroup takes a(isvu)"
 
         /** `DBUS_MAXIMUM_ARRAY_LENGTH` from dbus-protocol.h: 64 MiB of array data. */
@@ -1356,6 +1374,18 @@ internal class SniTrayImpl internal constructor(
          * each. The outer array is the one that reaches the limit first.
          */
         private const val PIXMAP_ENTRY_OVERHEAD: Long = 12
+
+        /**
+         * Most submenus one menu may nest. A GetLayout reply nests a variant,
+         * a struct and an array for every level, on top of the root and the
+         * innermost item's properties, and libdbus refuses a message whose
+         * containers, variants included, nest deeper than 64. With 19 levels
+         * the innermost value sits at exactly 64.
+         */
+        private const val MAX_SUBMENU_DEPTH = 19
+
+        private fun submenuDepth(items: List<TrayMenuItem>): Int =
+            items.maxOfOrNull { if (it is TrayMenuItem.Submenu) 1 + submenuDepth(it.items) else 0 } ?: 0
 
         /**
          * How long `dbus_connection_read_write` blocks per iteration. It
@@ -1395,17 +1425,18 @@ internal class SniTrayImpl internal constructor(
         }
 
         /**
-         * Derive an SNI `Id` from the human-readable title. Spec calls for
+         * Derive an SNI `Id` from the human-readable title. The spec asks for
          * "a name that should be unique for this application and consistent
-         * between sessions" — so lowercase, drop everything that's not
-         * `[a-z0-9]`, fall back to "tray" if the result is empty (titles
-         * made of pure CJK / cyrillic / emoji would otherwise produce an
-         * empty Id, which some hosts reject).
+         * between sessions", so the title is lowercased and only its letters
+         * and digits are kept, in whatever script. `Id` is a D-Bus string,
+         * which is UTF-8, so only bus names and object paths are held to
+         * ASCII. A title with neither, such as emoji alone, falls back to
+         * "tray", since some hosts reject an empty Id.
          */
         internal fun slugifyForSni(title: String): String {
             val slug = buildString(title.length) {
                 for (ch in title.lowercase()) {
-                    if (ch in 'a'..'z' || ch in '0'..'9') append(ch)
+                    if (ch.isLetterOrDigit()) append(ch)
                 }
             }
             return slug.ifEmpty { "tray" }
@@ -1584,21 +1615,45 @@ internal class SniTrayImpl internal constructor(
             }
         }
 
+        /**
+         * Announce [itemId] to the StatusNotifierWatcher. Every tray host in
+         * use owns `org.kde.StatusNotifierWatcher`, so that comes first. The
+         * freedesktop name from the spec draft is tried only when nobody owns
+         * the KDE one, which the bus answers at once, so the I/O thread never
+         * waits out two reply timeouts.
+         */
         private fun registerWithWatcher(
             bindings: DBusBindings,
             conn: MemorySegment,
             itemId: String,
             setup: Arena,
         ): Boolean {
+            val kde = registerWith(bindings, conn, itemId, setup, WATCHER_NAME_KDE) ?: return true
+            if (kde != SERVICE_UNKNOWN && kde != NAME_HAS_NO_OWNER) return false
+            return registerWith(bindings, conn, itemId, setup, WATCHER_NAME_FDO) == null
+        }
+
+        /**
+         * Call RegisterStatusNotifierItem on the watcher that owns [watcher],
+         * which also names its interface. Null on success, otherwise the D-Bus
+         * error name, or an empty string when the call could not be made.
+         */
+        private fun registerWith(
+            bindings: DBusBindings,
+            conn: MemorySegment,
+            itemId: String,
+            setup: Arena,
+            watcher: String,
+        ): String? {
             return runCatching {
-                val destination = setup.allocateUtf8("org.kde.StatusNotifierWatcher")
+                val destination = setup.allocateUtf8(watcher)
                 val path        = setup.allocateUtf8("/StatusNotifierWatcher")
-                val iface       = setup.allocateUtf8("org.kde.StatusNotifierWatcher")
+                val iface       = setup.allocateUtf8(watcher)
                 val member      = setup.allocateUtf8("RegisterStatusNotifierItem")
                 val msg = bindings.handle("dbus_message_new_method_call").invokeExact(
                     destination, path, iface, member,
                 ) as MemorySegment
-                if (msg.address() == 0L) return@runCatching false
+                if (msg.address() == 0L) return@runCatching ""
 
                 val iter = setup.allocate(bindings.messageIterLayout)
                 bindings.handle("dbus_message_iter_init_append").invokeExact(msg, iter) as Unit
@@ -1619,10 +1674,13 @@ internal class SniTrayImpl internal constructor(
                 }
                 val errorSet = bindings.handle("dbus_error_is_set").invokeExact(error) as Int
                 if (errorSet != 0) {
+                    // DBusError starts with its name, a const char*.
+                    val name = error.get(ValueLayout.ADDRESS, 0)
+                    val errorName = if (name.address() == 0L) "" else name.reinterpret(Long.MAX_VALUE).getString(0)
                     bindings.handle("dbus_error_free").invokeExact(error) as Unit
-                    false
-                } else true
-            }.getOrDefault(false)
+                    errorName
+                } else null
+            }.getOrDefault("")
         }
     }
 }

@@ -211,6 +211,9 @@ Behaviour that changed under existing calls:
 - A click on a menu item that `setMenu` removed while the menu was open is
   delivered on every platform. A listener that treats every
   `MenuItemSelected` id as one of the current menu's should check it.
+- On Linux, a title with letters outside `a-z` gets a different SNI `Id`, so a
+  tray host that stores settings per `Id` sees a new item.
+- On Linux, `setMenu` refuses a menu nested more than 19 submenus deep.
 
 ### From 0.1.3
 

@@ -162,6 +162,43 @@ class SniHostTest {
     }
 
     @Test
+    fun `a menu nested deeper than one D-Bus message allows is refused and the item stays on the bus`() {
+        val name = "org.libtray.HostTest.DeepMenu"
+        val tray = open(name)
+
+        // Each submenu level nests three containers in a GetLayout reply, and
+        // libdbus refuses a message nested past 64. Sent, the bus daemon
+        // dropped the item while isOpen stayed true.
+        tray.setMenu(nestedMenu(20)) shouldBe false
+        host.menuRootChildCount(name) shouldBe 3
+        host.getStringProperty(name, "Status") shouldBe "Active"
+
+        tray.setMenu(nestedMenu(19)) shouldBe true
+        host.menuRootChildCount(name) shouldBe 1
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
+    fun `an initial menu nested too deep leaves the tray without a menu`() {
+        val name = "org.libtray.HostTest.DeepInitialMenu"
+        val tray = Tray.create(
+            TrayBuilder(title = "deep menu", iconBytes = solidPng(32), menu = nestedMenu(20), linuxBusName = name),
+        ) ?: error("Tray.create returned null on the private bus")
+        trays += tray
+
+        host.menuRootChildCount(name) shouldBe 0
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
+    fun `a title in another script keeps its letters in the Id`() {
+        val name = "org.libtray.HostTest.CyrillicId"
+        open(name, title = "Мой Трей 2")
+
+        host.getStringProperty(name, "Id") shouldBe "мойтрей2"
+    }
+
+    @Test
     fun `properties have their spec types, and unknown ones and other paths get errors`() {
         val name = "org.libtray.HostTest.Properties.Types"
         open(name)
@@ -404,6 +441,18 @@ class SniHostTest {
     }
 
     @Test
+    fun `registers with a watcher that owns only the freedesktop name`() {
+        val name = "org.libtray.HostTest.FdoWatcher"
+        DBusTestClient.Watcher(DBusTestClient.FDO_WATCHER_NAME).use { first ->
+            open(name)
+            first.registrations.poll(2, TimeUnit.SECONDS) shouldBe name
+        }
+        DBusTestClient.Watcher(DBusTestClient.FDO_WATCHER_NAME).use { second ->
+            second.registrations.poll(3, TimeUnit.SECONDS) shouldBe name
+        }
+    }
+
+    @Test
     fun `answers the host within the latency budget`() {
         val name = "org.libtray.HostTest.Latency"
         val delivered = LinkedBlockingQueue<Long>()
@@ -468,6 +517,13 @@ class SniHostTest {
         ) ?: error("Tray.create returned null on the private bus")
         trays += tray
         return tray
+    }
+
+    /** A menu whose one item is [levels] submenus deep, with a single entry at the bottom. */
+    private fun nestedMenu(levels: Int): TrayMenu {
+        var item: TrayMenuItem = TrayMenuItem.Standard("leaf", "Leaf")
+        repeat(levels) { item = TrayMenuItem.Submenu("level$it", "Level $it", listOf(item)) }
+        return TrayMenu(item)
     }
 
     private fun signal(name: String, pid: String) {

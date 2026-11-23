@@ -67,6 +67,8 @@ public interface Tray : AutoCloseable {
      * Replace the right-click menu. `null` removes the menu (the icon
      * becomes click-only). Items that stay in the menu keep their identity,
      * so an open menu updates rather than closes on Linux hosts and macOS.
+     * Linux refuses a menu nested more than 19 submenus deep, which is as far
+     * as one D-Bus message goes, and a tray created with one has no menu.
      * A click on an item this call removed while the menu was open still
      * arrives as [TrayEvent.MenuItemSelected] with that item's id, and events
      * reach listeners asynchronously anyway, so a listener should expect ids

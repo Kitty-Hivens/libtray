@@ -17,6 +17,16 @@ class SniBusNameTest {
     }
 
     @Test
+    fun `the SNI Id keeps letters and digits of any script`() {
+        // Latin titles keep the Id they always had, so hosts that store
+        // settings per Id do not lose them.
+        SniTrayImpl.slugifyForSni("Nexira Launcher 2") shouldBe "nexiralauncher2"
+        SniTrayImpl.slugifyForSni("Мой Трей") shouldBe "мойтрей"
+        SniTrayImpl.slugifyForSni("トレイ") shouldBe "トレイ"
+        SniTrayImpl.slugifyForSni("🚀 !") shouldBe "tray"
+    }
+
+    @Test
     fun `keeps unique PID based names by default`() {
         val builder = TrayBuilder("MyApp", icon)
         val first = SniTrayImpl.busNameFor(builder)
