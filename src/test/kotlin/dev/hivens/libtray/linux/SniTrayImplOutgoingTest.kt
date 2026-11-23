@@ -8,6 +8,7 @@ import java.lang.foreign.Arena
 import java.lang.foreign.MemorySegment
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -30,8 +31,8 @@ import kotlin.concurrent.thread
  *    bus that stopped reading.
  *  - close() mid-send lets the in-flight send/unref pair finish and then
  *    drains the still-queued messages by unref WITHOUT sending.
- *  - concurrent emit from many threads loses nothing and keeps each
- *    thread's messages in submission order on the wire.
+ *  - setters called from many threads lose no signal and keep each
+ *    thread's signals in call order on the wire.
  *  - a message queued during an iteration is sent before the loop blocks
  *    in the next poll, and poll + send all run on one thread.
  *    Those last two are the reply-latency fix: libdbus holds the
@@ -176,7 +177,7 @@ class SniTrayImplOutgoingTest {
     }
 
     @Test
-    fun `concurrent emit from many threads loses nothing and keeps per-thread order`() {
+    fun `setters on many threads lose no signal and keep each thread's order`() {
         val rec = RecordingDbus()
         val tray = newTray(rec)
         val threads = 4
@@ -184,22 +185,27 @@ class SniTrayImplOutgoingTest {
         val start = CountDownLatch(1)
 
         val workers = (0 until threads).map { t ->
-            thread {
+            thread(name = "setter-$t") {
                 start.await()
-                for (s in 0 until perThread) tray.outgoing.put(seg(encode(t, s)))
+                repeat(perThread) { tray.setTooltip("thread $t call $it") shouldBe true }
             }
         }
         start.countDown()
         workers.forEach { it.join() }
 
-        val total = threads * perThread
-        awaitUntil(3_000) { rec.sent.size == total } shouldBe true
-        rec.sent.toSet().size shouldBe total                         // nothing dropped or duplicated
+        // setTooltip sends NewTitle and NewToolTip.
+        val total = threads * perThread * 2
+        awaitUntil(3_000) { rec.unrefed.size == total } shouldBe true
+        rec.sent.toList() shouldContainExactly rec.signals.toList()  // each signal built is sent once
+        rec.unrefed.toSet() shouldBe rec.signals.toSet()
 
-        val order = rec.sent.toList()
+        // Signal addresses grow in the order they were built, so each thread's
+        // own signals have to reach the wire in increasing order.
+        val sent = rec.sent.toList()
         for (t in 0 until threads) {
-            val seqForThread = order.filter { threadOf(it) == t }.map { seqOf(it) }
-            seqForThread shouldContainExactly (0 until perThread).toList()  // FIFO within each thread
+            val own = sent.filter { rec.signalThreads[it] == "setter-$t" }
+            own.size shouldBe perThread * 2
+            own shouldBe own.sorted()
         }
         tray.close()
     }
@@ -317,6 +323,9 @@ class SniTrayImplOutgoingTest {
         val signals = ConcurrentLinkedQueue<Long>()
         private val nextSignal = AtomicInteger(1000)
 
+        /** The thread that built each signal, by its address. */
+        val signalThreads = ConcurrentHashMap<Long, String>()
+
         // Real dbus_connection_read_write blocks up to timeoutMs; sleep a
         // little so the loop doesn't busy-spin during the test.
         fun readWrite(connection: MemorySegment, timeoutMs: Int): Int {
@@ -358,6 +367,7 @@ class SniTrayImplOutgoingTest {
             onNewSignal?.invoke()
             val address = nextSignal.getAndIncrement().toLong()
             signals.add(address)
+            signalThreads[address] = Thread.currentThread().name
             return MemorySegment.ofAddress(address)
         }
 
@@ -369,9 +379,6 @@ class SniTrayImplOutgoingTest {
 
     // Recognizable, non-zero, collision-free message "pointers".
     private fun seg(addr: Long): MemorySegment = MemorySegment.ofAddress(addr)
-    private fun encode(thread: Int, seq: Int): Long = (thread + 1) * 10_000L + seq
-    private fun threadOf(addr: Long): Int = (addr / 10_000L).toInt() - 1
-    private fun seqOf(addr: Long): Int = (addr % 10_000L).toInt()
 
     private fun awaitUntil(timeoutMs: Long, condition: () -> Boolean): Boolean {
         val deadline = System.nanoTime() + timeoutMs * 1_000_000
