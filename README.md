@@ -66,7 +66,7 @@ Available on Maven Central:
 
 ```kotlin
 dependencies {
-    implementation("dev.hivens:libtray:0.2.0")
+    implementation("dev.hivens:libtray:0.3.0")
 }
 ```
 
@@ -205,12 +205,14 @@ compiling as fields are added.
 Behaviour that changed under existing calls:
 
 - An icon that would decode to more than 4096x4096 pixels is refused with a
-  warning and `setIcon` returns false. Set `subsampleOversizedIcons` to
-  decode it at lower quality instead.
+  warning and `setIcon` returns false. A tray created with one has no icon.
+  Set `subsampleOversizedIcons` to decode it at lower quality instead.
 - `setIcon` with an empty array returns false instead of throwing.
 - A click on a menu item that `setMenu` removed while the menu was open is
   delivered on every platform. A listener that treats every
   `MenuItemSelected` id as one of the current menu's should check it.
+- `_` and `&` in menu labels are shown as written. A label that used them to
+  set an access key on Linux or Windows shows the character instead.
 - On Linux, a title with letters outside `a-z` gets a different SNI `Id`, so a
   tray host that stores settings per `Id` sees a new item.
 - On Linux, `setMenu` refuses a menu nested more than 19 submenus deep.
