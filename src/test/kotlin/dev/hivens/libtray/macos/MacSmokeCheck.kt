@@ -87,6 +87,35 @@ fun main() {
         .invokeExact(nsMenu, bindings.sel("performActionForItemAtIndex:"), 0L) as Unit
     expect(events, TrayEvent.MenuItemSelected("noop"), "menu item action")
 
+    // setMenu keeps the NSMenu and the items still in it, and relabels in
+    // place, so a menu on screen updates instead of going stale.
+    val msgSendId = bindings.handle("objc_msgSend_id")
+    fun firstItem(menu: MemorySegment): MemorySegment {
+        val items = msgSendId.invokeExact(menu, bindings.sel("itemArray")) as MemorySegment
+        return msgSendId.invokeExact(items, bindings.sel("firstObject")) as MemorySegment
+    }
+    fun text(nsString: MemorySegment): String =
+        (msgSendId.invokeExact(nsString, bindings.sel("UTF8String")) as MemorySegment).reinterpret(Long.MAX_VALUE).getString(0)
+    val menuBefore = tray.currentMenuHandle
+    val noopItem = firstItem(menuBefore)
+    // Our own reference, so the item outlives its removal below.
+    bindings.handle("objc_retain").invokeExact(noopItem) as MemorySegment
+    check(tray.setMenu(TrayMenu(TrayMenuItem.Standard("noop", "Noop again"), TrayMenuItem.Standard("exit", "Exit")))) { "setMenu relabel" }
+    if (tray.currentMenuHandle.address() != menuBefore.address()) fail("setMenu replaced the NSMenu instead of updating it")
+    if (firstItem(menuBefore).address() != noopItem.address()) fail("setMenu replaced an item that stayed in the menu")
+    val shownTitle = text(msgSendId.invokeExact(noopItem, bindings.sel("title")) as MemorySegment)
+    if (shownTitle != "Noop again") fail("the relabelled item shows \"$shownTitle\"")
+    step("setMenu updated the menu in place")
+
+    // A click on an item setMenu removed, as from a menu still open, still
+    // names that item: it carries its own id, like the other backends deliver.
+    check(tray.setMenu(TrayMenu(TrayMenuItem.Standard("other", "Other")))) { "setMenu with other items" }
+    val target = msgSendId.invokeExact(noopItem, bindings.sel("target")) as MemorySegment
+    bindings.handle("objc_msgSend_void_id").invokeExact(target, bindings.sel("onMenuItem:"), noopItem) as Unit
+    expect(events, TrayEvent.MenuItemSelected("noop"), "click on an item setMenu removed")
+    bindings.handle("objc_release").invokeExact(noopItem) as Unit
+    check(tray.setMenu(menu())) { "setMenu back to the first menu" }
+
     // A second tray built the same way must get its own menu clicks. Its items
     // would carry the same tags as the first tray's if tags were per tray.
     val other = openTray(menuOnPrimaryClick = false)

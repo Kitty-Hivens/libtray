@@ -227,6 +227,11 @@ internal class ObjcBindings private constructor(
                 FunctionDescriptor.ofVoid(
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)),
 
+            // void msgSend(id, SEL, id, long) — insertItem:atIndex: (NSInteger = long)
+            Triple("objc_msgSend_void_id_long", "objc_msgSend",
+                FunctionDescriptor.ofVoid(
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG)),
+
             // void msgSend(id, SEL, id) — addItem:, setTarget:, setMenu:, removeStatusItem:
             Triple("objc_msgSend_void_id",   "objc_msgSend",
                 FunctionDescriptor.ofVoid(

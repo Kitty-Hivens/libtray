@@ -2,6 +2,7 @@ package dev.hivens.libtray.macos
 
 import dev.hivens.libtray.EventDispatcher
 import dev.hivens.libtray.IconScaling
+import dev.hivens.libtray.MenuItemKey
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -11,6 +12,7 @@ import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.TraySubscription
 import dev.hivens.libtray.UpcallTarget
 import dev.hivens.libtray.awaitPastInterrupt
+import dev.hivens.libtray.menuItemKeys
 import dev.hivens.libtray.snapshot
 import org.slf4j.LoggerFactory
 import java.lang.foreign.Arena
@@ -43,11 +45,11 @@ import java.util.concurrent.atomic.AtomicLong
  *      so it lives past the autorelease pool.
  *   4. Install initial icon (PNG → NSData → NSImage → button.image)
  *      and tooltip (button.toolTip).
- *   5. NSMenu rebuilt on every [setMenu] call — short-lived menus,
- *      always cheap to rebuild — with target-action wired to our
- *      shared LibtrayMenuTarget instance + `onMenuItem:` selector.
- *      Per-item NSInteger tag indexes the libtray id slot for reverse
- *      lookup in the upcall handler.
+ *   5. One NSMenu kept for the tray and updated in place on every
+ *      [setMenu], an NSMenuItem per [MenuItemKey], with target-action wired
+ *      to our shared LibtrayMenuTarget instance + `onMenuItem:` selector.
+ *      Each item carries its libtray id as `representedObject` and the
+ *      tray's instance id as its tag, which is all the upcall handler reads.
  *   6. A transparent `LibtrayStatusView` is laid over the status button
  *      and receives its mouse events, each with the `NSEvent` as an
  *      argument, so the button and modifiers are read from the click
@@ -89,13 +91,17 @@ internal class AppKitTrayImpl private constructor(
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
     /**
-     * Per-item tag -> libtray id, rebuilt on every [setMenu]. The upcall
-     * handler walks live instances to find the owner, which works because
-     * [nextTag] is shared by all of them.
+     * The NSMenu and NSMenuItems the tray keeps between [setMenu] calls, one
+     * per [MenuItemKey], or null with no menu. [syncItems] changes them in
+     * place, so an item that is still in the menu stays the same object and a
+     * menu on screen updates instead of going stale. Each item carries its
+     * libtray id as its `representedObject` and this tray's [instanceId] as
+     * its tag, so a click names its own item even when setMenu removed it
+     * while the menu was open. Main thread only.
      */
-    private val tagToId = ConcurrentHashMap<Int, String>()
+    private var menuModel: ShownMenu? = null
 
-    /** Currently-installed NSMenu* (retained), or NULL when no menu set. */
+    /** The root NSMenu of [menuModel], or NULL when no menu set. */
     @Volatile private var currentMenu: MemorySegment = MemorySegment.NULL
 
     /** For the macOS check, which drives the native objects directly. */
@@ -260,17 +266,14 @@ internal class AppKitTrayImpl private constructor(
                     bindings.handle("objc_msgSend_void").invokeExact(shownMenu, bindings.sel("cancelTracking")) as Unit
                 }
             }
-            val prev = currentMenu
-            currentMenu = MemorySegment.NULL
-            if (prev.address() != 0L) {
+            if (currentMenu.address() != 0L) {
                 runCatching {
                     bindings.handle("objc_msgSend_void_id").invokeExact(
                         statusItem, bindings.sel("setMenu:"), MemorySegment.NULL,
                     ) as Unit
                 }
-                runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
             }
-            tagToId.clear()
+            releaseMenuModel()
             if (statusView.address() != 0L) {
                 runCatching {
                     bindings.handle("objc_msgSend_void").invokeExact(statusView, bindings.sel("removeFromSuperview")) as Unit
@@ -394,48 +397,172 @@ internal class AppKitTrayImpl private constructor(
     }
 
     /**
-     * Build a fresh NSMenu, wire each item's target-action to
-     * [menuTargetInstance] + onMenuItem: selector, and keep it in
-     * [currentMenu] for [popUpMenu]. The previous menu is released. If it
-     * is on screen right now, the status item still holds its own
-     * reference for as long as [popUpMenu] keeps it attached.
+     * Bring the kept NSMenu in line with [menu], creating it on first use, and
+     * keep it in [currentMenu] for [popUpMenu]. Items whose key is still there
+     * are updated in place, so a menu on screen changes under the user instead
+     * of going stale, and a click on it still reaches the item it shows.
      */
     private fun applyMenu(menu: TrayMenu) {
         runOnMainQueue {
             autoreleasepool {
-                tagToId.clear()
-                val nsMenuCls = bindings.cls("NSMenu")
-                val emptyTitle = bindings.nsString("")
-                val allocatedMenu = bindings.handle("objc_msgSend_id")
-                    .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
-                val newMenu = bindings.handle("objc_msgSend_id_id")
-                    .invokeExact(allocatedMenu, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
-                disableAutoenabling(newMenu)
-
-                appendItems(newMenu, menu.items)
-
-                // The alloc +1 IS our strong ref, parked in currentMenu.
-                val prev = currentMenu
-                currentMenu = newMenu
-                if (prev.address() != 0L) {
-                    bindings.handle("objc_release").invokeExact(prev) as Unit
+                val root = menuModel ?: ShownMenu(newMenu()).also {
+                    menuModel = it
+                    currentMenu = it.menu
                 }
+                syncItems(root, menu.items, null)
             }
         }
     }
 
     private fun clearMenu() {
-        runOnMainQueue {
-            autoreleasepool {
-                val prev = currentMenu
-                currentMenu = MemorySegment.NULL
-                if (prev.address() != 0L) {
-                    runCatching { bindings.handle("objc_release").invokeExact(prev) as Unit }
-                }
-                tagToId.clear()
+        runOnMainQueue { autoreleasepool { releaseMenuModel() } }
+    }
+
+    /**
+     * Drop the kept menu and our references to it. A menu on screen stays up:
+     * [popUpMenu] holds its own reference, and the NSMenu its items, whose
+     * clicks still deliver since each item carries its id and owner.
+     */
+    private fun releaseMenuModel() {
+        val model = menuModel ?: return
+        menuModel = null
+        currentMenu = MemorySegment.NULL
+        releaseShownMenu(model)
+    }
+
+    private fun releaseShownMenu(shown: ShownMenu) {
+        shown.items.forEach(::releaseShownItem)
+        release(shown.menu)
+    }
+
+    private fun releaseShownItem(shown: ShownItem) {
+        shown.submenu?.let(::releaseShownMenu)
+        release(shown.item)
+    }
+
+    /** A new empty NSMenu with auto-enabling off. Alloc +1, owned by the caller. */
+    private fun newMenu(): MemorySegment {
+        val allocated = bindings.handle("objc_msgSend_id")
+            .invokeExact(bindings.cls("NSMenu"), bindings.sel("alloc")) as MemorySegment
+        val menu = bindings.handle("objc_msgSend_id_id")
+            .invokeExact(allocated, bindings.sel("initWithTitle:"), bindings.nsString("")) as MemorySegment
+        disableAutoenabling(menu)
+        return menu
+    }
+
+    /**
+     * Make [shown] hold [items], children of the item keyed [parentKey]:
+     * items whose key is gone are removed, the rest updated in place and
+     * moved where they belong, and new ones created and inserted. [shown]'s
+     * list follows the NSMenu's order throughout.
+     */
+    private fun syncItems(shown: ShownMenu, items: List<TrayMenuItem>, parentKey: MenuItemKey?) {
+        val keys = menuItemKeys(items, parentKey)
+        val wanted = keys.toHashSet()
+        val gone = shown.items.filter { it.key !in wanted }
+        for (item in gone) {
+            bindings.handle("objc_msgSend_void_id").invokeExact(shown.menu, bindings.sel("removeItem:"), item.item) as Unit
+            releaseShownItem(item)
+        }
+        shown.items.removeAll(gone)
+        for ((index, entry) in items.zip(keys).withIndex()) {
+            val (item, key) = entry
+            val existing = shown.items.firstOrNull { it.key == key }
+            if (existing == null) {
+                val created = createItem(item, key)
+                insertItem(shown.menu, created.item, index)
+                shown.items.add(index, created)
+                continue
+            }
+            updateItem(existing, item)
+            val at = shown.items.indexOf(existing)
+            if (at != index) {
+                // Our reference keeps the item alive between the two calls.
+                bindings.handle("objc_msgSend_void_id").invokeExact(shown.menu, bindings.sel("removeItem:"), existing.item) as Unit
+                shown.items.removeAt(at)
+                insertItem(shown.menu, existing.item, index)
+                shown.items.add(index, existing)
             }
         }
     }
+
+    private fun insertItem(menu: MemorySegment, item: MemorySegment, index: Int) {
+        bindings.handle("objc_msgSend_void_id_long")
+            .invokeExact(menu, bindings.sel("insertItem:atIndex:"), item, index.toLong()) as Unit
+    }
+
+    /** A new NSMenuItem for [item], submenu included, with our own reference to it. */
+    private fun createItem(item: TrayMenuItem, key: MenuItemKey): ShownItem {
+        val nsMenuItemCls = bindings.cls("NSMenuItem")
+        if (item is TrayMenuItem.Separator) {
+            val separator = bindings.handle("objc_msgSend_id")
+                .invokeExact(nsMenuItemCls, bindings.sel("separatorItem")) as MemorySegment
+            // Autoreleased, so take a reference of our own like the other items have.
+            bindings.handle("objc_retain").invokeExact(separator) as MemorySegment
+            return ShownItem(key, separator, item.label, item.enabled, null)
+        }
+        // A submenu parent carries no action: AppKit opens the submenu instead.
+        val action = if (item is TrayMenuItem.Standard) bindings.sel("onMenuItem:") else MemorySegment.NULL
+        val allocated = bindings.handle("objc_msgSend_id")
+            .invokeExact(nsMenuItemCls, bindings.sel("alloc")) as MemorySegment
+        val menuItem = bindings.handle("objc_msgSend_id_id_sel_id").invokeExact(
+            allocated, bindings.sel("initWithTitle:action:keyEquivalent:"),
+            bindings.nsString(item.label), action, bindings.nsString(""),
+        ) as MemorySegment
+        if (item is TrayMenuItem.Standard) {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                menuItem, bindings.sel("setTarget:"), menuTargetInstance,
+            ) as Unit
+            bindings.handle("objc_msgSend_void_long").invokeExact(
+                menuItem, bindings.sel("setTag:"), instanceId.toLong(),
+            ) as Unit
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                menuItem, bindings.sel("setRepresentedObject:"), bindings.nsString(item.id),
+            ) as Unit
+        }
+        if (!item.enabled) {
+            bindings.handle("objc_msgSend_void_long").invokeExact(menuItem, bindings.sel("setEnabled:"), 0L) as Unit
+        }
+        var submenu: ShownMenu? = null
+        if (item is TrayMenuItem.Submenu) {
+            submenu = ShownMenu(newMenu())
+            bindings.handle("objc_msgSend_void_id").invokeExact(menuItem, bindings.sel("setSubmenu:"), submenu.menu) as Unit
+            syncItems(submenu, item.items, key)
+        }
+        return ShownItem(key, menuItem, item.label, item.enabled, submenu)
+    }
+
+    /** Apply what changed in [item] to the NSMenuItem [shown] already holds. */
+    private fun updateItem(shown: ShownItem, item: TrayMenuItem) {
+        if (item is TrayMenuItem.Separator) return
+        if (shown.label != item.label) {
+            bindings.handle("objc_msgSend_void_id").invokeExact(
+                shown.item, bindings.sel("setTitle:"), bindings.nsString(item.label),
+            ) as Unit
+            shown.label = item.label
+        }
+        if (shown.enabled != item.enabled) {
+            bindings.handle("objc_msgSend_void_long").invokeExact(
+                shown.item, bindings.sel("setEnabled:"), if (item.enabled) 1L else 0L,
+            ) as Unit
+            shown.enabled = item.enabled
+        }
+        if (item is TrayMenuItem.Submenu) syncItems(checkNotNull(shown.submenu), item.items, shown.key)
+    }
+
+    /** An NSMenu kept between menus, our reference held, with its items in menu order. */
+    private class ShownMenu(val menu: MemorySegment) {
+        val items = mutableListOf<ShownItem>()
+    }
+
+    /** An NSMenuItem kept between menus, our reference held, with what it shows now. */
+    private class ShownItem(
+        val key: MenuItemKey,
+        val item: MemorySegment,
+        var label: String,
+        var enabled: Boolean,
+        val submenu: ShownMenu?,
+    )
 
     /**
      * `[menu setAutoenablesItems:NO]`.
@@ -455,91 +582,6 @@ internal class AppKitTrayImpl private constructor(
             bindings.handle("objc_msgSend_void_long").invokeExact(
                 menu, bindings.sel("setAutoenablesItems:"), 0L,
             ) as Unit
-        }
-    }
-
-    /**
-     * Recursively append [items] into [parentMenu] (NSMenu*). Standard
-     * items get a fresh tag mapped to their libtray id; submenus build
-     * a child NSMenu attached via setSubmenu:. Separators use
-     * `[NSMenuItem separatorItem]`.
-     */
-    private fun appendItems(parentMenu: MemorySegment, items: List<TrayMenuItem>) {
-        val nsMenuItemCls = bindings.cls("NSMenuItem")
-        val onSelector = bindings.sel("onMenuItem:")
-        val emptyKey = bindings.nsString("")
-
-        for (item in items) {
-            when (item) {
-                is TrayMenuItem.Separator -> {
-                    val sep = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsMenuItemCls, bindings.sel("separatorItem")) as MemorySegment
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        parentMenu, bindings.sel("addItem:"), sep,
-                    ) as Unit
-                }
-                is TrayMenuItem.Standard -> {
-                    val tag = nextTag.getAndIncrement()
-                    tagToId[tag] = item.id
-                    val title = bindings.nsString(item.label)
-                    val allocated = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsMenuItemCls, bindings.sel("alloc")) as MemorySegment
-                    val menuItem = bindings.handle("objc_msgSend_id_id_sel_id")
-                        .invokeExact(
-                            allocated, bindings.sel("initWithTitle:action:keyEquivalent:"),
-                            title, onSelector, emptyKey,
-                        ) as MemorySegment
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        menuItem, bindings.sel("setTarget:"), menuTargetInstance,
-                    ) as Unit
-                    bindings.handle("objc_msgSend_void_long").invokeExact(
-                        menuItem, bindings.sel("setTag:"), tag.toLong(),
-                    ) as Unit
-                    if (!item.enabled) {
-                        bindings.handle("objc_msgSend_void_long").invokeExact(
-                            menuItem, bindings.sel("setEnabled:"), 0L,
-                        ) as Unit
-                    }
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        parentMenu, bindings.sel("addItem:"), menuItem,
-                    ) as Unit
-                    // addItem: retains the item; release our alloc +1 so each
-                    // NSMenuItem doesn't leak on every setMenu.
-                    bindings.handle("objc_release").invokeExact(menuItem) as Unit
-                }
-                is TrayMenuItem.Submenu -> {
-                    val title = bindings.nsString(item.label)
-                    val allocated = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsMenuItemCls, bindings.sel("alloc")) as MemorySegment
-                    val parentItem = bindings.handle("objc_msgSend_id_id_sel_id")
-                        .invokeExact(
-                            allocated, bindings.sel("initWithTitle:action:keyEquivalent:"),
-                            title, MemorySegment.NULL, emptyKey,
-                        ) as MemorySegment
-                    if (!item.enabled) {
-                        bindings.handle("objc_msgSend_void_long").invokeExact(
-                            parentItem, bindings.sel("setEnabled:"), 0L,
-                        ) as Unit
-                    }
-                    val nsMenuCls = bindings.cls("NSMenu")
-                    val emptyTitle = bindings.nsString("")
-                    val childAllocated = bindings.handle("objc_msgSend_id")
-                        .invokeExact(nsMenuCls, bindings.sel("alloc")) as MemorySegment
-                    val childMenu = bindings.handle("objc_msgSend_id_id")
-                        .invokeExact(childAllocated, bindings.sel("initWithTitle:"), emptyTitle) as MemorySegment
-                    disableAutoenabling(childMenu)
-                    appendItems(childMenu, item.items)
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        parentItem, bindings.sel("setSubmenu:"), childMenu,
-                    ) as Unit
-                    bindings.handle("objc_msgSend_void_id").invokeExact(
-                        parentMenu, bindings.sel("addItem:"), parentItem,
-                    ) as Unit
-                    // setSubmenu: / addItem: each retain; release our alloc +1s.
-                    bindings.handle("objc_release").invokeExact(childMenu) as Unit
-                    bindings.handle("objc_release").invokeExact(parentItem) as Unit
-                }
-            }
         }
     }
 
@@ -781,9 +823,6 @@ internal class AppKitTrayImpl private constructor(
         private val log = LoggerFactory.getLogger("libtray.AppKitTray")
         private val instanceCounter = AtomicInteger(0)
 
-        /** Next `NSMenuItem` tag. Process-wide: the tag alone has to identify the owning tray. */
-        private val nextTag = AtomicInteger(1)
-
         /** instance id → impl, for upcall dispatch. */
         private val INSTANCE_REGISTRY = ConcurrentHashMap<Int, AppKitTrayImpl>()
 
@@ -880,31 +919,30 @@ internal class AppKitTrayImpl private constructor(
         /**
          * The `void onMenuItem:(id sender)` IMP. Cocoa calls it as
          * `void f(id self, SEL _cmd, id sender)` per ObjC convention.
-         * We only care about `sender` (the NSMenuItem*); read its tag,
-         * find the owning Tray instance, fire the libtray event.
+         * `sender` is the NSMenuItem the user picked, which carries all
+         * that is needed: its tag is the owning tray's instance id and its
+         * `representedObject` the libtray id. Nothing is looked up in state
+         * setMenu replaces, so a click on an item it removed while the menu
+         * was open still names that item, as it does on the other backends.
+         * Only a tray closed meanwhile drops the click.
          */
         @JvmStatic
         @Suppress("unused", "UNUSED_PARAMETER")
         fun onMenuItemEntry(self: MemorySegment, cmd: MemorySegment, sender: MemorySegment) {
             val bindings = sharedBindings ?: return
-            val tag = try {
-                (bindings.handle("objc_msgSend_long")
-                    .invokeExact(sender, bindings.sel("tag")) as Long).toInt()
+            // An exception leaving an upcall ends the JVM.
+            try {
+                val owner = (bindings.handle("objc_msgSend_long").invokeExact(sender, bindings.sel("tag")) as Long).toInt()
+                val inst = INSTANCE_REGISTRY[owner] ?: return
+                val idString = bindings.handle("objc_msgSend_id")
+                    .invokeExact(sender, bindings.sel("representedObject")) as MemorySegment
+                if (idString.address() == 0L) return
+                val utf8 = bindings.handle("objc_msgSend_id").invokeExact(idString, bindings.sel("UTF8String")) as MemorySegment
+                if (utf8.address() == 0L) return
+                inst.fire(TrayEvent.MenuItemSelected(utf8.reinterpret(Long.MAX_VALUE).getString(0)))
             } catch (t: Throwable) {
-                log.warn("onMenuItem: tag read threw", t)
-                return
+                log.warn("onMenuItem: handling the click threw", t)
             }
-            for (inst in INSTANCE_REGISTRY.values) {
-                val id = inst.tagToId[tag] ?: continue
-                // An exception leaving an upcall ends the JVM.
-                runCatching { inst.fire(TrayEvent.MenuItemSelected(id)) }
-                    .onFailure { log.warn("onMenuItem: firing the event threw", it) }
-                return
-            }
-            // Tag fell through every instance — typically means the
-            // menu was rebuilt between Cocoa's mouse-down and our
-            // handler running (race on rapid setMenu calls). Drop
-            // silently; no event but no crash either.
         }
 
         /**
