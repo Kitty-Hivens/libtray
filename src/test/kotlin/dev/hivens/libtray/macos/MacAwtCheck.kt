@@ -93,7 +93,12 @@ private fun builder() = TrayBuilder(
 
 private fun createUpdateClose(where: String) {
     val tray = Tray.create(builder()) ?: fail("Tray.create on $where returned null")
-    if (!tray.setTooltip("updated from $where")) fail("setTooltip on $where")
+    val tooltip = "updated from $where"
+    if (!tray.setTooltip(tooltip)) fail("setTooltip on $where")
+    // setTooltip only queues the change on the main queue, and close() turns
+    // a queued one into a no-op, so read back what the button shows first.
+    val shown = (tray as AppKitTrayImpl).shownTooltip()
+    if (shown != tooltip) fail("setTooltip on $where left the button showing \"$shown\"")
 
     val start = System.nanoTime()
     tray.close()

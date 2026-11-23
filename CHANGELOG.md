@@ -24,10 +24,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   only supports closing a shared arena with it, and `close()` releases the
   arenas the backends bind their native calls in, which otherwise failed
   quietly and leaked.
-
 - `TrayBuilder.subsampleOversizedIcons`: an icon past 4096x4096 pixels is
-  decoded subsampled to that size, with a warning, instead of refused. Off
-  by default.
+  decoded subsampled to fit that budget, with a warning, instead of refused.
+  Off by default.
 
 ### Changed
 - An icon that would decode to more than 4096x4096 pixels (64 MiB as ARGB)
@@ -39,8 +38,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `NSImage` untouched as before.
 - **Binary-incompatible:** `TrayBuilder` gained `subsampleOversizedIcons`,
   so its constructor and generated `copy` changed shape. Kotlin source is
-  unaffected, recompile against this version. Java callers on
-  `TrayBuilder.of` are unaffected.
+  unaffected, recompile against this version. Java callers of the
+  seven-argument constructor stop compiling and should move to
+  `TrayBuilder.of`, whose callers are unaffected.
 - Oversized icons are scaled by area averaging on the pixel array instead
   of through `Image.getScaledInstance(SCALE_SMOOTH)` and a `Graphics2D`
   draw. The old path went through the AWT Toolkit image pipeline and
@@ -69,6 +69,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   for bytes that do not decode. On macOS it no longer gets that far either,
   so it does not show the text placeholder. `TrayBuilder` still rejects an
   empty initial icon.
+- Windows: the tray menu is owned by the hidden top-level window instead of a
+  message-only one, and a `WM_NULL` is posted after it closes, as the
+  `TrackPopupMenu` documentation asks for a notification icon's menu.
+  Windows only dismisses such a menu on an outside click when its owner is
+  the foreground window, which a message-only window cannot become. Windows
+  11 dismissed it either way.
 
 ### Fixed
 - macOS: `Tray.create` returned null unless called on the Cocoa main thread,
@@ -98,13 +104,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   arguments got an empty reply, which for `Get` and `GetProperty` carried the
   wrong signature. They now get `InvalidArgs`. A dbusmenu reply is also built
   from one menu even when `setMenu` replaces it meanwhile.
+- Linux: a `GetLayout` reply racing `setMenu` could carry one menu's layout
+  with the next menu's revision, so the host took the old layout for the new
+  one.
+  A `GetLayout` or `GetGroupProperties` reply built before a `setMenu` could
+  also reach the host after that `setMenu`'s `ItemsPropertiesUpdated` and
+  undo the labels it carried. Replies and these signals now go out in the
+  order the menu changed.
 - Linux: a method call without an interface, or on the `org.freedesktop.DBus`
   interface, got no reply, so the caller waited out its whole timeout. It now
   gets `UnknownMethod`.
-- Linux: with `maxIconSize = null`, an icon past 4096x4096 made libdbus abort
-  the whole process at the tray host's first `IconPixmap` query, since its
-  pixels exceed the 64 MiB a D-Bus array may hold. Such an icon is now
-  refused like one that does not decode.
+- Linux: with `maxIconSize = null`, an icon of 4096x4096 pixels or more made
+  libdbus abort the whole process at the tray host's first `IconPixmap`
+  query, since its pixels and the entry around them exceed the 64 MiB a
+  D-Bus array may hold. Such an icon is now refused like one that does not
+  decode.
 - Linux: `Introspect` answered with the item interface on every path,
   including `/`, and listed no child objects. A host that walks the object
   tree from `/` to find items would take `/` for the item, where every method
@@ -151,11 +165,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `taskkill` without `/F` does, destroyed it and stopped the tray while the
   icon stayed up and `isOpen` stayed true. The window now ignores it unless
   `close()` sent it.
-- Windows: a click outside the open menu could leave it open, since its
-  message-only owner window could not take the foreground. The menu's owner
-  is now the hidden top-level window, and the message the `TrackPopupMenu`
-  documentation asks for after the menu closes is posted, without which the
-  next menu could appear and vanish at once.
 - Windows: a tooltip longer than 127 UTF-16 units was cut without regard to
   surrogate pairs, so an emoji or another character outside the Basic
   Multilingual Plane at the cut left half of itself behind as a stray glyph.

@@ -109,6 +109,32 @@ internal class AppKitTrayImpl private constructor(
     internal val statusButtonHandle: MemorySegment get() = statusButton
     internal val statusViewHandle: MemorySegment get() = statusView
 
+    /**
+     * For the macOS check: `[statusButton toolTip]`, read on the main queue
+     * behind every setter queued before it, or null when the tooltip is unset
+     * or the queue did not get to the read in time.
+     */
+    internal fun shownTooltip(): String? {
+        var shown: String? = null
+        val done = CountDownLatch(1)
+        val read = {
+            try {
+                autoreleasepool {
+                    val msgSendId = bindings.handle("objc_msgSend_id")
+                    val tooltip = msgSendId.invokeExact(statusButton, bindings.sel("toolTip")) as MemorySegment
+                    if (tooltip.address() != 0L) {
+                        val utf8 = msgSendId.invokeExact(tooltip, bindings.sel("UTF8String")) as MemorySegment
+                        shown = utf8.reinterpret(Long.MAX_VALUE).getString(0)
+                    }
+                }
+            } finally {
+                done.countDown()
+            }
+        }
+        if (isCocoaMainThread(bindings)) read() else if (!enqueueOnMainQueue(read)) return null
+        return if (done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) shown else null
+    }
+
     /** See [dev.hivens.libtray.TrayBuilder.maxIconSize]; null disables scaling. */
     private val maxIconSize: Int? = initial.maxIconSize
 

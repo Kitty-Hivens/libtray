@@ -142,12 +142,12 @@ internal object IconScaling {
                     refuse(width, height, log)
                     return@withReader null
                 }
-                val step = ceil(sqrt(pixels.toDouble() / MAX_DECODED_PIXELS)).toInt()
-                param.setSourceSubsampling(step, step, 0, 0)
+                val (stepX, stepY) = subsamplingSteps(width, height)
+                param.setSourceSubsampling(stepX, stepY, 0, 0)
                 log?.warn(
-                    "Tray icon is {}x{}, past the {} pixel budget. Decoding every {}th pixel, as " +
+                    "Tray icon is {}x{}, past the {} pixel budget. Decoding every {}th column and {}th row, as " +
                         "TrayBuilder.subsampleOversizedIcons asks, so detail is lost. Pass a smaller icon.",
-                    width, height, MAX_DECODED_PIXELS, step,
+                    width, height, MAX_DECODED_PIXELS, stepX, stepY,
                 )
             }
             reader.read(0, param)
@@ -179,6 +179,33 @@ internal object IconScaling {
 
     /** Most pixels an icon may decode to: 4096 x 4096, 64 MiB as ARGB. */
     const val MAX_DECODED_PIXELS: Long = 4096L * 4096
+
+    /**
+     * What subsampling aims under: a 4096-pixel row below [MAX_DECODED_PIXELS],
+     * so the result also fits a single D-Bus array on Linux, where the
+     * `IconPixmap` entry adds a few bytes to the pixels.
+     */
+    private const val MAX_SUBSAMPLED_PIXELS: Long = MAX_DECODED_PIXELS - 4096
+
+    /**
+     * The column and row steps that bring a [width] x [height] image under
+     * [MAX_SUBSAMPLED_PIXELS]. One step for both axes, which keeps the aspect
+     * ratio, grows until the result fits. Only when a side is down to one
+     * pixel and the result still does not fit, as for a thin image, does the
+     * other axis take further steps on its own.
+     */
+    internal fun subsamplingSteps(width: Int, height: Int): Pair<Int, Int> {
+        fun shown(size: Int, step: Int): Long = (size.toLong() + step - 1) / step
+        fun fits(stepX: Int, stepY: Int) = shown(width, stepX) * shown(height, stepY) <= MAX_SUBSAMPLED_PIXELS
+        var step = max(1, sqrt(width.toDouble() * height / MAX_SUBSAMPLED_PIXELS).toInt())
+        while (!fits(step, step) && shown(width, step) > 1 && shown(height, step) > 1) step++
+        var stepX = step
+        var stepY = step
+        while (!fits(stepX, stepY)) {
+            if (shown(width, stepX) > shown(height, stepY)) stepX++ else stepY++
+        }
+        return stepX to stepY
+    }
 
     internal fun areaAverage(
         source: IntArray,

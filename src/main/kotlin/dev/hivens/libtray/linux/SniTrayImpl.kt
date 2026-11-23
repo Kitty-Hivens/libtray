@@ -118,7 +118,14 @@ internal class SniTrayImpl internal constructor(
     private val menuIds = AtomicInteger(0)
     @Volatile private var menuLayout: DBusMenuLayout = DBusMenuLayout(initial.menu?.snapshot(), menuIds)
 
-    /** One setMenu at a time, since each layout is built from the one before it. */
+    /**
+     * One setMenu at a time, since each layout is built from the one before
+     * it. The I/O thread also holds it while it builds and queues a
+     * GetLayout, GetGroupProperties or GetProperty reply, so a reply and the
+     * signal of a concurrent setMenu reach [outgoing] in the order the
+     * layouts changed, and a reply never pairs one layout with another one's
+     * revision. Never taken while [nativeLock] is held.
+     */
     private val menuLock = Any()
     private val layoutRevision = AtomicInteger(0)
     private val open = AtomicBoolean(true)
@@ -795,7 +802,7 @@ internal class SniTrayImpl internal constructor(
      * every LayoutUpdated signal we emit. recursionDepth = -1 means
      * "give me everything"; finite values let the host page the tree.
      */
-    private fun handleMenuGetLayout(msg: MemorySegment) {
+    private fun handleMenuGetLayout(msg: MemorySegment): Unit = synchronized(menuLock) {
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
@@ -881,7 +888,7 @@ internal class SniTrayImpl internal constructor(
      * GetGroupProperties(ids, propertyNames) → a(ia{sv})
      *   array of (id, properties_dict).
      */
-    private fun handleMenuGetGroupProperties(msg: MemorySegment) {
+    private fun handleMenuGetGroupProperties(msg: MemorySegment): Unit = synchronized(menuLock) {
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
@@ -920,7 +927,7 @@ internal class SniTrayImpl internal constructor(
     }
 
     /** GetProperty(id, name) → variant. Niche; hosts mostly use GetGroupProperties. */
-    private fun handleMenuGetProperty(msg: MemorySegment) {
+    private fun handleMenuGetProperty(msg: MemorySegment): Unit = synchronized(menuLock) {
         Arena.ofConfined().use { call ->
             val iter = call.allocate(bindings.messageIterLayout)
             bindings.handle("dbus_message_iter_init").invokeExact(msg, iter) as Int
@@ -1306,11 +1313,12 @@ internal class SniTrayImpl internal constructor(
             val img = IconScaling.decode(bytes, subsampleOversized, log) ?: return emptyList()
             val w = img.width
             val h = img.height
-            // libdbus aborts the process on an array longer than this rather
-            // than failing the append, and the host asks for the pixmap on its
-            // own schedule. Only reachable with scaling off.
-            if (w.toLong() * h * 4 > DBUS_MAXIMUM_ARRAY_LENGTH) {
-                log.warn("Icon {}x{} is too large to send over D-Bus, keep it within 4096x4096 or leave maxIconSize on", w, h)
+            // Past the D-Bus array limit, libdbus either aborts the process
+            // inside the append or builds a reply the bus daemon disconnects
+            // the item for, at the host's first IconPixmap query, which comes
+            // on its own schedule. Only reachable with scaling off.
+            if (w.toLong() * h * 4 + PIXMAP_ENTRY_OVERHEAD > DBUS_MAXIMUM_ARRAY_LENGTH) {
+                log.warn("Icon {}x{} is too large to send over D-Bus, keep it below 4096x4096 or leave maxIconSize on", w, h)
                 return emptyList()
             }
             val argb = IntArray(w * h)
@@ -1341,6 +1349,13 @@ internal class SniTrayImpl internal constructor(
 
         /** `DBUS_MAXIMUM_ARRAY_LENGTH` from dbus-protocol.h: 64 MiB of array data. */
         private const val DBUS_MAXIMUM_ARRAY_LENGTH: Long = 64L * 1024 * 1024
+
+        /**
+         * What one `(iiay)` entry adds to the outer `IconPixmap` array besides
+         * its pixels: width, height and the byte array's length, four bytes
+         * each. The outer array is the one that reaches the limit first.
+         */
+        private const val PIXMAP_ENTRY_OVERHEAD: Long = 12
 
         /**
          * How long `dbus_connection_read_write` blocks per iteration. It

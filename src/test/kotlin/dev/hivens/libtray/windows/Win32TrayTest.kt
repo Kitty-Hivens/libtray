@@ -14,8 +14,11 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.condition.EnabledOnOs
 import org.junit.jupiter.api.condition.OS
 import java.lang.foreign.Arena
+import java.lang.foreign.FunctionDescriptor
+import java.lang.foreign.Linker
 import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
+import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.CountDownLatch
@@ -58,9 +61,14 @@ class Win32TrayTest {
             post(tray, Win32Bindings.WM_MBUTTONUP)
             events.poll(2, TimeUnit.SECONDS) shouldBe TrayEvent.MiddleActivated
             // A version 4 shell opens the menu on WM_CONTEXTMENU. The popup it
-            // tracks is cancelled by close() below.
+            // tracks is cancelled by close() below, which this only proves once
+            // the pump thread is inside TrackPopupMenu.
             post(tray, Win32Bindings.WM_CONTEXTMENU)
             events.poll(2, TimeUnit.SECONDS) shouldBe TrayEvent.MenuRequested
+            val hwnd = (tray as Win32TrayImpl).windowHandle
+            val deadline = System.nanoTime() + 2_000_000_000L
+            while (!PopupMenuMode.isTracking(hwnd) && System.nanoTime() < deadline) Thread.sleep(20)
+            PopupMenuMode.isTracking(hwnd) shouldBe true
         } finally {
             val start = System.nanoTime()
             tray.close()
@@ -229,5 +237,41 @@ class Win32TrayTest {
 
     private fun post(tray: Tray, mouseEvent: Int) {
         postShellCallback(tray, mouseEvent) shouldBe true
+    }
+}
+
+/** The two user32 calls that tell whether a window's thread is tracking a popup menu it owns. */
+private object PopupMenuMode {
+    private val arena = Arena.ofShared()
+    private val user32 = SymbolLookup.libraryLookup("user32", arena)
+    private val linker = Linker.nativeLinker()
+
+    // DWORD GetWindowThreadProcessId(HWND, LPDWORD)
+    private val windowThread = linker.downcallHandle(
+        user32.find("GetWindowThreadProcessId").orElseThrow(),
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS),
+    )
+
+    // BOOL GetGUIThreadInfo(DWORD, PGUITHREADINFO)
+    private val guiThreadInfo = linker.downcallHandle(
+        user32.find("GetGUIThreadInfo").orElseThrow(),
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS),
+    )
+
+    // GUITHREADINFO on x86_64: cbSize, flags, six HWNDs, then a RECT.
+    private const val GUI_THREAD_INFO_SIZE = 72
+    private const val FLAGS_OFFSET = 4L
+    private const val MENU_OWNER_OFFSET = 32L
+    private const val GUI_POPUPMENUMODE = 0x10
+
+    fun isTracking(hwnd: MemorySegment): Boolean = Arena.ofConfined().use { tmp ->
+        val thread = windowThread.invokeExact(hwnd, MemorySegment.NULL) as Int
+        if (thread == 0) return false
+        val info = tmp.allocate(GUI_THREAD_INFO_SIZE.toLong(), 8)
+        info.set(ValueLayout.JAVA_INT, 0, GUI_THREAD_INFO_SIZE)
+        if ((guiThreadInfo.invokeExact(thread, info) as Int) == 0) return false
+        val flags = info.get(ValueLayout.JAVA_INT, FLAGS_OFFSET)
+        val menuOwner = info.get(ValueLayout.ADDRESS, MENU_OWNER_OFFSET)
+        (flags and GUI_POPUPMENUMODE) != 0 && menuOwner.address() == hwnd.address()
     }
 }
