@@ -1,10 +1,13 @@
 package dev.hivens.libtray.windows
 
+import dev.hivens.libtray.ICON_FIXTURES
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
 import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
+import dev.hivens.libtray.hex
+import dev.hivens.libtray.samplePoints
 import dev.hivens.libtray.solidPng
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
@@ -191,6 +194,28 @@ class Win32TrayTest {
         data.set(ValueLayout.ADDRESS, off("hWnd"), hwnd)
         data.set(ValueLayout.JAVA_INT, off("uID"), Win32Bindings.TRAY_ICON_UID)
         (bindings.handle("Shell_NotifyIconW").invokeExact(Win32Bindings.NIM_DELETE, data) as Int) != 0
+    }
+
+    @Test
+    fun `every test icon reaches the shell the right way up`() {
+        // Read back from the HICON the shell got, the step where icons once
+        // came out upside down: CreateIcon takes rows top-down, unlike a DIB.
+        // RGB only, as CreateIcon is free to treat alpha its own way.
+        val tray = open() as Win32TrayImpl
+        try {
+            val problems = ICON_FIXTURES.mapNotNull { icon ->
+                if (!tray.setIcon(icon.bytes())) return@mapNotNull "${icon.name} was refused"
+                val handle = tray.currentIconHandle ?: return@mapNotNull "${icon.name} left no icon"
+                val size = icon.shownSize
+                val pixels = IconReadback.pixels(handle, size)
+                val shown = samplePoints(size, size).map { (x, y) -> pixels[y * size + x] and 0xFFFFFF }
+                val expected = listOf(icon.corner, icon.opposite).map { it and 0xFFFFFF }
+                if (shown == expected) null else "${icon.name} is held as ${hex(shown)}, expected ${hex(expected)}"
+            }
+            problems shouldBe emptyList()
+        } finally {
+            tray.close()
+        }
     }
 
     private fun open(): Tray = Tray.create(

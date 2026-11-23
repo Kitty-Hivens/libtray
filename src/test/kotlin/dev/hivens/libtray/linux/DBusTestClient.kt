@@ -7,6 +7,7 @@ import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout
 import java.lang.invoke.MethodHandle
+import java.nio.ByteOrder
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
@@ -120,6 +121,17 @@ internal class DBusTestClient : AutoCloseable {
         )
     }
 
+    // The library only writes fixed arrays, so reading one back is bound here.
+    // The native check uses it, and its shape, void(ptr, ptr, ptr), is one the
+    // shipped metadata already registers for dbus_bus_add_match.
+    private val getFixedArray: MethodHandle by lazy {
+        val symbol = SymbolLookup.libraryLookup("libdbus-1.so.3", bindings.arena)
+            .find("dbus_message_iter_get_fixed_array").orElseThrow()
+        Linker.nativeLinker().downcallHandle(
+            symbol, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS),
+        )
+    }
+
     /** `Properties.Get` of a string or object path property. */
     fun getStringProperty(destination: String, name: String): String =
         call(destination, ITEM_PATH, "org.freedesktop.DBus.Properties", "Get",
@@ -152,6 +164,32 @@ internal class DBusTestClient : AutoCloseable {
             val width = readInt(struct, arena)
             bindings.handle("dbus_message_iter_next").invokeExact(struct) as Int
             width to readInt(struct, arena)
+        }
+
+    /** One `IconPixmap` entry: [argb] holds the pixels row by row from the top. */
+    class Pixmap(val width: Int, val height: Int, val argb: IntArray) {
+        fun pixel(x: Int, y: Int): Int = argb[y * width + x]
+    }
+
+    /** The first pixmap in `IconPixmap` with its pixels, or null when the array is empty. */
+    fun firstIconPixmap(destination: String): Pixmap? =
+        call(destination, ITEM_PATH, "org.freedesktop.DBus.Properties", "Get",
+            listOf(Arg.Str(ITEM_IFACE), Arg.Str("IconPixmap"))) { reply, arena ->
+            val array = recurse(recurse(firstArg(reply, arena), arena), arena)
+            if (argType(array) == DBusBindings.DBUS_TYPE_INVALID) return@call null
+            val struct = recurse(array, arena)
+            val width = readInt(struct, arena)
+            bindings.handle("dbus_message_iter_next").invokeExact(struct) as Int
+            val height = readInt(struct, arena)
+            bindings.handle("dbus_message_iter_next").invokeExact(struct) as Int
+            val bytesIter = recurse(struct, arena)
+            val data = arena.allocate(ValueLayout.ADDRESS)
+            val count = arena.allocate(ValueLayout.JAVA_INT)
+            getFixedArray.invokeExact(bytesIter, data, count) as Unit
+            val n = count.get(ValueLayout.JAVA_INT, 0)
+            check(n == width * height * 4) { "IconPixmap holds $n bytes for ${width}x$height" }
+            val bytes = data.get(ValueLayout.ADDRESS, 0).reinterpret(n.toLong())
+            Pixmap(width, height, IntArray(width * height) { i -> bytes.get(ARGB_NETWORK_ORDER, i * 4L) })
         }
 
     /** Number of top-level children in the root of a dbusmenu `GetLayout` reply. */
@@ -352,6 +390,9 @@ internal class DBusTestClient : AutoCloseable {
         const val MENU_PATH = "/MenuBar"
         const val ITEM_IFACE = "org.kde.StatusNotifierItem"
         const val WATCHER_NAME = "org.kde.StatusNotifierWatcher"
+
+        /** One `IconPixmap` pixel: ARGB32 in network byte order, so A, R, G, B. */
+        private val ARGB_NETWORK_ORDER: ValueLayout.OfInt = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN)
         private const val CALL_TIMEOUT_MS = 2_000
     }
 }

@@ -134,6 +134,9 @@ internal class Win32TrayImpl private constructor(
      */
     private val iconHandle = AtomicReference<MemorySegment?>(null)
 
+    /** The HICON the shell has now, for tests that read its pixels back. */
+    internal val currentIconHandle: MemorySegment? get() = iconHandle.get()
+
     /** Tracks the latest tooltip string for re-applying after setIcon. */
     @Volatile private var tooltip: String = initial.tooltip ?: ""
 

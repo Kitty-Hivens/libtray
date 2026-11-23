@@ -1,6 +1,7 @@
 package dev.hivens.libtray.linux
 
 import dev.hivens.libtray.ICON_FIXTURES
+import dev.hivens.libtray.IconFixture
 import dev.hivens.libtray.Tray
 import dev.hivens.libtray.TrayBuilder
 import dev.hivens.libtray.TrayEvent
@@ -8,8 +9,10 @@ import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.expect
 import dev.hivens.libtray.fail
+import dev.hivens.libtray.hex
 import dev.hivens.libtray.iconProblem
 import dev.hivens.libtray.linux.DBusTestClient.Arg
+import dev.hivens.libtray.samplePoints
 import dev.hivens.libtray.solidPng
 import dev.hivens.libtray.startWatchdog
 import dev.hivens.libtray.step
@@ -61,15 +64,15 @@ fun main() {
     step("oversized icon scaled to 256x256")
 
     // Every colour model and reader. Each icon follows a 16 px one, so the
-    // pixmap size only matches when this icon really replaced it.
+    // pixmap size only matches when this icon really replaced it. The pixels
+    // are read back as the host gets them, so a wrong byte order or a flipped
+    // row order in the IconPixmap marshalling fails here too.
     val problems = ICON_FIXTURES.mapNotNull { icon ->
         if (!tray.setIcon(solidPng(16))) return@mapNotNull "the 16 px baseline was refused"
-        iconProblem(icon) { tray.setIcon(it) }
-            ?: host.firstIconPixmapSize(name).takeIf { it != (icon.shownSize to icon.shownSize) }
-                ?.let { "${icon.name} is shown at $it, expected ${icon.shownSize}" }
+        iconProblem(icon) { tray.setIcon(it) } ?: pixmapProblem(icon, host.firstIconPixmap(name))
     }
     if (problems.isNotEmpty()) fail("icons that did not decode as on the JVM: $problems")
-    step("all ${ICON_FIXTURES.size} icon formats decoded as on the JVM")
+    step("all ${ICON_FIXTURES.size} icon formats decoded as on the JVM and reached the host the right way up")
 
     host.callNoResult(name, DBusTestClient.ITEM_PATH, DBusTestClient.ITEM_IFACE, "Activate", listOf(Arg.Int32(0), Arg.Int32(0)))
     expect(events, TrayEvent.Activated)
@@ -85,4 +88,15 @@ fun main() {
     watcher.close()
     step("PASS")
     exitProcess(0)
+}
+
+/** What is wrong with the pixmap the host got for [icon], or null if nothing. */
+private fun pixmapProblem(icon: IconFixture, pixmap: DBusTestClient.Pixmap?): String? {
+    if (pixmap == null) return "${icon.name} reached the host with no pixmap"
+    if (pixmap.width != icon.shownSize || pixmap.height != icon.shownSize) {
+        return "${icon.name} is shown at ${pixmap.width}x${pixmap.height}, expected ${icon.shownSize}"
+    }
+    val shown = samplePoints(pixmap.width, pixmap.height).map { (x, y) -> pixmap.pixel(x, y) }
+    val expected = listOf(icon.corner, icon.opposite)
+    return if (shown == expected) null else "${icon.name} reaches the host as ${hex(shown)}, expected ${hex(expected)}"
 }
