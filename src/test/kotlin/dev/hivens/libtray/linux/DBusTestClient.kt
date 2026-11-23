@@ -369,11 +369,11 @@ internal class DBusTestClient : AutoCloseable {
     }
 
     /**
-     * A minimal `org.kde.StatusNotifierWatcher`: owns the name and records
-     * every `RegisterStatusNotifierItem` argument in [registrations]. Close
-     * it to drop the name, which a tray item sees as the watcher going away.
+     * A minimal StatusNotifierWatcher under [name]: owns it and records every
+     * `RegisterStatusNotifierItem` argument in [registrations]. Close it to
+     * drop the name, which a tray item sees as the watcher going away.
      */
-    class Watcher : AutoCloseable {
+    class Watcher(private val name: String = WATCHER_NAME) : AutoCloseable {
         val registrations = LinkedBlockingQueue<String>()
         private val client = DBusTestClient()
         private val running = AtomicBoolean(true)
@@ -383,8 +383,8 @@ internal class DBusTestClient : AutoCloseable {
             // A watcher closed just before may not have lost the name yet:
             // the daemon handles its disconnect on its own schedule.
             val deadline = System.nanoTime() + 2_000_000_000L
-            while (!client.requestName(WATCHER_NAME)) {
-                check(System.nanoTime() < deadline) { "$WATCHER_NAME is already owned on this bus" }
+            while (!client.requestName(name)) {
+                check(System.nanoTime() < deadline) { "$name is already owned on this bus" }
                 Thread.sleep(20)
             }
             loop = thread(name = "test-sni-watcher", isDaemon = true) { serve() }
@@ -437,6 +437,7 @@ internal class DBusTestClient : AutoCloseable {
         const val MENU_PATH = "/MenuBar"
         const val ITEM_IFACE = "org.kde.StatusNotifierItem"
         const val WATCHER_NAME = "org.kde.StatusNotifierWatcher"
+        const val FDO_WATCHER_NAME = "org.freedesktop.StatusNotifierWatcher"
 
         /** One `IconPixmap` pixel: ARGB32 in network byte order, so A, R, G, B. */
         private val ARGB_NETWORK_ORDER: ValueLayout.OfInt = ValueLayout.JAVA_INT_UNALIGNED.withOrder(ByteOrder.BIG_ENDIAN)
