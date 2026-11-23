@@ -7,6 +7,7 @@ import dev.hivens.libtray.TrayMenu
 import dev.hivens.libtray.TrayMenuItem
 import dev.hivens.libtray.linux.DBusTestClient.Arg
 import io.kotest.assertions.throwables.shouldThrow
+import io.kotest.assertions.withClue
 import io.kotest.matchers.collections.shouldContainExactly
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
@@ -279,7 +280,7 @@ class SniHostTest {
     }
 
     @Test
-    fun `a click on an item of a replaced menu is dropped`() {
+    fun `a click on an item removed while the menu was open still reaches the listener`() {
         val name = "org.libtray.HostTest.ReplacedMenu"
         val events = LinkedBlockingQueue<TrayEvent>()
         val tray = open(name)
@@ -287,12 +288,58 @@ class SniHostTest {
 
         tray.setMenu(TrayMenu(TrayMenuItem.Standard("a", "A"), TrayMenuItem.Standard("b", "B"), TrayMenuItem.Standard("c", "C")))
 
-        // Id 3 was "exit" in the menu a host may still have on screen.
+        // Id 3 was "exit" in the menu a host may still have on screen. The
+        // user clicked it, so the app hears about it, as it does on Windows.
         clickMenu(name, 3)
-        events.poll(200, TimeUnit.MILLISECONDS) shouldBe null
+        take(events) shouldBe TrayEvent.MenuItemSelected("exit")
 
+        // The new items took ids no earlier menu used.
         clickMenu(name, 4)
         take(events) shouldBe TrayEvent.MenuItemSelected("a")
+    }
+
+    @Test
+    fun `a relabelled item keeps its id and goes out as a property update`() {
+        val name = "org.libtray.HostTest.Relabel"
+        val events = LinkedBlockingQueue<TrayEvent>()
+        val tray = open(name)
+        tray.onEvent { events.add(it) }
+        host.watchMenu()
+
+        tray.setMenu(TrayMenu(
+            TrayMenuItem.Standard("show", "Show window"),
+            TrayMenuItem.Separator,
+            TrayMenuItem.Standard("exit", "Exit"),
+        ))
+
+        // Same structure, so hosts keep the menu they built and only update
+        // the label, instead of rebuilding it and closing an open submenu.
+        val signals = host.menuSignals(500)
+        signals shouldContainExactly listOf("ItemsPropertiesUpdated")
+        host.menuItemLabel(name, 1) shouldBe "Show window"
+        clickMenu(name, 3)
+        take(events) shouldBe TrayEvent.MenuItemSelected("exit")
+    }
+
+    @Test
+    fun `menu calls with an id that never existed get an error`() {
+        val name = "org.libtray.HostTest.UnknownMenuId"
+        open(name)
+
+        val calls = listOf(
+            "Event" to listOf(Arg.Int32(999), Arg.Str("clicked"), Arg.VariantInt32(0), Arg.UInt32(0)),
+            "AboutToShow" to listOf(Arg.Int32(999)),
+            "GetLayout" to listOf(Arg.Int32(999), Arg.Int32(-1), Arg.EmptyStringArray),
+            "GetProperty" to listOf(Arg.Int32(999), Arg.Str("label")),
+            "EventGroup" to listOf(Arg.MenuClicks(listOf(999))),
+        )
+        for ((member, args) in calls) {
+            withClue(member) {
+                shouldThrow<IllegalStateException> {
+                    host.callNoResult(name, DBusTestClient.MENU_PATH, "com.canonical.dbusmenu", member, args)
+                }.message.shouldContain("InvalidArgs")
+            }
+        }
     }
 
     @Test
