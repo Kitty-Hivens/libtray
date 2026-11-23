@@ -65,7 +65,12 @@ public interface Tray : AutoCloseable {
 
     /**
      * Replace the right-click menu. `null` removes the menu (the icon
-     * becomes click-only).
+     * becomes click-only). Items that stay in the menu keep their identity,
+     * so an open menu updates rather than closes on Linux hosts and macOS.
+     * A click on an item this call removed while the menu was open still
+     * arrives as [TrayEvent.MenuItemSelected] with that item's id, and events
+     * reach listeners asynchronously anyway, so a listener should expect ids
+     * the current menu no longer has.
      * @return false when the tray is closed or the change failed. See the
      *   class KDoc for what true means on each platform.
      */
