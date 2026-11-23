@@ -267,7 +267,7 @@ internal class SniTrayImpl internal constructor(
     private fun fitsOneMessage(menu: TrayMenu): Boolean {
         val depth = submenuDepth(menu.items)
         if (depth <= MAX_SUBMENU_DEPTH) return true
-        log.warn("Menu is {} submenus deep, past the {} one D-Bus message can carry, keeping the current menu", depth, MAX_SUBMENU_DEPTH)
+        log.warn("Menu is {} submenus deep, past the {} one D-Bus message can carry, so it is not used", depth, MAX_SUBMENU_DEPTH)
         return false
     }
 

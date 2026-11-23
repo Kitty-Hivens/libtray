@@ -69,6 +69,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   for bytes that do not decode. On macOS it no longer gets that far either,
   so it does not show the text placeholder. `TrayBuilder` still rejects an
   empty initial icon.
+- Linux: the StatusNotifierItem `Id` keeps the letters and digits of any
+  script. It used to keep only `a-z` and `0-9`, so every title in another
+  script became `tray`. A title in plain Latin letters keeps its `Id`. Where
+  a title mixes scripts or has accented letters, the `Id` changes, and a host
+  that stores settings per `Id` sees a new item.
 - Windows: the tray menu is owned by the hidden top-level window instead of a
   message-only one, and a `WM_NULL` is posted after it closes, as the
   `TrackPopupMenu` documentation asks for a notification icon's menu.
@@ -119,6 +124,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   query, since its pixels and the entry around them exceed the 64 MiB a
   D-Bus array may hold. Such an icon is now refused like one that does not
   decode.
+- Linux: a menu nested 20 submenus deep made the bus daemon disconnect the
+  item at the host's first `GetLayout`, while `isOpen` stayed true, since
+  libdbus refuses messages nested that deep. `setMenu` now refuses a menu
+  deeper than 19 submenus with a warning and returns false, and a tray
+  created with one has no menu.
+- Linux: the item only registered with `org.kde.StatusNotifierWatcher`, so a
+  watcher that owns just `org.freedesktop.StatusNotifierWatcher` never showed
+  it. That name is now tried when nobody owns the KDE one.
 - Linux: `Introspect` answered with the item interface on every path,
   including `/`, and listed no child objects. A host that walks the object
   tree from `/` to find items would take `/` for the item, where every method
@@ -165,6 +178,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `taskkill` without `/F` does, destroyed it and stopped the tray while the
   icon stayed up and `isOpen` stayed true. The window now ignores it unless
   `close()` sent it.
+- Windows: the error code logged for a failed call could be wrong. It came
+  from a separate `GetLastError` call, and the JVM can reset the code in
+  between. It is now captured as the failed call returns.
 - Windows: a tooltip longer than 127 UTF-16 units was cut without regard to
   surrogate pairs, so an emoji or another character outside the Basic
   Multilingual Plane at the cut left half of itself behind as a stray glyph.
