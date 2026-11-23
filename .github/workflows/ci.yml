@@ -10,8 +10,10 @@ on:
   # Publish runs every job here against the tag before it uploads anything.
   workflow_call:
 
+# Called from Publish, github.workflow names the caller, so a release run on
+# main does not cancel or get cancelled by a push run on the same ref.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
