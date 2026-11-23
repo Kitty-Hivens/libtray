@@ -194,6 +194,24 @@ null). Single-instance apps can use a fixed name as shown.
 <details>
   <summary>Migrating</summary>
 
+### From 0.2.0
+
+`TrayBuilder` gained `subsampleOversizedIcons`, so a jar built against
+0.2.0 throws `NoSuchMethodError` until it is recompiled. Kotlin source is
+unaffected. Java callers of the seven-argument constructor stop compiling
+and should move to `TrayBuilder.of(title, icon)...build()`, which keeps
+compiling as fields are added.
+
+Behaviour that changed under existing calls:
+
+- An icon that would decode to more than 4096x4096 pixels is refused with a
+  warning and `setIcon` returns false. Set `subsampleOversizedIcons` to
+  decode it at lower quality instead.
+- `setIcon` with an empty array returns false instead of throwing.
+- A click on a menu item that `setMenu` removed while the menu was open is
+  delivered on every platform. A listener that treats every
+  `MenuItemSelected` id as one of the current menu's should check it.
+
 ### From 0.1.3
 
 The event API, the threading of events and `TrayBuilder` all changed.
