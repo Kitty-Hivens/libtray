@@ -236,11 +236,15 @@ internal class DBusTestClient : AutoCloseable {
     }
 
     /** Number of top-level children in the root of a dbusmenu `GetLayout` reply. */
-    fun menuRootChildCount(destination: String): Int =
+    fun menuRootChildCount(destination: String): Int = menuRevisionAndRootChildCount(destination).second
+
+    /** The layout revision and the number of top-level children of one `GetLayout` reply. */
+    fun menuRevisionAndRootChildCount(destination: String): Pair<Int, Int> =
         call(destination, MENU_PATH, "com.canonical.dbusmenu", "GetLayout",
             listOf(Arg.Int32(0), Arg.Int32(-1), Arg.EmptyStringArray)) { reply, arena ->
             val iter = firstArg(reply, arena)
-            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int  // skip revision
+            val revision = readInt(iter, arena)
+            bindings.handle("dbus_message_iter_next").invokeExact(iter) as Int
             val root = recurse(iter, arena)
             bindings.handle("dbus_message_iter_next").invokeExact(root) as Int  // skip id
             bindings.handle("dbus_message_iter_next").invokeExact(root) as Int  // skip properties
@@ -250,7 +254,7 @@ internal class DBusTestClient : AutoCloseable {
                 count++
                 bindings.handle("dbus_message_iter_next").invokeExact(children) as Int
             }
-            count
+            revision to count
         }
 
     /** Own [name] on this connection. False when someone else already holds it. */

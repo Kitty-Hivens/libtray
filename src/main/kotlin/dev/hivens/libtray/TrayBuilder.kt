@@ -26,10 +26,12 @@ package dev.hivens.libtray
  *   logged at WARN). Applies to [iconBytes] and to every later
  *   [Tray.setIcon]. Tray hosts draw at panel height, so a 512 or 1024
  *   application icon costs bytes and CPU without ever showing the extra
- *   detail — on Linux it is re-marshalled into the `IconPixmap` property
+ *   detail. On Linux it is re-marshalled into the `IconPixmap` property
  *   on every query the host makes. Default 256, which is also the largest
  *   size the Win32 backend accepts. Set to null to send the original
- *   bytes untouched.
+ *   bytes untouched. Linux then refuses an icon of 4096x4096 pixels or
+ *   more, since its pixels no longer fit the one D-Bus array that
+ *   `IconPixmap` is sent as.
  * @property linuxBusName Optional well-known D-Bus name for the Linux
  *   StatusNotifierItem. Defaults to the existing
  *   `org.kde.StatusNotifierItem-PID-N` name. Flatpak apps can set a name

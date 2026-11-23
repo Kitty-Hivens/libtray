@@ -10,15 +10,18 @@ import java.util.zip.Deflater
  * so that the only AWT and ImageIO work in them is libtray's own, which is
  * what the shipped metadata has to cover.
  */
-internal fun solidPng(size: Int, argb: Int = 0xFFBB86FC.toInt()): ByteArray {
-    val row = ByteArray(1 + size * 4)  // filter byte 0, then RGBA per pixel
-    for (x in 0 until size) {
+internal fun solidPng(size: Int, argb: Int = 0xFFBB86FC.toInt()): ByteArray = solidPngOf(size, size, argb)
+
+/** [solidPng] with its own [width] and [height]. */
+internal fun solidPngOf(width: Int, height: Int, argb: Int = 0xFFBB86FC.toInt()): ByteArray {
+    val row = ByteArray(1 + width * 4)  // filter byte 0, then RGBA per pixel
+    for (x in 0 until width) {
         row[1 + x * 4] = (argb ushr 16).toByte()
         row[2 + x * 4] = (argb ushr 8).toByte()
         row[3 + x * 4] = argb.toByte()
         row[4 + x * 4] = (argb ushr 24).toByte()
     }
-    val raw = ByteArrayOutputStream().apply { repeat(size) { write(row) } }.toByteArray()
+    val raw = ByteArrayOutputStream().apply { repeat(height) { write(row) } }.toByteArray()
     val deflater = Deflater().apply { setInput(raw); finish() }
     val compressed = ByteArrayOutputStream()
     val buffer = ByteArray(8192)
@@ -28,7 +31,7 @@ internal fun solidPng(size: Int, argb: Int = 0xFFBB86FC.toInt()): ByteArray {
     out.write(byteArrayOf(0x89.toByte(), 'P'.code.toByte(), 'N'.code.toByte(), 'G'.code.toByte(), 0x0D, 0x0A, 0x1A, 0x0A))
     val header = ByteArrayOutputStream().also {
         DataOutputStream(it).apply {
-            writeInt(size); writeInt(size)
+            writeInt(width); writeInt(height)
             writeByte(8)   // bit depth
             writeByte(6)   // colour type RGBA
             writeByte(0); writeByte(0); writeByte(0)  // compression, filter, interlace

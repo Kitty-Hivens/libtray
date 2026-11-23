@@ -19,9 +19,11 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import dev.hivens.libtray.solidPng
+import dev.hivens.libtray.solidPngOf
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -108,18 +110,55 @@ class SniHostTest {
     }
 
     @Test
-    fun `an icon too large for a D-Bus array is refused instead of aborting the process`() {
+    fun `an icon whose pixmap would not fit one D-Bus array is refused and the item stays on the bus`() {
         val name = "org.libtray.HostTest.HugeIcon"
         val tray = Tray.create(
             TrayBuilder(title = "huge icon", iconBytes = solidPng(32), maxIconSize = null, linuxBusName = name),
         ) ?: error("Tray.create returned null on the private bus")
         trays += tray
 
-        // 4100 x 4100 x 4 bytes is past the 64 MiB libdbus allows in one
-        // array, and libdbus aborts the whole process on that, at the host's
-        // first IconPixmap query. Without scaling nothing else stops it.
-        tray.setIcon(solidPng(4100)) shouldBe false
+        // 4096 x 4096 x 4 bytes is exactly the 64 MiB a D-Bus array may hold,
+        // and the a(iiay) around it adds width, height and a length. Sent, it
+        // made the bus daemon drop the item at the host's first IconPixmap
+        // query, and a larger one made libdbus abort the process.
+        tray.setIcon(solidPng(4096)) shouldBe false
         host.firstIconPixmapSize(name) shouldBe (32 to 32)
+
+        // A row less fits, and the host gets it.
+        tray.setIcon(solidPngOf(4096, 4095)) shouldBe true
+        host.firstIconPixmapSize(name) shouldBe (4096 to 4095)
+        host.getStringProperty(name, "Status") shouldBe "Active"
+    }
+
+    @Test
+    fun `a layout reply never pairs one menu with another menu's revision`() {
+        val name = "org.libtray.HostTest.LayoutRevision"
+        val tray = open(name)
+
+        // Every setMenu here changes the structure, so the revision goes up by
+        // one each time: even revisions carry three items, odd ones two.
+        val three = TrayMenu(TrayMenuItem.Standard("show", "Show"), TrayMenuItem.Separator, TrayMenuItem.Standard("exit", "Exit"))
+        val two = TrayMenu(TrayMenuItem.Standard("show", "Show"), TrayMenuItem.Standard("exit", "Exit"))
+        val stop = AtomicBoolean(false)
+        val setter = thread {
+            var flip = false
+            while (!stop.get()) {
+                tray.setMenu(if (flip) three else two)
+                flip = !flip
+            }
+        }
+        val mismatches = mutableListOf<Pair<Int, Int>>()
+        try {
+            val deadline = System.nanoTime() + 2_000_000_000L
+            while (System.nanoTime() < deadline) {
+                val (revision, count) = host.menuRevisionAndRootChildCount(name)
+                if ((revision % 2 == 0) != (count == 3)) mismatches += revision to count
+            }
+        } finally {
+            stop.set(true)
+            setter.join(2_000)
+        }
+        mismatches shouldBe emptyList()
     }
 
     @Test
