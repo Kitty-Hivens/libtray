@@ -193,6 +193,21 @@ class IconScalingTest {
     }
 
     @Test
+    fun `subsampling keeps every shape within the pixel budget`() {
+        // 8191 x 8193 with one step of 2 for both axes comes out 4096 x 4097,
+        // a row past the budget. 3 x 20,000,000 cannot get its short side under
+        // one pixel, so a step taken from the area alone leaves it twice too big.
+        for ((width, height) in listOf(8191 to 8193, 3 to 20_000_000)) {
+            val img = BufferedImage(width, height, BufferedImage.TYPE_BYTE_BINARY)
+            val bytes = ByteArrayOutputStream().also { ImageIO.write(img, "PNG", it) }.toByteArray()
+            val decoded = IconScaling.decode(bytes, subsampleOversized = true, log = log) ?: error("${width}x$height did not decode")
+            withClue("${width}x$height decoded to ${decoded.width}x${decoded.height}") {
+                (decoded.width.toLong() * decoded.height <= IconScaling.MAX_DECODED_PIXELS) shouldBe true
+            }
+        }
+    }
+
+    @Test
     fun `an icon exactly at the budget still decodes in full`() {
         val img = BufferedImage(4096, 4096, BufferedImage.TYPE_BYTE_BINARY)
         val bytes = ByteArrayOutputStream().also { ImageIO.write(img, "PNG", it) }.toByteArray()
