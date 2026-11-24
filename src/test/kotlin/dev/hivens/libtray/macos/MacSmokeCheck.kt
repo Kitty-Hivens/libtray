@@ -10,6 +10,7 @@ import dev.hivens.libtray.fail
 import dev.hivens.libtray.solidPng
 import dev.hivens.libtray.startWatchdog
 import dev.hivens.libtray.step
+import java.io.File
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
@@ -154,11 +155,14 @@ fun main() {
         if (it == TrayEvent.MenuRequested) {
             Thread.sleep(300)  // let the menu come up
             val start = System.nanoTime()
+            closeStartNanos = start
             tray.close()
             closeTookMs.set((System.nanoTime() - start) / 1_000_000)
+            closeStartNanos = 0L
             closed.countDown()
         }
     }
+    Thread { watchTheClose() }.apply { isDaemon = true }.start()
     clicks.send(overlay, "rightMouseDown:", NS_RIGHT_MOUSE_DOWN, button = 1)
     if (!closed.await(10, TimeUnit.SECONDS)) fail("close() from the MenuRequested listener did not return")
     if (tray.isOpen) fail("still open after close() during menu tracking")
@@ -258,4 +262,24 @@ private fun shownIconWidth(bindings: ObjcBindings, button: MemorySegment): Long 
     val representation = msgSendId.invokeExact(representations, bindings.sel("firstObject")) as MemorySegment
     if (representation.address() == 0L) fail("the status button's image has no representation")
     return bindings.handle("objc_msgSend_long").invokeExact(representation, bindings.sel("pixelsWide")) as Long
+}
+
+@Volatile private var closeStartNanos = 0L
+
+private fun watchTheClose() {
+    while (true) {
+        Thread.sleep(20)
+        val start = closeStartNanos
+        if (start == 0L || System.nanoTime() - start < 700_000_000L) continue
+        step("SMOKE STALL in close() during menu tracking")
+        for ((thread, frames) in Thread.getAllStackTraces()) {
+            println("  \"${thread.name}\" ${thread.state}")
+            frames.forEach { println("      at $it") }
+        }
+        val out = File("build/edt-probe").apply { mkdirs() }.resolve("smoke-${ProcessHandle.current().pid()}.txt")
+        ProcessBuilder("/usr/bin/sample", ProcessHandle.current().pid().toString(), "1", "10", "-file", out.path)
+            .redirectErrorStream(true).start().waitFor()
+        if (out.exists()) out.readLines().take(220).forEach { println("  | $it") }
+        return
+    }
 }

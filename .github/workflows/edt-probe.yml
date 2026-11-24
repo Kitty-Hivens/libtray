@@ -8,11 +8,22 @@ permissions:
 
 jobs:
   probe:
-    name: EDT probe (macOS)
+    name: EDT probe (${{ matrix.library }}, ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        library: [ before, fixed ]
+        shard: [ 1, 2 ]
     runs-on: macos-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Take the library from before the fix
+        if: matrix.library == 'before'
+        run: git checkout 075461a -- src/main
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
@@ -23,15 +34,15 @@ jobs:
       - name: Run the probe and the check next to the tasks a build runs beside them
         run: |
           bad=0
-          for i in $(seq 1 45); do
+          for i in $(seq 1 40); do
             echo "=== probe run $i"
             ./gradlew -q --continue macEdtProbe macSmokeCheck test --rerun || bad=$((bad+1))
           done
-          echo "runs with a stall or a failure: $bad of 45"
+          echo "runs with a stall or a failure: $bad of 40"
           [ "$bad" = 0 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: edt-probe
+          name: edt-probe-${{ matrix.library }}-${{ matrix.shard }}
           path: build/edt-probe
           if-no-files-found: ignore
