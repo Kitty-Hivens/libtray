@@ -33,6 +33,9 @@ fun main() {
         }
     }
     step("AWT is up and its window is showing")
+    // Loading the bindings and their classes takes long enough to look like a stall.
+    running = null
+    warmUp()
     repeat(CYCLES) { cycle ->
         thread { runCycle("background", cycle) }.join()
         EventQueue.invokeAndWait { runCycle("EDT", cycle) }
@@ -42,8 +45,8 @@ fun main() {
     exitProcess(if (stalls.get() == 0) 0 else 2)
 }
 
-private const val CYCLES = 10
-private const val STALL_NANOS = 400_000_000L
+private const val CYCLES = 150
+private const val STALL_NANOS = 700_000_000L
 
 private class Running(val what: String, val startNanos: Long, @Volatile var dumped: Boolean = false)
 
@@ -60,6 +63,12 @@ private fun <T> timed(what: String, block: () -> T): T {
         val ms = (System.nanoTime() - mine.startNanos) / 1_000_000
         if (ms >= 100) step("$what took $ms ms")
     }
+}
+
+private fun warmUp() {
+    val tray = Tray.create(TrayBuilder(title = "libtray-edt-probe", iconBytes = solidPng(32)))
+    (tray as? AppKitTrayImpl)?.shownTooltip()
+    tray?.close()
 }
 
 private fun runCycle(where: String, cycle: Int) {

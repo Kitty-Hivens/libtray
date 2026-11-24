@@ -10,7 +10,7 @@ jobs:
   probe:
     name: EDT probe (macOS)
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
@@ -20,18 +20,18 @@ jobs:
       - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       - name: Build
         run: ./gradlew testClasses
-      - name: Run the check and the probe in fresh processes
+      - name: Run the probe and the check next to the tasks a build runs beside them
         run: |
           bad=0
-          for i in $(seq 1 12); do
+          for i in $(seq 1 15); do
             echo "=== probe run $i"
-            ./gradlew -q macEdtProbe || bad=$((bad+1))
+            ./gradlew -q --continue macEdtProbe macSmokeCheck test --rerun || bad=$((bad+1))
           done
-          for i in $(seq 1 12); do
+          for i in $(seq 1 15); do
             echo "=== check run $i"
-            ./gradlew -q macAwtCheck || bad=$((bad+1))
+            ./gradlew -q --continue macAwtCheck macSmokeCheck test --rerun || bad=$((bad+1))
           done
-          echo "runs with a stall or a failure: $bad of 24"
+          echo "runs with a stall or a failure: $bad of 30"
           [ "$bad" = 0 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
