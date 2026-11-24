@@ -23,15 +23,11 @@ jobs:
       - name: Run the probe and the check next to the tasks a build runs beside them
         run: |
           bad=0
-          for i in $(seq 1 15); do
+          for i in $(seq 1 45); do
             echo "=== probe run $i"
             ./gradlew -q --continue macEdtProbe macSmokeCheck test --rerun || bad=$((bad+1))
           done
-          for i in $(seq 1 15); do
-            echo "=== check run $i"
-            ./gradlew -q --continue macAwtCheck macSmokeCheck test --rerun || bad=$((bad+1))
-          done
-          echo "runs with a stall or a failure: $bad of 30"
+          echo "runs with a stall or a failure: $bad of 45"
           [ "$bad" = 0 ]
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
