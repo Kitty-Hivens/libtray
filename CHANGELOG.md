@@ -3,7 +3,11 @@
 All notable changes to libtray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.3.0]
+
+`TrayBuilder` gained a property, so a jar compiled against 0.2.0 has to be
+recompiled. That and the behaviour that changed are in the README's
+migration section.
 
 ### Added
 - GraalVM native-image metadata in the jar, under
@@ -29,13 +33,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Off by default.
 
 ### Changed
-- An icon that would decode to more than 4096x4096 pixels (64 MiB as ARGB)
-  is refused before it is decoded, with a warning, and `setIcon` returns
-  false. The size comes from the image header, so a small file that declares
-  huge dimensions can no longer make libtray allocate a raster for them.
-  Scaling also reads only the header for an icon that already fits instead
-  of decoding it in full. With `maxIconSize = null`, macOS hands the bytes to
-  `NSImage` untouched as before.
+- An icon that would decode to more than 4096x4096 pixels (64 MiB as ARGB) is
+  refused before it is decoded, with a warning, and `setIcon` returns false. A
+  tray created with such an icon has none, and on macOS it shows the text
+  placeholder. The size comes from the image header, so a small file that
+  declares huge dimensions can no longer make libtray allocate a raster for
+  them. Scaling also reads only the header for an icon that already fits
+  instead of decoding it in full. With `maxIconSize = null`, macOS hands the
+  bytes to `NSImage` untouched as before.
 - **Binary-incompatible:** `TrayBuilder` gained `subsampleOversizedIcons`,
   so its constructor and generated `copy` changed shape. Kotlin source is
   unaffected, recompile against this version. Java callers of the
@@ -53,17 +58,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   a temporary file on every call, which a read-only temp directory turned into
   a lost icon. Scaling also reads the source one row at a time instead of
   copying the whole frame.
+- The Kotlin standard library dependency is 2.4.21.
 - A failed `Tray.create` is logged at WARN with its stack trace instead of
   at INFO with the message only.
 - Menu items keep their identity across `setMenu`: an item at the same place
   among items of its kind and id stays the same native item. On Linux it keeps
   its dbusmenu id, and a change of labels or enabled flags alone goes out as
-  `ItemsPropertiesUpdated` instead of `LayoutUpdated`, so tray hosts update the
-  menu they built rather than rebuild it, and an open submenu stays open. On
-  macOS the `NSMenu` and its items are updated in place, so an open menu shows
-  the change. A click on an item `setMenu` removed while the menu was open is
-  now delivered on every platform, as Windows already did. Linux and macOS
-  dropped it.
+  `ItemsPropertiesUpdated` instead of `LayoutUpdated`, so tray hosts update
+  the menu they built rather than rebuild it, and an open submenu stays open.
+  A `setMenu` that changes nothing sends no signal at all. On macOS the
+  `NSMenu` and its items are updated in place, so an open menu shows the
+  change. A click on an item `setMenu` removed while the menu was open is now
+  delivered on every platform, as Windows already did. Linux and macOS dropped
+  it.
 - `setIcon` with an empty array logs a warning, keeps the current icon and
   returns false instead of throwing `IllegalArgumentException`, as it does
   for bytes that do not decode. On macOS it no longer gets that far either,
@@ -109,21 +116,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   arguments got an empty reply, which for `Get` and `GetProperty` carried the
   wrong signature. They now get `InvalidArgs`. A dbusmenu reply is also built
   from one menu even when `setMenu` replaces it meanwhile.
-- Linux: a `GetLayout` reply racing `setMenu` could carry one menu's layout
-  with the next menu's revision, so the host took the old layout for the new
-  one.
-  A `GetLayout` or `GetGroupProperties` reply built before a `setMenu` could
-  also reach the host after that `setMenu`'s `ItemsPropertiesUpdated` and
-  undo the labels it carried. Replies and these signals now go out in the
-  order the menu changed.
 - Linux: a method call without an interface, or on the `org.freedesktop.DBus`
   interface, got no reply, so the caller waited out its whole timeout. It now
   gets `UnknownMethod`.
-- Linux: with `maxIconSize = null`, an icon of 4096x4096 pixels or more made
-  libdbus abort the whole process at the tray host's first `IconPixmap`
-  query, since its pixels and the entry around them exceed the 64 MiB a
-  D-Bus array may hold. Such an icon is now refused like one that does not
-  decode.
+- Linux: with `maxIconSize = null`, an icon of 4096x4096 pixels made the bus
+  daemon disconnect the item at the tray host's first `IconPixmap` query, and
+  a larger one made libdbus abort the whole process, since the pixels and the
+  entry around them exceed the 64 MiB a D-Bus array may hold. Such an icon is
+  now refused like one that does not decode.
 - Linux: a menu nested 20 submenus deep made the bus daemon disconnect the
   item at the host's first `GetLayout`, while `isOpen` stayed true, since
   libdbus refuses messages nested that deep. `setMenu` now refuses a menu
@@ -165,7 +165,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   before its class is unregistered.
 - Windows: setters from different threads could interleave on the shared
   `NOTIFYICONDATA`, and a setter racing `close()` could throw. `close()` also
-  released native handles a pump thread that had not stopped was still using.
+  released native handles a pump thread that had not stopped was still using,
+  and a window message arriving then could end the JVM.
 - Windows: when the pump thread was slow to start, `Tray.create` could close
   the native bindings it was still using, and an icon added after `close()`
   removed the entry could stay in the notification area.
@@ -174,10 +175,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   broadcast a restarted Explorer sends. It is now a hidden top-level window
   that adds the icon again on that broadcast, also when the application
   runs elevated.
-- Windows: a `WM_CLOSE` posted to the tray window by another process, as
-  `taskkill` without `/F` does, destroyed it and stopped the tray while the
-  icon stayed up and `isOpen` stayed true. The window now ignores it unless
-  `close()` sent it.
 - Windows: the error code logged for a failed call could be wrong. It came
   from a separate `GetLastError` call, and the JVM can reset the code in
   between. It is now captured as the failed call returns.
