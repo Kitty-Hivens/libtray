@@ -148,6 +148,7 @@ internal class ObjcBindings private constructor(
          *   * `ptr`  — raw pointer (`ADDRESS`)
          *   * `long` — 64-bit integer (`JAVA_LONG`)
          *   * `double` — 64-bit float (`JAVA_DOUBLE`)
+         *   * `bool` — Objective-C BOOL (`JAVA_BOOLEAN`)
          *   * `void` — no return
          *
          * The receiver + selector pair (id, sel) is implicit in every
@@ -237,6 +238,13 @@ internal class ObjcBindings private constructor(
                 FunctionDescriptor.ofVoid(
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
 
+            // void msgSend(id, SEL, sel, id, BOOL, id)
+            // performSelectorOnMainThread:withObject:waitUntilDone:modes:
+            Triple("objc_msgSend_void_sel_id_bool_id", "objc_msgSend",
+                FunctionDescriptor.ofVoid(
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_BOOLEAN, ValueLayout.ADDRESS)),
+
             // void msgSend(id, SEL, sel) — setAction:
             Triple("objc_msgSend_void_sel",  "objc_msgSend",
                 FunctionDescriptor.ofVoid(
@@ -253,7 +261,7 @@ internal class ObjcBindings private constructor(
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
 
             // dispatch_async_f(queue, context, work) -- block-free GCD enqueue
-            // backing runOnMainQueue (issue #3). work is void(*)(void* ctx).
+            // waking the main thread for runOnMainQueue (issue #3). work is void(*)(void* ctx).
             Triple("dispatch_async_f", "dispatch_async_f",
                 FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)),
         )
@@ -311,7 +319,7 @@ internal class ObjcBindings private constructor(
             }
             // _dispatch_main_q is a DATA symbol (the global main queue); its
             // address is exactly what dispatch_get_main_queue() returns. Absent
-            // -> NULL, and runOnMainQueue degrades to a direct call.
+            // -> NULL, and only performSelectorOnMainThread: wakes the main thread.
             val mainQueue = lookups.firstNotNullOfOrNull { it.find("_dispatch_main_q").orElse(null) }
                 ?: MemorySegment.NULL
             val applicationGlobal = lookups.firstNotNullOfOrNull { it.find("NSApp").orElse(null) }
