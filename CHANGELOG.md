@@ -197,6 +197,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   the lists when it takes the menu, and `setMenu` with a menu whose list was
   emptied after it was built returns false. On macOS the icon bytes are
   copied the same way before the main queue reads them.
+- macOS: when the Cocoa main thread did not get to the teardown within two
+  seconds, `close()` ran it on the calling thread, where AppKit raises an
+  exception that can end the process. The teardown now stays queued, `close()`
+  returns after the two seconds, and the icon goes away once the main thread
+  is free.
 - macOS: with more than one tray, a menu click could be delivered to the
   wrong tray, because menu item tags were only unique within a tray.
 - macOS: each `Tray.create` kept another set of native bindings alive for the
