@@ -20,11 +20,11 @@ import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.ValueLayout
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.atomic.AtomicLong
 
 /**
  * macOS tray backend on top of `NSStatusBar` / `NSStatusItem` via the
@@ -60,13 +60,13 @@ import java.util.concurrent.atomic.AtomicLong
  *      the mouse, such as VoiceOver.
  *
  * **Threading.** [create] off the main thread runs the creation on the Cocoa
- * main queue and waits for it (see [createThroughMainQueue]), so an AWT, Swing
+ * main thread and waits for it (see [createThroughMainQueue]), so an AWT, Swing
  * or Compose app can call it from any thread once its UI is up. Mutating calls
- * (setIcon / setTooltip / setMenu) marshal onto the same queue via libdispatch
- * (`dispatch_async_f`, see [runOnMainQueue]): a call already on the main
- * thread runs inline, any other thread enqueues. AppKit therefore always runs
- * where it wants regardless of which thread the consumer calls from, and the
- * public setters still return as soon as the enqueue succeeds. The
+ * (setIcon / setTooltip / setMenu) go to the same queue of main thread actions
+ * (see [enqueueOnMainQueue]): a call already on the main thread runs inline,
+ * any other thread enqueues. AppKit therefore always runs where it wants
+ * regardless of which thread the consumer calls from, and the public setters
+ * still return as soon as the enqueue succeeds. The
  * `onMenuItem:`, `onStatusItemClick:` and status view mouse upcalls already
  * arrive on the main thread by AppKit's contract. [close] queues its teardown
  * on the main queue too, but waits for it, so the icon is gone when close()
@@ -86,7 +86,7 @@ internal class AppKitTrayImpl private constructor(
 
     private val open = AtomicBoolean(true)
 
-    /** Set by the one [tearDown] that runs, wherever close() ended up running it. */
+    /** Set when [tearDown] starts. Main thread, read by the macOS check from others. */
     private val tornDown = AtomicBoolean(false)
     private val events = EventDispatcher("libtray-events-${ProcessHandle.current().pid()}")
 
@@ -234,8 +234,8 @@ internal class AppKitTrayImpl private constructor(
         INSTANCE_REGISTRY.remove(instanceId)
         tearDownOnMainThread()
         // The ObjcBindings arena is deliberately NOT closed here (unlike the
-        // Linux / Win32 backends). runOnMainQueue can leave actions queued on
-        // the GCD main queue that still use the msgSend handles, and the
+        // Linux / Win32 backends). runOnMainQueue can leave actions queued for
+        // the main thread that still use the msgSend handles, and the
         // menu-target class + its upcall stub are already process-lifetime.
         // All trays share one set of bindings, see sharedBindings.
     }
@@ -245,17 +245,17 @@ internal class AppKitTrayImpl private constructor(
      *
      * `NSStatusItem` is main-thread-only, and close() is routinely called
      * from a listener, which runs on the libtray event thread. Queuing the
-     * teardown also puts it behind any apply* the main queue is already
+     * teardown also puts it behind any apply* the main thread is already
      * running or holding, so none of them can message a released status
      * item. Waiting keeps close() synchronous: the icon is gone when it
      * returns. The wait is bounded because a main thread that is blocked,
      * or a process that never runs a Cocoa loop, would otherwise hang the
-     * caller. On timeout, or when the teardown could not be queued at all, it
-     * runs on the calling thread instead, since leaving the icon up is worse,
-     * and [tornDown] keeps a queued copy from running it a second time.
+     * caller. On timeout the teardown stays queued and the icon stays up until
+     * the main thread gets to it. It never runs on the calling thread: AppKit
+     * raises an exception when a view is removed there, which ends the process.
      */
     private fun tearDownOnMainThread() {
-        if (isCocoaMainThread(bindings) || bindings.mainQueue.address() == 0L) {
+        if (isCocoaMainThread(bindings)) {
             tearDown()
             return
         }
@@ -267,19 +267,14 @@ internal class AppKitTrayImpl private constructor(
                 done.countDown()
             }
         }
-        if (enqueued && done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) return
-        if (enqueued) {
+        if (!enqueued) {
+            log.warn("Could not queue the tray teardown on the Cocoa main thread, so the icon stays up")
+        } else if (!done.awaitPastInterrupt(CLOSE_ON_MAIN_TIMEOUT_MS)) {
             log.warn(
-                "Cocoa main queue did not run the tray teardown within {} ms, tearing down on {} instead",
-                CLOSE_ON_MAIN_TIMEOUT_MS, Thread.currentThread().name,
-            )
-        } else {
-            log.warn(
-                "Could not queue the tray teardown on the Cocoa main queue, tearing down on {} instead",
-                Thread.currentThread().name,
+                "The Cocoa main thread did not run the tray teardown within {} ms. The icon goes away once it does.",
+                CLOSE_ON_MAIN_TIMEOUT_MS,
             )
         }
-        tearDown()
     }
 
     private fun tearDown() {
@@ -819,10 +814,8 @@ internal class AppKitTrayImpl private constructor(
     private fun fire(event: TrayEvent) = events.fire(event)
 
     /**
-     * Run [action] on the Cocoa main queue (issue #3). Already on the main
-     * thread -> run inline (dispatch_async would needlessly defer a tick).
-     * Otherwise enqueue via `dispatch_async_f`. If libdispatch did not resolve
-     * ([ObjcBindings.mainQueue] is NULL) fall back to running inline.
+     * Run [action] on the Cocoa main thread (issue #3). Already there -> run
+     * inline, otherwise enqueue it (see [enqueueOnMainQueue]).
      *
      * The queued body re-checks [open] on the main thread rather than
      * trusting the check made here at enqueue time. close() flips [open]
@@ -837,11 +830,9 @@ internal class AppKitTrayImpl private constructor(
             runCatching { action() }
             return
         }
-        if (bindings.mainQueue.address() == 0L) {
-            runCatching { action() }
-            return
+        if (!enqueueOnMainQueue { if (open.get()) action() }) {
+            log.warn("Could not queue a tray change on the Cocoa main thread, so it is dropped")
         }
-        enqueueOnMainQueue { if (open.get()) action() }
     }
 
     private fun enqueueOnMainQueue(action: () -> Unit): Boolean = enqueueOnMainQueue(bindings, action) != null
@@ -859,12 +850,14 @@ internal class AppKitTrayImpl private constructor(
         /**
          * `void f(id self, SEL _cmd, id arg)`, the shape of every Objective-C
          * method IMP libtray installs: [onMenuItemEntry],
-         * [onStatusItemClickEntry] and [onStatusViewMouseEntry].
+         * [onStatusItemClickEntry], [onStatusViewMouseEntry] and
+         * [onMainThreadWakeEntry].
          */
         internal val OBJC_METHOD_DESCRIPTOR: FunctionDescriptor =
             FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS)
 
         private val DISPATCH_TRAMPOLINE = UpcallTarget(AppKitTrayImpl::class.java, "dispatchTrampoline", TRAMPOLINE_DESCRIPTOR)
+        private val ON_MAIN_THREAD_WAKE = UpcallTarget(AppKitTrayImpl::class.java, "onMainThreadWakeEntry", OBJC_METHOD_DESCRIPTOR)
         private val ON_MENU_ITEM = UpcallTarget(AppKitTrayImpl::class.java, "onMenuItemEntry", OBJC_METHOD_DESCRIPTOR)
         private val ON_STATUS_ITEM_CLICK = UpcallTarget(AppKitTrayImpl::class.java, "onStatusItemClickEntry", OBJC_METHOD_DESCRIPTOR)
         private val ON_STATUS_VIEW_MOUSE = UpcallTarget(AppKitTrayImpl::class.java, "onStatusViewMouseEntry", OBJC_METHOD_DESCRIPTOR)
@@ -884,39 +877,160 @@ internal class AppKitTrayImpl private constructor(
         /** `[NSEvent buttonNumber]` of the middle button. 0 is left, 1 right. */
         private const val MIDDLE_BUTTON_NUMBER: Long = 2
 
-        // ── Main-queue marshaling (issue #3) ──────────────────────────────
-        // Pending runOnMainQueue actions, keyed by a monotonic id handed to
-        // dispatch_async_f as the opaque context pointer. The trampoline looks
-        // the action up by id, runs it, drops it. One process-wide upcall stub
-        // serves every instance.
-        private val PENDING = ConcurrentHashMap<Long, () -> Unit>()
-        private val dispatchCounter = AtomicLong(0)
+        // ── Main-thread marshaling (issue #3) ─────────────────────────────
+
+        /** One action waiting for the main thread. A class of its own, so a caller that gives up can remove it. */
+        private class MainAction(val run: () -> Unit)
+
+        /** What waits for the main thread, oldest first. */
+        private val MAIN_ACTIONS = ConcurrentLinkedQueue<MainAction>()
+
+        /** True while [runMainActions] is on the stack. Main thread only. */
+        private var runningMainActions = false
+
         @Volatile private var trampolineStub: MemorySegment? = null
         @Volatile private var trampolineArena: Arena? = null
 
-        /** GCD work function `void f(void* context)`: run the pending action the context id names. */
+        /**
+         * AWT's private run loop mode, the same in OpenJDK and JBR. AWT runs the
+         * main thread's loop in it while that thread waits for the event
+         * dispatch thread, which AppKit's accessibility and Services queries
+         * make it do.
+         */
+        private const val AWT_RUN_LOOP_MODE = "AWTRunLoopMode"
+
+        /** The value of `NSRunLoopCommonModes`. */
+        private const val COMMON_RUN_LOOP_MODES = "kCFRunLoopCommonModes"
+
+        /** An instance of `LibtrayMainThread_<pid>`, the target of [performWake], or NULL until it is needed. */
+        @Volatile private var mainThreadTarget: MemorySegment = MemorySegment.NULL
+
+        /** The NSArray of run loop modes [performWake] works in. Set before [mainThreadTarget]. */
+        @Volatile private var mainThreadModes: MemorySegment = MemorySegment.NULL
+        @Volatile private var mainThreadTargetFailed = false
+        @Volatile private var mainThreadStubArena: Arena? = null
+
+        /**
+         * Run what waits for the main thread, in the order it was queued. Main
+         * thread only. A wake that arrives while an action is running, from a
+         * run loop that action started, leaves the rest to the call already on
+         * the stack, so actions never run inside one another.
+         */
+        private fun runMainActions() {
+            if (runningMainActions) return
+            runningMainActions = true
+            try {
+                while (true) {
+                    val next = MAIN_ACTIONS.poll() ?: break
+                    runCatching { next.run() }.onFailure { log.warn("main-thread action threw", it) }
+                }
+            } finally {
+                runningMainActions = false
+            }
+        }
+
+        /** GCD work function `void f(void* context)`, one of the two wakes. */
         @JvmStatic
+        @Suppress("unused", "UNUSED_PARAMETER")
         fun dispatchTrampoline(context: MemorySegment) {
-            val action = PENDING.remove(context.address()) ?: return
-            runCatching { action() }.onFailure { log.warn("main-queue action threw", it) }
+            runCatching { runMainActions() }.onFailure { log.warn("running the main-thread actions threw", it) }
+        }
+
+        /** The `void wake:(id)` IMP of `LibtrayMainThread`, the other wake. */
+        @JvmStatic
+        @Suppress("unused", "UNUSED_PARAMETER")
+        fun onMainThreadWakeEntry(self: MemorySegment, cmd: MemorySegment, arg: MemorySegment) {
+            runCatching { runMainActions() }.onFailure { log.warn("running the main-thread actions threw", it) }
         }
 
         /**
-         * `dispatch_async_f` [action] onto the main queue. Returns the id it
-         * waits under in [PENDING], so a caller that gives up can drop it, or
-         * null when the enqueue itself failed.
+         * Queue [action] for the Cocoa main thread and wake it. Returns what a
+         * caller that gives up removes from [MAIN_ACTIONS], or null when the
+         * main thread could not be woken at all.
+         *
+         * Two wakes, and whichever comes first runs the action. The main
+         * dispatch queue is not drained while AWT waits for the event dispatch
+         * thread in [AWT_RUN_LOOP_MODE], and a caller on that thread which
+         * waits for the action would deadlock with it. [performWake] names that
+         * mode. The dispatch one serves a main thread without a Foundation run
+         * loop.
          */
-        private fun enqueueOnMainQueue(bindings: ObjcBindings, action: () -> Unit): Long? {
-            val id = dispatchCounter.getAndIncrement()
-            PENDING[id] = action
-            val enqueued = runCatching {
+        private fun enqueueOnMainQueue(bindings: ObjcBindings, action: () -> Unit): MainAction? {
+            val queued = MainAction(action)
+            MAIN_ACTIONS.add(queued)
+            val performed = runCatching { performWake(bindings) }
+                .onFailure { log.debug("performSelectorOnMainThread: threw", it) }.getOrDefault(false)
+            val dispatched = bindings.mainQueue.address() != 0L && runCatching {
                 bindings.handle("dispatch_async_f").invokeExact(
-                    bindings.mainQueue, MemorySegment.ofAddress(id), dispatchTrampolineStub(),
+                    bindings.mainQueue, MemorySegment.NULL, trampolineStub ?: dispatchTrampolineStub(),
                 ) as Unit
                 true
             }.getOrDefault(false)
-            if (!enqueued) PENDING.remove(id)  // never came back, don't strand the entry
-            return if (enqueued) id else null
+            if (performed || dispatched) return queued
+            MAIN_ACTIONS.remove(queued)
+            return null
+        }
+
+        /** `[target performSelectorOnMainThread:wake: withObject:nil waitUntilDone:NO modes:]`. */
+        private fun performWake(bindings: ObjcBindings): Boolean {
+            // Past the lock once it is built: the main thread takes the same one,
+            // and a caller it waits for must not wait for it.
+            var target = mainThreadTarget
+            if (target.address() == 0L) target = buildMainThreadTarget(bindings)
+            if (target.address() == 0L) return false
+            val pool = bindings.handle("objc_autoreleasePoolPush").invokeExact() as MemorySegment
+            try {
+                bindings.handle("objc_msgSend_void_sel_id_bool_id").invokeExact(
+                    target, bindings.sel("performSelectorOnMainThread:withObject:waitUntilDone:modes:"),
+                    bindings.sel("wake:"), MemorySegment.NULL, false, mainThreadModes,
+                ) as Unit
+            } finally {
+                bindings.handle("objc_autoreleasePoolPop").invokeExact(pool) as Unit
+            }
+            return true
+        }
+
+        /**
+         * The target of [performWake], built on first use on whichever thread
+         * that is, as the Objective-C runtime allows. NULL when it could not be
+         * built, as for a second copy of libtray in the process (see
+         * [ensureMenuTargetClass]).
+         */
+        @Synchronized
+        private fun buildMainThreadTarget(bindings: ObjcBindings): MemorySegment {
+            if (mainThreadTarget.address() != 0L || mainThreadTargetFailed) return mainThreadTarget
+            runCatching {
+                val arena = Arena.ofShared()
+                mainThreadStubArena = arena
+                val className = "LibtrayMainThread_${ProcessHandle.current().pid()}"
+                val newClass = bindings.handle("objc_allocateClassPair")
+                    .invokeExact(bindings.cls("NSObject"), arena.allocateFrom(className), 0L) as MemorySegment
+                require(newClass.address() != 0L) { "objc_allocateClassPair failed for $className" }
+                val added = bindings.handle("class_addMethod").invokeExact(
+                    newClass, bindings.sel("wake:"), ON_MAIN_THREAD_WAKE.stub(arena), arena.allocateFrom("v@:@"),
+                ) as Boolean
+                require(added) { "class_addMethod failed for wake:" }
+                bindings.handle("objc_registerClassPair").invokeExact(newClass) as Unit
+
+                val pool = bindings.handle("objc_autoreleasePoolPush").invokeExact() as MemorySegment
+                try {
+                    val common = bindings.handle("objc_msgSend_id_id").invokeExact(
+                        bindings.cls("NSArray"), bindings.sel("arrayWithObject:"), bindings.nsString(COMMON_RUN_LOOP_MODES),
+                    ) as MemorySegment
+                    val modes = bindings.handle("objc_msgSend_id_id").invokeExact(
+                        common, bindings.sel("arrayByAddingObject:"), bindings.nsString(AWT_RUN_LOOP_MODE),
+                    ) as MemorySegment
+                    mainThreadModes = bindings.handle("objc_retain").invokeExact(modes) as MemorySegment
+                } finally {
+                    bindings.handle("objc_autoreleasePoolPop").invokeExact(pool) as Unit
+                }
+                val allocated = bindings.handle("class_createInstance").invokeExact(newClass, 0L) as MemorySegment
+                mainThreadTarget = bindings.handle("objc_msgSend_id").invokeExact(allocated, bindings.sel("init")) as MemorySegment
+            }.onFailure {
+                mainThreadTargetFailed = true
+                log.warn("Could not build the target that wakes the Cocoa main thread while AWT holds it", it)
+            }
+            return mainThreadTarget
         }
 
         /** The single shared upcall stub bridging GCD to [dispatchTrampoline]. Built once, process-lifetime. */
@@ -1056,14 +1170,6 @@ internal class AppKitTrayImpl private constructor(
             if (isCocoaMainThread(bindings)) {
                 return createOnMainThread(bindings, builder, initialIcon(builder))
             }
-            if (bindings.mainQueue.address() == 0L) {
-                log.warn(
-                    "libdispatch did not resolve, so the tray can only be created on the Cocoa main thread. " +
-                        "Current thread: {}",
-                    Thread.currentThread().name,
-                )
-                return null
-            }
             return createThroughMainQueue(bindings, builder)
         }
 
@@ -1127,7 +1233,7 @@ internal class AppKitTrayImpl private constructor(
                 }
             }
 
-            val pendingId = enqueueOnMainQueue(bindings, ::createQueued) ?: run {
+            val queued = enqueueOnMainQueue(bindings, ::createQueued) ?: run {
                 log.warn("Could not queue the tray creation on the Cocoa main queue")
                 return null
             }
@@ -1138,7 +1244,7 @@ internal class AppKitTrayImpl private constructor(
             }
             // Not run yet: drop it, so a main thread that never gets to it does
             // not keep the builder and its icon for the life of the process.
-            PENDING.remove(pendingId)
+            MAIN_ACTIONS.remove(queued)
             log.warn(
                 "The Cocoa main queue did not run the tray creation within {} ms. The main thread is " +
                     "blocked, or nothing runs a Cocoa loop on it.",
