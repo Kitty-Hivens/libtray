@@ -270,6 +270,12 @@ val macAwtCheck = tasks.register<JavaExec>("macAwtCheck") {
     onlyIf("macOS") { isMac }
 }
 
+tasks.register<JavaExec>("macEdtProbe") {
+    classpath = sourceSets.test.get().runtimeClasspath
+    mainClass.set("dev.hivens.libtray.macos.EdtProbeKt")
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+}
+
 // The same check with Tray.create called before AWT starts, as an app does
 // that sets its tray up before its first window. A process of its own, since
 // AWT can only start once per JVM.

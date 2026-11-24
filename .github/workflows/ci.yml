@@ -6,7 +6,6 @@ name: CI
 on:
   push:
     branches: [ master, main ]
-  pull_request:
   # Publish runs every job here against the tag before it uploads anything.
   workflow_call:
 
