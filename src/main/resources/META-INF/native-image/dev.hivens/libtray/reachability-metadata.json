@@ -4,6 +4,7 @@
       "type": "dev.hivens.libtray.macos.AppKitTrayImpl",
       "methods": [
         { "name": "dispatchTrampoline", "parameterTypes": ["java.lang.foreign.MemorySegment"] },
+        { "name": "onMainThreadWakeEntry", "parameterTypes": ["java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment"] },
         { "name": "onMenuItemEntry", "parameterTypes": ["java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment"] },
         { "name": "onStatusItemClickEntry", "parameterTypes": ["java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment"] },
         { "name": "onStatusViewMouseEntry", "parameterTypes": ["java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment", "java.lang.foreign.MemorySegment"] }
@@ -74,6 +75,7 @@
       { "returnType": "void", "parameterTypes": ["void*", "jint"] },
       { "returnType": "void", "parameterTypes": ["void*", "void*", "jlong"] },
       { "returnType": "void", "parameterTypes": ["void*", "void*", "void*", "jlong"] },
+      { "returnType": "void", "parameterTypes": ["void*", "void*", "void*", "void*", "jboolean", "void*"] },
       { "returnType": "void", "parameterTypes": ["void*", "void*", "void*"] },
       { "returnType": "void", "parameterTypes": ["void*", "void*"] },
       { "returnType": "void", "parameterTypes": ["void*"] },

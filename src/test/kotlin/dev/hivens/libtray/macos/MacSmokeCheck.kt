@@ -145,25 +145,15 @@ fun main() {
     bindings.handle("objc_msgSend_void_id").invokeExact(button, bindings.sel("performClick:"), MemorySegment.NULL) as Unit
     expect(events, TrayEvent.Activated, "button action (VoiceOver path)")
 
-    // Right press: MenuRequested fires, then performClick: tracks the menu on
-    // this thread. The listener closes the tray from the event thread, so the
-    // teardown has to run from the main queue inside the menu's tracking loop.
-    val closeTookMs = AtomicLong(-1)
-    val closed = CountDownLatch(1)
-    tray.onEvent {
-        if (it == TrayEvent.MenuRequested) {
-            Thread.sleep(300)  // let the menu come up
-            val start = System.nanoTime()
-            tray.close()
-            closeTookMs.set((System.nanoTime() - start) / 1_000_000)
-            closed.countDown()
-        }
+    // Something else on the machine can dismiss the menu before close() lands,
+    // and then there is no tracking loop to close it from.
+    var menuTray: AppKitTrayImpl = tray
+    var attempts = 1
+    while (!closeDuringMenuTracking(bindings, clicks, menuTray)) {
+        if (attempts++ == 3) fail("the menu closed on its own before close(), three times in a row")
+        step("the menu closed on its own before close(), trying again")
+        menuTray = openTray(menuOnPrimaryClick = false) as AppKitTrayImpl
     }
-    clicks.send(overlay, "rightMouseDown:", NS_RIGHT_MOUSE_DOWN, button = 1)
-    if (!closed.await(10, TimeUnit.SECONDS)) fail("close() from the MenuRequested listener did not return")
-    if (tray.isOpen) fail("still open after close() during menu tracking")
-    if (closeTookMs.get() >= 2_000) fail("close() during menu tracking fell back to the timeout (${closeTookMs.get()} ms)")
-    step("closed during menu tracking in ${closeTookMs.get()} ms")
 
     // close() from a thread other than main has to get its teardown run by
     // the main queue, so the Cocoa loop has to be running for it.
@@ -184,6 +174,48 @@ fun main() {
         .invokeExact(bindings.cls("NSApplication"), bindings.sel("sharedApplication")) as MemorySegment
     bindings.handle("objc_msgSend_void").invokeExact(app, bindings.sel("run")) as Unit
     fail("[NSApp run] returned")
+}
+
+/**
+ * Right press: MenuRequested fires, then performClick: tracks the menu on this
+ * thread. The listener closes the tray from the event thread, so the teardown
+ * has to run from the main queue inside the menu's tracking loop. False when
+ * the menu was gone before that. The tray is closed either way, which then
+ * takes a run loop on this thread.
+ */
+private fun closeDuringMenuTracking(bindings: ObjcBindings, clicks: SyntheticClicks, tray: AppKitTrayImpl): Boolean {
+    val closeTookMs = AtomicLong(-1)
+    val closed = CountDownLatch(1)
+    tray.onEvent {
+        if (it == TrayEvent.MenuRequested) {
+            Thread.sleep(300)  // let the menu come up
+            val start = System.nanoTime()
+            tray.close()
+            closeTookMs.set((System.nanoTime() - start) / 1_000_000)
+            closed.countDown()
+        }
+    }
+    clicks.send(tray.statusViewHandle, "rightMouseDown:", NS_RIGHT_MOUSE_DOWN, button = 1)
+    val duringMenu = tray.isTornDown
+
+    val deadline = System.nanoTime() + 10_000_000_000L
+    while (closed.count > 0) {
+        if (System.nanoTime() > deadline) fail("close() from the MenuRequested listener did not return")
+        runMainLoopFor(bindings, 0.05)
+    }
+    if (tray.isOpen) fail("still open after close() from the MenuRequested listener")
+    if (closeTookMs.get() >= 2_000) fail("close() from the MenuRequested listener fell back to the timeout (${closeTookMs.get()} ms)")
+    if (duringMenu) step("closed during menu tracking in ${closeTookMs.get()} ms")
+    return duringMenu
+}
+
+/** `[[NSRunLoop currentRunLoop] runUntilDate:]`, [seconds] from now. Main thread. */
+private fun runMainLoopFor(bindings: ObjcBindings, seconds: Double) {
+    val loop = bindings.handle("objc_msgSend_id")
+        .invokeExact(bindings.cls("NSRunLoop"), bindings.sel("currentRunLoop")) as MemorySegment
+    val until = bindings.handle("objc_msgSend_id_double")
+        .invokeExact(bindings.cls("NSDate"), bindings.sel("dateWithTimeIntervalSinceNow:"), seconds) as MemorySegment
+    bindings.handle("objc_msgSend_void_id").invokeExact(loop, bindings.sel("runUntilDate:"), until) as Unit
 }
 
 /**
