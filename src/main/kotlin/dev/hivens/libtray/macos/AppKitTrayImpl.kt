@@ -108,6 +108,7 @@ internal class AppKitTrayImpl private constructor(
     internal val currentMenuHandle: MemorySegment get() = currentMenu
     internal val statusButtonHandle: MemorySegment get() = statusButton
     internal val statusViewHandle: MemorySegment get() = statusView
+    internal val isTornDown: Boolean get() = tornDown.get()
 
     /**
      * For the macOS check: `[statusButton toolTip]`, read on the main queue
